@@ -162,11 +162,34 @@ export interface UsageSummaryEntry {
   total_tokens: number;
 }
 
+/** UTC calendar day rollup for the summary period. */
+export interface UsageDayEntry {
+  day: string;
+  request_count: number;
+  total_usd: number;
+  total_tokens: number;
+}
+
+/** Model / alias rollup for the summary period. */
+export interface UsageModelEntry {
+  label: string;
+  provider_kind: string | null;
+  request_count: number;
+  total_usd: number;
+  total_tokens: number;
+}
+
 export interface UsageSummaryResponse {
   period: string;
   total_usd: number;
   request_count: number;
+  /** Present when summary was scoped with `key_id`. */
+  key_id?: string | null;
   entries: UsageSummaryEntry[];
+  /** Period-accurate daily spend (not limited to recent-N records). */
+  by_day?: UsageDayEntry[];
+  /** Period-accurate model/alias spend. */
+  by_model?: UsageModelEntry[];
 }
 
 export interface UsageRecord {
@@ -411,9 +434,15 @@ export function createAdminApi(fetchImpl?: FetchLike) {
     },
 
     usage: {
-      /** Period rollup by key. */
-      summary: async (period?: string) => {
-        const q = period ? `?period=${encodeURIComponent(period)}` : "";
+      /**
+       * Period rollup: by key + by day + by model.
+       * Optional `keyId` scopes day/model (and reported totals) to one key.
+       */
+      summary: async (period?: string, keyId?: string) => {
+        const params = new URLSearchParams();
+        if (period) params.set("period", period);
+        if (keyId) params.set("key_id", keyId);
+        const q = params.toString() ? `?${params}` : "";
         return adminRequest<UsageSummaryResponse>(`/admin/usage/summary${q}`, opts());
       },
       list: async (limit = 50, keyId?: string) => {

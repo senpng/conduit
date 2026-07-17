@@ -250,31 +250,27 @@ fn spawn_callback_server(
     let sid = session_id.clone();
 
     tokio::spawn(async move {
-        let app = axum::Router::new()
-            .route(
-                callback_path,
-                axum::routing::get({
-                    let state = state_cb.clone();
-                    let sid = sid.clone();
-                    move |q: Query<CallbackQuery>| {
-                        let state = state.clone();
-                        let sid = sid.clone();
-                        async move { handle_callback(state, sid, kind, q.0).await }
-                    }
-                }),
-            )
-            .route(
+        // Bind the provider-specific path. Codex uses `/auth/callback` and also
+        // accepts a `/callback` alias; Claude's path *is* `/callback`, so do not
+        // register it twice (axum panics on overlapping method routes).
+        let make_handler = |state: Arc<DaemonState>, sid: String| {
+            move |q: Query<CallbackQuery>| {
+                let state = state.clone();
+                let sid = sid.clone();
+                async move { handle_callback(state, sid, kind, q.0).await }
+            }
+        };
+
+        let mut app = axum::Router::new().route(
+            callback_path,
+            axum::routing::get(make_handler(state_cb.clone(), sid.clone())),
+        );
+        if callback_path != "/callback" {
+            app = app.route(
                 "/callback",
-                axum::routing::get({
-                    let state = state_cb.clone();
-                    let sid = sid.clone();
-                    move |q: Query<CallbackQuery>| {
-                        let state = state.clone();
-                        let sid = sid.clone();
-                        async move { handle_callback(state, sid, kind, q.0).await }
-                    }
-                }),
+                axum::routing::get(make_handler(state_cb.clone(), sid.clone())),
             );
+        }
 
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let listener = match tokio::net::TcpListener::bind(addr).await {

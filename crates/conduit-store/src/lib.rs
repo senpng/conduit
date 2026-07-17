@@ -20,7 +20,9 @@ pub use route_repo::RouteRepo;
 pub use schema::{
     AppEventRow, DownstreamKeyRow, PricingRow, ProviderRow, RouteRow, UsageRecordRow,
 };
-pub use usage_repo::{new_usage_record, UsageRepo, UsageSummaryRow};
+pub use usage_repo::{
+    new_usage_record, UsageDayRow, UsageModelRow, UsageRepo, UsageSummaryRow,
+};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     SqlitePool,

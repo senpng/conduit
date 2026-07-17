@@ -203,6 +203,19 @@ describe("usage client", () => {
             total_tokens: 15,
           },
         ],
+        by_day: [
+          { day: "2026-07-01", request_count: 1, total_usd: 0.5, total_tokens: 5 },
+          { day: "2026-07-15", request_count: 1, total_usd: 1.0, total_tokens: 10 },
+        ],
+        by_model: [
+          {
+            label: "gpt-5.6-terra",
+            provider_kind: "codex-oauth",
+            request_count: 2,
+            total_usd: 1.5,
+            total_tokens: 15,
+          },
+        ],
       });
     });
     const api = createAdminApi(fetchImpl);
@@ -210,6 +223,29 @@ describe("usage client", () => {
     expect(list.period).toBe("2026-07");
     expect(list.entries).toHaveLength(1);
     expect(list.total_usd).toBe(1.5);
+    expect(list.by_day).toHaveLength(2);
+    expect(list.by_model?.[0].label).toBe("gpt-5.6-terra");
+  });
+
+  it("summary passes period and key_id query params", async () => {
+    const fetchImpl = mockFetch((url) => {
+      expect(url).toBe(
+        "http://127.0.0.1:4001/admin/usage/summary?period=2026-06&key_id=k1",
+      );
+      return jsonResponse({
+        period: "2026-06",
+        total_usd: 0,
+        request_count: 0,
+        key_id: "k1",
+        entries: [],
+        by_day: [],
+        by_model: [],
+      });
+    });
+    const api = createAdminApi(fetchImpl);
+    const list = await api.usage.summary("2026-06", "k1");
+    expect(list.period).toBe("2026-06");
+    expect(list.key_id).toBe("k1");
   });
 });
 

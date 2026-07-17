@@ -17,7 +17,6 @@
     fmtDay,
     fmtAgo,
     fmtTokens,
-    dayKey,
     shortId,
     providerNameMap,
   } from "../lib/format";
@@ -43,9 +42,12 @@
 
   async function load(): Promise<void> {
     try {
+      const key = keyFilter || undefined;
+      // Summary carries period-accurate by_day / by_model (scoped when a key is selected).
+      // Records list remains a recent window for the ledger table only.
       const [s, r] = await Promise.all([
-        usageApi.summary(),
-        usageApi.list(limit, keyFilter || undefined),
+        usageApi.summary(undefined, key),
+        usageApi.list(limit, key),
       ]);
       summary = s;
       records = r.entries ?? [];
@@ -87,7 +89,7 @@
     return keyNames.get(id) ?? shortId(id, 8);
   }
 
-  // ── By day (from loaded records — window labeled honestly) ───────────────
+  // ── By day (period-accurate from summary.by_day, UTC) ────────────────────
 
   interface DayRow {
     day: string;
@@ -97,19 +99,13 @@
   }
 
   const byDay = $derived.by((): DayRow[] => {
-    const m = new Map<string, DayRow>();
-    for (const r of records) {
-      const k = dayKey(r.ts);
-      let d = m.get(k);
-      if (!d) {
-        d = { day: k, cost: 0, requests: 0, tokens: 0 };
-        m.set(k, d);
-      }
-      d.cost += r.cost_usd;
-      d.requests += 1;
-      d.tokens += r.total_tokens ?? 0;
-    }
-    return [...m.values()].sort((a, b) => (a.day < b.day ? -1 : 1));
+    const rows = summary?.by_day ?? [];
+    return rows.map((d) => ({
+      day: d.day,
+      cost: d.total_usd,
+      requests: d.request_count,
+      tokens: d.total_tokens ?? 0,
+    }));
   });
 
   const dayMax = $derived(Math.max(1e-9, ...byDay.map((d) => d.cost)));
@@ -118,7 +114,7 @@
   );
   const dayWindow = $derived(
     byDay.length > 0
-      ? `${fmtDay(byDay[0].day)} → ${fmtDay(byDay[byDay.length - 1].day)}`
+      ? `${fmtDay(byDay[0].day)} → ${fmtDay(byDay[byDay.length - 1].day)} · full period (UTC)`
       : "",
   );
 
@@ -129,7 +125,7 @@
     return i % step === 0;
   }
 
-  // ── By model / alias (from loaded records) ───────────────────────────────
+  // ── By model / alias (period-accurate from summary.by_model) ──────────────
 
   interface ModelRow {
     label: string;
@@ -140,19 +136,14 @@
   }
 
   const byModel = $derived.by((): ModelRow[] => {
-    const m = new Map<string, ModelRow>();
-    for (const r of records) {
-      const label = r.alias || r.model_id || "(unknown)";
-      let row = m.get(label);
-      if (!row) {
-        row = { label, kind: r.provider_kind, requests: 0, tokens: 0, cost: 0 };
-        m.set(label, row);
-      }
-      row.requests += 1;
-      row.tokens += r.total_tokens ?? 0;
-      row.cost += r.cost_usd;
-    }
-    const all = [...m.values()].sort((a, b) => b.cost - a.cost);
+    const rows = summary?.by_model ?? [];
+    const all = rows.map((m) => ({
+      label: m.label,
+      kind: m.provider_kind,
+      requests: m.request_count,
+      tokens: m.total_tokens ?? 0,
+      cost: m.total_usd,
+    }));
     if (all.length <= 10) return all;
     const top = all.slice(0, 9);
     const rest = all.slice(9);
@@ -166,7 +157,8 @@
     return top;
   });
 
-  const recordsCostTotal = $derived(records.reduce((s, r) => s + r.cost_usd, 0));
+  /** Period model total (for share bars) — not the recent-N ledger window. */
+  const modelCostTotal = $derived(byModel.reduce((s, m) => s + m.cost, 0));
 
   function share(cost: number, total: number): number {
     return total > 0 ? Math.round((cost / total) * 1000) / 10 : 0;
@@ -248,16 +240,17 @@
     </div>
   </div>
 
-  <!-- Daily spend chart (from loaded records) -->
+  <!-- Daily spend chart (period-accurate SQL rollup) -->
   <div class="panel">
     <div class="row-between">
       <span class="panel-title">Daily spend</span>
       <span class="muted tiny">
-        {dayWindow} · from latest {records.length} loaded records
+        {dayWindow || "no data"}
+        {#if keyFilter} · {keyLabel(keyFilter)}{/if}
       </span>
     </div>
     {#if byDay.length === 0}
-      <p class="empty">No usage records in window.</p>
+      <p class="empty">No usage this period.</p>
     {:else}
       <div class="chart" role="img" aria-label="Daily spend bar chart">
         {#each byDay as d (d.day)}
@@ -369,11 +362,11 @@
       {/if}
     </div>
 
-    <!-- By model / alias (from loaded records) -->
+    <!-- By model / alias (period-accurate) -->
     <div class="panel">
-      <span class="panel-title">By model / alias — loaded window</span>
+      <span class="panel-title">By model / alias — this period</span>
       {#if byModel.length === 0}
-        <p class="empty">No records in window.</p>
+        <p class="empty">No usage this period.</p>
       {:else}
         <table class="table">
           <thead>
@@ -400,11 +393,11 @@
                     <div class="meter" style="flex:1">
                       <div
                         class="meter-fill"
-                        style:width="{share(m.cost, recordsCostTotal)}%"
+                        style:width="{share(m.cost, modelCostTotal)}%"
                       ></div>
                     </div>
                     <span class="muted tiny mono" style="width:38px; text-align:right">
-                      {share(m.cost, recordsCostTotal)}%
+                      {share(m.cost, modelCostTotal)}%
                     </span>
                   </div>
                 </td>

@@ -22,6 +22,10 @@ struct ToolAcc {
     start_emitted: bool,
     /// True once any `input_json_delta` was streamed live after start.
     args_live_streamed: bool,
+    /// True after `content_block_stop` for this tool. Prevents `close_open_blocks`
+    /// on finish from re-emitting a second empty `tool_use` (Anthropic-native
+    /// path already closed the block before `message_delta`).
+    closed: bool,
 }
 
 /// Stateful encoder: IR chunks → Anthropic Messages SSE frames.
@@ -134,9 +138,10 @@ impl AnthropicStreamEncoder {
                 .find(|(oi, _)| self.tool_block_indexes.get(oi) == Some(&idx))
             {
                 let _ = oi;
-                if acc.start_emitted {
+                if acc.start_emitted && !acc.closed {
                     out.push(content_block_stop(idx));
                     acc.start_emitted = false;
+                    acc.closed = true;
                 }
             }
             return out;
@@ -215,33 +220,40 @@ impl AnthropicStreamEncoder {
         // Tool argument delta
         if let Some(BlockDelta::InputJsonDelta { partial_json }) = &chunk.delta {
             let openai_idx = chunk.block_index;
-            {
-                let acc = self.tools.entry(openai_idx).or_default();
-                if !partial_json.is_empty() {
-                    acc.arguments.push_str(partial_json);
+            let already_closed = self
+                .tools
+                .get(&openai_idx)
+                .map(|a| a.closed)
+                .unwrap_or(false);
+            if !already_closed {
+                {
+                    let acc = self.tools.entry(openai_idx).or_default();
+                    if !partial_json.is_empty() {
+                        acc.arguments.push_str(partial_json);
+                    }
                 }
-            }
-            // Emit start if we can; stream args live once started.
-            let can_start = self
-                .tools
-                .get(&openai_idx)
-                .map(|a| !a.start_emitted && !a.name.is_empty() && !a.id.is_empty())
-                .unwrap_or(false);
-            if can_start {
-                self.stop_text(&mut out);
-                self.stop_thinking(&mut out);
-                self.emit_tool_start(openai_idx, &mut out);
-            }
-            let started = self
-                .tools
-                .get(&openai_idx)
-                .map(|a| a.start_emitted)
-                .unwrap_or(false);
-            if started && !partial_json.is_empty() {
-                let block_idx = self.tool_content_index(openai_idx);
-                out.push(input_json_delta(block_idx, partial_json));
-                if let Some(acc) = self.tools.get_mut(&openai_idx) {
-                    acc.args_live_streamed = true;
+                // Emit start if we can; stream args live once started.
+                let can_start = self
+                    .tools
+                    .get(&openai_idx)
+                    .map(|a| !a.start_emitted && !a.name.is_empty() && !a.id.is_empty())
+                    .unwrap_or(false);
+                if can_start {
+                    self.stop_text(&mut out);
+                    self.stop_thinking(&mut out);
+                    self.emit_tool_start(openai_idx, &mut out);
+                }
+                let started = self
+                    .tools
+                    .get(&openai_idx)
+                    .map(|a| a.start_emitted)
+                    .unwrap_or(false);
+                if started && !partial_json.is_empty() {
+                    let block_idx = self.tool_content_index(openai_idx);
+                    out.push(input_json_delta(block_idx, partial_json));
+                    if let Some(acc) = self.tools.get_mut(&openai_idx) {
+                        acc.args_live_streamed = true;
+                    }
                 }
             }
         }
@@ -294,6 +306,9 @@ impl AnthropicStreamEncoder {
     fn handle_tool_start(&mut self, chunk: &CanonicalChunk, out: &mut Vec<String>) {
         let openai_idx = chunk.block_index;
         let acc = self.tools.entry(openai_idx).or_default();
+        if acc.closed {
+            return;
+        }
         if let Some(id) = &chunk.tool_use_id {
             if !id.is_empty() {
                 acc.id = id.clone();
@@ -317,7 +332,10 @@ impl AnthropicStreamEncoder {
             (
                 acc.id.clone(),
                 acc.name.clone(),
-                acc.start_emitted || acc.name.is_empty() || acc.id.is_empty(),
+                acc.closed
+                    || acc.start_emitted
+                    || acc.name.is_empty()
+                    || acc.id.is_empty(),
             )
         };
         if already {
@@ -396,8 +414,18 @@ impl AnthropicStreamEncoder {
         }
 
         // Belated tool starts + stop all tools (CLIProxyAPI finish_reason path).
+        // Skip tools already closed via explicit content_block_stop (Anthropic→IR→Anthropic).
         let indexes: Vec<u32> = self.tools.keys().copied().collect();
         for openai_idx in indexes {
+            if self
+                .tools
+                .get(&openai_idx)
+                .map(|a| a.closed)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
             let needs_start = self
                 .tools
                 .get(&openai_idx)
@@ -433,6 +461,7 @@ impl AnthropicStreamEncoder {
             }
             out.push(content_block_stop(block_idx));
             acc.start_emitted = false;
+            acc.closed = true;
         }
         self.content_blocks_stopped = true;
     }
@@ -720,5 +749,137 @@ mod tests {
         let joined = frames.join("");
         assert!(joined.contains("end_turn"));
         assert!(!joined.contains("\"stop_reason\":\"tool_use\""));
+    }
+
+    /// Anthropic-native IR already emits content_block_stop before message_delta.
+    /// finish must not re-open tools with empty `input: {}` (Claude Code then
+    /// shows "Invalid tool parameters" / missing required fields).
+    #[test]
+    fn anthropic_native_tool_stop_before_finish_does_not_reemit() {
+        let mut enc = AnthropicStreamEncoder::new("msg_1", "claude-opus");
+        let start = CanonicalChunk {
+            request_id: String::new(),
+            index: 0,
+            block_index: 0,
+            block_kind: Some(BlockKind::ToolUse),
+            delta: None,
+            finish_reason: None,
+            usage: None,
+            tool_use_id: Some("toolu_abc".into()),
+            tool_name: Some("Bash".into()),
+        };
+        let args = CanonicalChunk {
+            request_id: String::new(),
+            index: 0,
+            block_index: 0,
+            block_kind: None,
+            delta: Some(BlockDelta::InputJsonDelta {
+                partial_json: r#"{"command":"pwd"}"#.into(),
+            }),
+            finish_reason: None,
+            usage: None,
+            tool_use_id: None,
+            tool_name: None,
+        };
+        // Explicit content_block_stop (all fields empty except block_index).
+        let block_stop = CanonicalChunk {
+            request_id: String::new(),
+            index: 0,
+            block_index: 0,
+            block_kind: None,
+            delta: None,
+            finish_reason: None,
+            usage: None,
+            tool_use_id: None,
+            tool_name: None,
+        };
+        let frames: Vec<_> = enc
+            .push(&start)
+            .into_iter()
+            .chain(enc.push(&args))
+            .chain(enc.push(&block_stop))
+            .chain(enc.push(&finish(FinishReason::ToolCalls)))
+            .collect();
+        let joined = frames.join("");
+
+        // Count SSE event lines only (JSON body also contains the type string).
+        let block_starts = joined.matches("event: content_block_start").count();
+        assert_eq!(
+            block_starts, 1,
+            "expected single tool block start, got:\n{joined}"
+        );
+        assert!(
+            joined.contains(r#"{"command":"pwd"}"#)
+                || joined.contains(r#"\"command\":\"pwd\""#)
+        );
+        // Ensure we did not emit a second tool_use start after stop.
+        let first_stop = joined.find("event: content_block_stop").expect("stop");
+        let after_stop = &joined[first_stop..];
+        assert!(
+            !after_stop.contains("event: content_block_start"),
+            "re-emitted tool after stop:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn two_anthropic_tools_stop_then_finish_once_each() {
+        let mut enc = AnthropicStreamEncoder::new("msg_1", "claude-opus");
+        let mk_start = |idx: u32, id: &str, name: &str| CanonicalChunk {
+            request_id: String::new(),
+            index: 0,
+            block_index: idx,
+            block_kind: Some(BlockKind::ToolUse),
+            delta: None,
+            finish_reason: None,
+            usage: None,
+            tool_use_id: Some(id.into()),
+            tool_name: Some(name.into()),
+        };
+        let mk_args = |idx: u32, json: &str| CanonicalChunk {
+            request_id: String::new(),
+            index: 0,
+            block_index: idx,
+            block_kind: None,
+            delta: Some(BlockDelta::InputJsonDelta {
+                partial_json: json.into(),
+            }),
+            finish_reason: None,
+            usage: None,
+            tool_use_id: None,
+            tool_name: None,
+        };
+        let mk_stop = |idx: u32| CanonicalChunk {
+            request_id: String::new(),
+            index: 0,
+            block_index: idx,
+            block_kind: None,
+            delta: None,
+            finish_reason: None,
+            usage: None,
+            tool_use_id: None,
+            tool_name: None,
+        };
+
+        let frames: Vec<_> = enc
+            .push(&mk_start(0, "toolu_1", "Bash"))
+            .into_iter()
+            .chain(enc.push(&mk_args(0, r#"{"command":"ls"}"#)))
+            .chain(enc.push(&mk_stop(0)))
+            .chain(enc.push(&mk_start(1, "toolu_2", "Bash")))
+            .chain(enc.push(&mk_args(1, r#"{"command":"pwd"}"#)))
+            .chain(enc.push(&mk_stop(1)))
+            .chain(enc.push(&finish(FinishReason::ToolCalls)))
+            .collect();
+        let joined = frames.join("");
+        assert_eq!(
+            joined.matches("event: content_block_start").count(),
+            2,
+            "expected exactly 2 tool starts:\n{joined}"
+        );
+        assert!(joined.contains("toolu_1") && joined.contains("toolu_2"));
+        // No third start after final stop / message_delta.
+        let last_stop = joined.rfind("event: content_block_stop").unwrap();
+        let after = &joined[last_stop..];
+        assert!(!after.contains("event: content_block_start"), "{joined}");
     }
 }

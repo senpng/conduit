@@ -134,6 +134,118 @@ impl<'a> UsageRepo<'a> {
             })
             .collect())
     }
+
+    /// Daily rollup for a calendar period (`YYYY-MM`), UTC day from `ts` prefix.
+    ///
+    /// Optional `key_id` scopes to one downstream key. Used by the Usage UI so
+    /// "Daily spend" is period-accurate (not limited to the recent-N records window).
+    #[instrument(skip(self))]
+    pub async fn summary_by_day(
+        &self,
+        period: &str,
+        key_id: Option<&str>,
+    ) -> Result<Vec<UsageDayRow>, StoreError> {
+        let pattern = format!("{period}%");
+        let rows = match key_id {
+            Some(kid) => sqlx::query(
+                r#"SELECT
+                       substr(ts, 1, 10) AS day,
+                       COUNT(*) AS request_count,
+                       COALESCE(SUM(cost_usd), 0) AS total_usd,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                   FROM usage_records
+                   WHERE ts LIKE ? AND downstream_key_id = ?
+                   GROUP BY substr(ts, 1, 10)
+                   ORDER BY day ASC"#,
+            )
+            .bind(&pattern)
+            .bind(kid)
+            .fetch_all(self.pool)
+            .await,
+            None => sqlx::query(
+                r#"SELECT
+                       substr(ts, 1, 10) AS day,
+                       COUNT(*) AS request_count,
+                       COALESCE(SUM(cost_usd), 0) AS total_usd,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                   FROM usage_records
+                   WHERE ts LIKE ?
+                   GROUP BY substr(ts, 1, 10)
+                   ORDER BY day ASC"#,
+            )
+            .bind(&pattern)
+            .fetch_all(self.pool)
+            .await,
+        }
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| UsageDayRow {
+                day: r.get("day"),
+                request_count: r.get::<i64, _>("request_count") as u64,
+                total_usd: r.get("total_usd"),
+                total_tokens: r.get::<i64, _>("total_tokens") as u64,
+            })
+            .collect())
+    }
+
+    /// Model/alias rollup for a calendar period (`YYYY-MM`).
+    #[instrument(skip(self))]
+    pub async fn summary_by_model(
+        &self,
+        period: &str,
+        key_id: Option<&str>,
+    ) -> Result<Vec<UsageModelRow>, StoreError> {
+        let pattern = format!("{period}%");
+        let rows = match key_id {
+            Some(kid) => sqlx::query(
+                r#"SELECT
+                       COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
+                       provider_kind,
+                       COUNT(*) AS request_count,
+                       COALESCE(SUM(cost_usd), 0) AS total_usd,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                   FROM usage_records
+                   WHERE ts LIKE ? AND downstream_key_id = ?
+                   GROUP BY COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
+                            provider_kind
+                   ORDER BY total_usd DESC"#,
+            )
+            .bind(&pattern)
+            .bind(kid)
+            .fetch_all(self.pool)
+            .await,
+            None => sqlx::query(
+                r#"SELECT
+                       COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
+                       provider_kind,
+                       COUNT(*) AS request_count,
+                       COALESCE(SUM(cost_usd), 0) AS total_usd,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                   FROM usage_records
+                   WHERE ts LIKE ?
+                   GROUP BY COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
+                            provider_kind
+                   ORDER BY total_usd DESC"#,
+            )
+            .bind(&pattern)
+            .fetch_all(self.pool)
+            .await,
+        }
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| UsageModelRow {
+                label: r.get("label"),
+                provider_kind: r.get("provider_kind"),
+                request_count: r.get::<i64, _>("request_count") as u64,
+                total_usd: r.get("total_usd"),
+                total_tokens: r.get::<i64, _>("total_tokens") as u64,
+            })
+            .collect())
+    }
 }
 
 /// Period rollup used by admin summary.
@@ -144,6 +256,26 @@ pub struct UsageSummaryRow {
     pub total_usd: f64,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// One UTC calendar day within a period summary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageDayRow {
+    /// `YYYY-MM-DD` (UTC, from `ts` prefix).
+    pub day: String,
+    pub request_count: u64,
+    pub total_usd: f64,
+    pub total_tokens: u64,
+}
+
+/// One model/alias within a period summary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageModelRow {
+    pub label: String,
+    pub provider_kind: Option<String>,
+    pub request_count: u64,
+    pub total_usd: f64,
     pub total_tokens: u64,
 }
 
@@ -333,5 +465,23 @@ mod tests {
         let k2 = sum.iter().find(|s| s.downstream_key_id == "k2").unwrap();
         assert_eq!(k2.request_count, 1);
         assert!((k2.total_usd - 0.5).abs() < 1e-9);
+
+        let by_day = repo.summary_by_day("2026-07", None).await.unwrap();
+        assert_eq!(by_day.len(), 3); // 01, 15, 20
+        assert_eq!(by_day[0].day, "2026-07-01");
+        assert!((by_day[0].total_usd - 1.0).abs() < 1e-9);
+        let day15 = by_day.iter().find(|d| d.day == "2026-07-15").unwrap();
+        assert!((day15.total_usd - 2.5).abs() < 1e-9);
+
+        let k1_days = repo.summary_by_day("2026-07", Some("k1")).await.unwrap();
+        assert_eq!(k1_days.len(), 2);
+        assert!(k1_days.iter().all(|d| d.day.starts_with("2026-07")));
+
+        // Alias rollup (rows above have no alias — label falls back to "(unknown)")
+        let by_model = repo.summary_by_model("2026-07", None).await.unwrap();
+        assert!(!by_model.is_empty());
+        let unknown = by_model.iter().find(|m| m.label == "(unknown)").unwrap();
+        assert_eq!(unknown.request_count, 3);
+        assert!((unknown.total_usd - 4.0).abs() < 1e-9);
     }
 }

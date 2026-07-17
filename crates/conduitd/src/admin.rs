@@ -643,9 +643,11 @@ pub async fn list_usage(
 pub struct UsageSummaryQuery {
     /// `YYYY-MM`; defaults to current UTC month.
     pub period: Option<String>,
+    /// Optional downstream key scope for `by_day` / `by_model` rollups.
+    pub key_id: Option<String>,
 }
 
-/// GET /admin/usage/summary — aggregate spend by key for a calendar month.
+/// GET /admin/usage/summary — aggregate spend by key / day / model for a calendar month.
 pub async fn usage_summary(
     State(state): State<Arc<DaemonState>>,
     Query(q): Query<UsageSummaryQuery>,
@@ -655,31 +657,65 @@ pub async fn usage_summary(
     let period = q
         .period
         .unwrap_or_else(|| format!("{:04}-{:02}", now.year(), now.month()));
+    let key_id = q.key_id.as_deref().filter(|s| !s.is_empty());
     let repo = UsageRepo::new(&state.pool);
-    match repo.summary_period(&period).await {
-        Ok(entries) => {
-            let total_usd: f64 = entries.iter().map(|e| e.total_usd).sum();
-            let request_count: u64 = entries.iter().map(|e| e.request_count).sum();
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "period": period,
-                    "total_usd": total_usd,
-                    "request_count": request_count,
-                    "entries": entries.iter().map(|e| json!({
-                        "downstream_key_id": e.downstream_key_id,
-                        "request_count": e.request_count,
-                        "total_usd": e.total_usd,
-                        "prompt_tokens": e.prompt_tokens,
-                        "completion_tokens": e.completion_tokens,
-                        "total_tokens": e.total_tokens,
-                    })).collect::<Vec<_>>(),
-                })),
-            )
-                .into_response()
-        }
-        Err(e) => internal(e).into_response(),
-    }
+
+    let entries = match repo.summary_period(&period).await {
+        Ok(e) => e,
+        Err(e) => return internal(e).into_response(),
+    };
+    let by_day = match repo.summary_by_day(&period, key_id).await {
+        Ok(d) => d,
+        Err(e) => return internal(e).into_response(),
+    };
+    let by_model = match repo.summary_by_model(&period, key_id).await {
+        Ok(m) => m,
+        Err(e) => return internal(e).into_response(),
+    };
+
+    // Top-level totals: when a key filter is set, sum only that key's entry so
+    // cards match the scoped day/model charts.
+    let scoped_entries: Vec<_> = match key_id {
+        Some(kid) => entries
+            .iter()
+            .filter(|e| e.downstream_key_id == kid)
+            .collect(),
+        None => entries.iter().collect(),
+    };
+    let total_usd: f64 = scoped_entries.iter().map(|e| e.total_usd).sum();
+    let request_count: u64 = scoped_entries.iter().map(|e| e.request_count).sum();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "period": period,
+            "total_usd": total_usd,
+            "request_count": request_count,
+            "key_id": key_id,
+            "entries": entries.iter().map(|e| json!({
+                "downstream_key_id": e.downstream_key_id,
+                "request_count": e.request_count,
+                "total_usd": e.total_usd,
+                "prompt_tokens": e.prompt_tokens,
+                "completion_tokens": e.completion_tokens,
+                "total_tokens": e.total_tokens,
+            })).collect::<Vec<_>>(),
+            "by_day": by_day.iter().map(|d| json!({
+                "day": d.day,
+                "request_count": d.request_count,
+                "total_usd": d.total_usd,
+                "total_tokens": d.total_tokens,
+            })).collect::<Vec<_>>(),
+            "by_model": by_model.iter().map(|m| json!({
+                "label": m.label,
+                "provider_kind": m.provider_kind,
+                "request_count": m.request_count,
+                "total_usd": m.total_usd,
+                "total_tokens": m.total_tokens,
+            })).collect::<Vec<_>>(),
+        })),
+    )
+        .into_response()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
