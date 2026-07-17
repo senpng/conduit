@@ -1,0 +1,89 @@
+# ── Rust ──────────────────────────────────────────────────────────────────────
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# ── conduit-ui (Node / Vite / Svelte) ─────────────────────────────────────────
+conduit-ui/node_modules/
+conduit-ui/dist/
+conduit-ui/.vite/
+conduit-ui/.svelte-kit/
+conduit-ui/*.local
+conduit-ui/.env
+conduit-ui/.env.*
+!conduit-ui/.env.example
+
+# ── Tauri ─────────────────────────────────────────────────────────────────────
+conduit-ui/src-tauri/target/
+# Wix / NSIS / bundle artifacts (if built locally)
+conduit-ui/src-tauri/WixTools/
+conduit-ui/src-tauri/*.app
+conduit-ui/src-tauri/*.dmg
+conduit-ui/src-tauri/*.AppImage
+conduit-ui/src-tauri/*.deb
+conduit-ui/src-tauri/*.rpm
+conduit-ui/src-tauri/*.msi
+conduit-ui/src-tauri/*.exe
+
+# ── Local runtime data (default ~/.conduit is outside repo; keep local copies out)
+/data/
+/.conduit/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# ── Secrets & local config ────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!*.pub
+conduit.toml.local
+**/secrets/
+**/credentials/
+
+# ── IDE / editor ──────────────────────────────────────────────────────────────
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# ── OS junk ───────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+
+# ── Logs / coverage / temp ────────────────────────────────────────────────────
+*.log
+logs/
+coverage/
+.nyc_output/
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+
+# ── Test / fuzz / profiling artifacts ─────────────────────────────────────────
+*.profraw
+*.profdata
+flamegraph.svg
+perf.data*
+fuzz/artifacts/
+fuzz/corpus/
+
+# ── Claude / agent local state (optional local-only) ──────────────────────────
+.claude/settings.local.json

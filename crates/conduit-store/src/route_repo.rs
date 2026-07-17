@@ -1,0 +1,244 @@
+use chrono::Utc;
+use sqlx::{Row, SqlitePool};
+use tracing::instrument;
+
+use crate::{schema::RouteRow, StoreError};
+
+pub struct RouteRepo<'a> {
+    pool: &'a SqlitePool,
+}
+
+impl<'a> RouteRepo<'a> {
+    pub fn new(pool: &'a SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    #[instrument(skip(self, row))]
+    pub async fn upsert(&self, row: &RouteRow) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"INSERT INTO routes
+               (id, match_alias, strategy, targets_json, retry_policy_json, enabled, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   match_alias        = excluded.match_alias,
+                   strategy           = excluded.strategy,
+                   targets_json       = excluded.targets_json,
+                   retry_policy_json  = excluded.retry_policy_json,
+                   enabled            = excluded.enabled,
+                   updated_at         = excluded.updated_at"#,
+        )
+        .bind(&row.id)
+        .bind(&row.match_alias)
+        .bind(&row.strategy)
+        .bind(&row.targets_json)
+        .bind(&row.retry_policy_json)
+        .bind(row.enabled as i32)
+        .bind(&row.created_at)
+        .bind(&row.updated_at)
+        .execute(self.pool)
+        .await
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self, row))]
+    pub async fn insert(&self, row: &RouteRow) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"INSERT INTO routes
+               (id, match_alias, strategy, targets_json, retry_policy_json, enabled, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&row.id)
+        .bind(&row.match_alias)
+        .bind(&row.strategy)
+        .bind(&row.targets_json)
+        .bind(&row.retry_policy_json)
+        .bind(row.enabled as i32)
+        .bind(&row.created_at)
+        .bind(&row.updated_at)
+        .execute(self.pool)
+        .await
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    pub async fn get(&self, id: &str) -> Result<Option<RouteRow>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, match_alias, strategy, targets_json, retry_policy_json, enabled, created_at, updated_at
+             FROM routes WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(self.pool)
+        .await
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?
+        .map(map_route_row);
+        Ok(row)
+    }
+
+    #[instrument(skip(self))]
+    pub async fn get_by_alias(&self, alias: &str) -> Result<Option<RouteRow>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, match_alias, strategy, targets_json, retry_policy_json, enabled, created_at, updated_at
+             FROM routes WHERE match_alias = ? AND enabled = 1",
+        )
+        .bind(alias)
+        .fetch_optional(self.pool)
+        .await
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?
+        .map(map_route_row);
+        Ok(row)
+    }
+
+    /// List all enabled routes.
+    #[instrument(skip(self))]
+    pub async fn list(&self) -> Result<Vec<RouteRow>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, match_alias, strategy, targets_json, retry_policy_json, enabled, created_at, updated_at
+             FROM routes WHERE enabled = 1 ORDER BY match_alias ASC",
+        )
+        .fetch_all(self.pool)
+        .await
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?
+        .into_iter()
+        .map(map_route_row)
+        .collect();
+        Ok(rows)
+    }
+
+    /// List all routes including disabled ones.
+    #[instrument(skip(self))]
+    pub async fn list_all(&self) -> Result<Vec<RouteRow>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, match_alias, strategy, targets_json, retry_policy_json, enabled, created_at, updated_at
+             FROM routes ORDER BY match_alias ASC",
+        )
+        .fetch_all(self.pool)
+        .await
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?
+        .into_iter()
+        .map(map_route_row)
+        .collect();
+        Ok(rows)
+    }
+
+    #[instrument(skip(self))]
+    pub async fn set_enabled(&self, id: &str, enabled: bool) -> Result<(), StoreError> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("UPDATE routes SET enabled = ?, updated_at = ? WHERE id = ?")
+            .bind(enabled as i32)
+            .bind(&now)
+            .bind(id)
+            .execute(self.pool)
+            .await
+            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    pub async fn delete(&self, id: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM routes WHERE id = ?")
+            .bind(id)
+            .execute(self.pool)
+            .await
+            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        Ok(())
+    }
+}
+
+fn map_route_row(r: sqlx::sqlite::SqliteRow) -> RouteRow {
+    RouteRow {
+        id: r.get("id"),
+        match_alias: r.get("match_alias"),
+        strategy: r.get("strategy"),
+        targets_json: r.get("targets_json"),
+        retry_policy_json: r
+            .get::<Option<String>, _>("retry_policy_json")
+            .unwrap_or_else(|| "{}".to_string()),
+        enabled: r.get::<i32, _>("enabled") != 0,
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::*;
+    use crate::open_db;
+
+    fn make_row(id: &str, alias: &str) -> RouteRow {
+        let now = Utc::now().to_rfc3339();
+        RouteRow {
+            id: id.to_string(),
+            match_alias: alias.to_string(),
+            strategy: "fixed".into(),
+            targets_json: r#"[{"provider_id":"openai","model_id":"gpt-4o","upstream_key_id":"k1","provider_kind":"openai"}]"#.into(),
+            retry_policy_json: r#"{"max_retries":2,"base_delay_ms":500,"retryable_statuses":[429,500]}"#.into(),
+            enabled: true,
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_get_delete() {
+        let pool = open_db("sqlite::memory:").await.unwrap();
+        let repo = RouteRepo::new(&pool);
+
+        repo.insert(&make_row("r1", "gpt-4o")).await.unwrap();
+        let got = repo.get("r1").await.unwrap().unwrap();
+        assert_eq!(got.match_alias, "gpt-4o");
+
+        repo.delete("r1").await.unwrap();
+        assert!(repo.get("r1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn upsert_updates_fields() {
+        let pool = open_db("sqlite::memory:").await.unwrap();
+        let repo = RouteRepo::new(&pool);
+
+        repo.upsert(&make_row("r2", "alias-a")).await.unwrap();
+
+        let mut updated = make_row("r2", "alias-a");
+        updated.strategy = "fallback".into();
+        repo.upsert(&updated).await.unwrap();
+
+        let got = repo.get("r2").await.unwrap().unwrap();
+        assert_eq!(got.strategy, "fallback");
+    }
+
+    #[tokio::test]
+    async fn retry_policy_json_survives_round_trip() {
+        let pool = open_db("sqlite::memory:").await.unwrap();
+        let repo = RouteRepo::new(&pool);
+
+        let row = make_row("r3", "fast");
+        repo.upsert(&row).await.unwrap();
+
+        let got = repo.get("r3").await.unwrap().unwrap();
+        let rp: serde_json::Value = serde_json::from_str(&got.retry_policy_json).unwrap();
+        assert_eq!(rp["max_retries"], 2);
+        assert_eq!(rp["base_delay_ms"], 500);
+    }
+
+    #[tokio::test]
+    async fn list_excludes_disabled() {
+        let pool = open_db("sqlite::memory:").await.unwrap();
+        let repo = RouteRepo::new(&pool);
+
+        repo.insert(&make_row("r4", "visible")).await.unwrap();
+
+        let mut hidden = make_row("r5", "hidden");
+        hidden.enabled = false;
+        repo.insert(&hidden).await.unwrap();
+
+        let rows = repo.list().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].match_alias, "visible");
+    }
+}

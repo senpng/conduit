@@ -1,0 +1,94 @@
+[workspace]
+members = [
+    "crates/conduit-ir",
+    "crates/conduit-codec",
+    "crates/conduit-secret",
+    "crates/conduit-store",
+    "crates/conduit-trace",
+    "crates/conduit-quota",
+    "crates/conduit-router",
+    "crates/conduit-upstream",
+    "crates/conduit-oauth",
+    "crates/conduit-pipeline",
+    "crates/conduitd",
+    "crates/conduitctl",
+]
+resolver = "2"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io", "codec"] }
+
+# Web framework
+axum = { version = "0.8", features = ["macros"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
+hyper = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+eventsource-stream = "0.2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "migrate", "chrono", "uuid"] }
+
+# Secret / crypto
+secrecy = { version = "0.8", features = ["serde"] }
+zeroize = { version = "1", features = ["derive"] }
+argon2 = "0.5"
+aes-gcm = "0.10"
+keyring = { version = "2" }
+age = { version = "0.10", features = ["armor"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Streams / futures
+futures = "0.3"
+async-trait = "0.1"
+pin-project-lite = "0.2"
+
+# ID generation
+ulid = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Compression
+zstd = "0.13"
+
+# Encoding
+base64 = "0.22"
+hex = "0.4"
+blake3 = "1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Testing
+insta = { version = "1", features = ["json", "redactions"] }
+proptest = "1"
+wiremock = "0.6"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Config
+serde_toml = { package = "toml", version = "0.8" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+debug = true

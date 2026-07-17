@@ -1,0 +1,724 @@
+//! Stateful Anthropic SSE encoder — CLIProxyAPI `ConvertOpenAIResponseToClaude` parity.
+//!
+//! Emits the full lifecycle:
+//! `message_start` → `content_block_start` / `*_delta` / `content_block_stop` →
+//! `message_delta` → `message_stop`.
+
+use std::collections::BTreeMap;
+
+use conduit_ir::canonical::{BlockDelta, BlockKind, CanonicalChunk, FinishReason, Usage};
+use serde_json::json;
+
+/// Synthetic signature stamped onto thinking blocks produced from OpenAI
+/// `reasoning_content`, so multi-turn re-encoding can map them back.
+pub const GPT_THINKING_SIGNATURE: &str = "gpt#conduit";
+
+/// Accumulates tool call pieces until id + name are both known.
+#[derive(Debug, Default)]
+struct ToolAcc {
+    id: String,
+    name: String,
+    arguments: String,
+    start_emitted: bool,
+    /// True once any `input_json_delta` was streamed live after start.
+    args_live_streamed: bool,
+}
+
+/// Stateful encoder: IR chunks → Anthropic Messages SSE frames.
+#[derive(Debug)]
+pub struct AnthropicStreamEncoder {
+    message_id: String,
+    model: String,
+    message_started: bool,
+    text_started: bool,
+    text_index: i32,
+    thinking_started: bool,
+    thinking_index: i32,
+    next_block_index: u32,
+    /// OpenAI tool_calls index → Anthropic content block index.
+    tool_block_indexes: BTreeMap<u32, u32>,
+    tools: BTreeMap<u32, ToolAcc>,
+    saw_tool_call: bool,
+    finish_reason: Option<FinishReason>,
+    content_blocks_stopped: bool,
+    message_delta_sent: bool,
+    message_stop_sent: bool,
+    pending_usage: Option<Usage>,
+}
+
+impl AnthropicStreamEncoder {
+    pub fn new(message_id: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            message_id: message_id.into(),
+            model: model.into(),
+            message_started: false,
+            text_started: false,
+            text_index: -1,
+            thinking_started: false,
+            thinking_index: -1,
+            next_block_index: 0,
+            tool_block_indexes: BTreeMap::new(),
+            tools: BTreeMap::new(),
+            saw_tool_call: false,
+            finish_reason: None,
+            content_blocks_stopped: false,
+            message_delta_sent: false,
+            message_stop_sent: false,
+            pending_usage: None,
+        }
+    }
+
+    /// Emit `message_start` if not already sent. Call at stream open or let
+    /// [`Self::push`] emit it on the first contentful chunk.
+    pub fn ensure_message_start(&mut self, prompt_tokens: u32) -> Option<String> {
+        if self.message_started {
+            return None;
+        }
+        self.message_started = true;
+        Some(encode_message_start_frame(
+            &self.message_id,
+            &self.model,
+            prompt_tokens,
+        ))
+    }
+
+    /// Process one IR chunk; returns zero or more complete SSE frames.
+    pub fn push(&mut self, chunk: &CanonicalChunk) -> Vec<String> {
+        let mut out = Vec::new();
+
+        if let Some(frame) = self.ensure_message_start(0) {
+            out.push(frame);
+        }
+
+        // Usage-only (no finish yet) — stash for message_delta.
+        if chunk.finish_reason.is_none()
+            && chunk.delta.is_none()
+            && chunk.block_kind.is_none()
+            && chunk.tool_use_id.is_none()
+            && chunk.tool_name.is_none()
+        {
+            if let Some(u) = &chunk.usage {
+                self.pending_usage = Some(u.clone());
+                // If we already saw finish_reason, emit message_delta now.
+                if self.finish_reason.is_some() && !self.message_delta_sent {
+                    self.close_open_blocks(&mut out);
+                    self.emit_message_delta(&mut out);
+                    self.emit_message_stop(&mut out);
+                }
+                return out;
+            }
+        }
+
+        // Explicit content_block_stop from Anthropic-native IR (all None except block_index).
+        if chunk.block_kind.is_none()
+            && chunk.delta.is_none()
+            && chunk.finish_reason.is_none()
+            && chunk.usage.is_none()
+            && chunk.tool_use_id.is_none()
+            && chunk.tool_name.is_none()
+        {
+            // Treat as content_block_stop for the given index when a block is open.
+            let idx = chunk.block_index;
+            if self.text_started && self.text_index == idx as i32 {
+                out.push(content_block_stop(idx));
+                self.text_started = false;
+                self.text_index = -1;
+            } else if self.thinking_started && self.thinking_index == idx as i32 {
+                out.push(signature_delta(idx, GPT_THINKING_SIGNATURE));
+                out.push(content_block_stop(idx));
+                self.thinking_started = false;
+                self.thinking_index = -1;
+            } else if let Some((oi, acc)) = self
+                .tools
+                .iter_mut()
+                .find(|(oi, _)| self.tool_block_indexes.get(oi) == Some(&idx))
+            {
+                let _ = oi;
+                if acc.start_emitted {
+                    out.push(content_block_stop(idx));
+                    acc.start_emitted = false;
+                }
+            }
+            return out;
+        }
+
+        // Thinking delta
+        if let Some(BlockDelta::ThinkingDelta { thinking }) = &chunk.delta {
+            if !thinking.is_empty() {
+                self.stop_text(&mut out);
+                self.ensure_thinking_start(&mut out);
+                let idx = self.thinking_index.max(0) as u32;
+                out.push(thinking_delta(idx, thinking));
+            }
+        }
+
+        // Signature delta
+        if let Some(BlockDelta::SignatureDelta { signature }) = &chunk.delta {
+            if self.thinking_started {
+                let idx = self.thinking_index.max(0) as u32;
+                out.push(signature_delta(idx, signature));
+            }
+        }
+
+        // Text delta (with or without block_kind set)
+        if let Some(BlockDelta::TextDelta { text }) = &chunk.delta {
+            if !text.is_empty() {
+                self.stop_thinking(&mut out);
+                self.ensure_text_start(&mut out);
+                let idx = self.text_index.max(0) as u32;
+                out.push(text_delta(idx, text));
+            }
+        }
+
+        // Bare block start (Anthropic-native IR: kind set, no delta)
+        if chunk.delta.is_none() && chunk.finish_reason.is_none() {
+            if let Some(kind) = &chunk.block_kind {
+                match kind {
+                    BlockKind::Text => {
+                        // Only if not already open — OpenAI path uses kind+delta together.
+                        if !self.text_started
+                            && chunk.tool_use_id.is_none()
+                            && chunk.tool_name.is_none()
+                        {
+                            self.stop_thinking(&mut out);
+                            // Prefer upstream block_index when provided as pure start.
+                            if chunk.block_index > 0 || self.next_block_index == 0 {
+                                // assign via ensure
+                            }
+                            self.ensure_text_start(&mut out);
+                        }
+                    }
+                    BlockKind::Thinking => {
+                        if !self.thinking_started
+                            && chunk.tool_use_id.is_none()
+                            && chunk.tool_name.is_none()
+                        {
+                            self.stop_text(&mut out);
+                            self.ensure_thinking_start(&mut out);
+                        }
+                    }
+                    BlockKind::ToolUse => {
+                        self.handle_tool_start(chunk, &mut out);
+                    }
+                    _ => {}
+                }
+            } else if chunk.tool_use_id.is_some() || chunk.tool_name.is_some() {
+                self.handle_tool_start(chunk, &mut out);
+            }
+        } else if matches!(chunk.block_kind, Some(BlockKind::ToolUse))
+            && chunk.delta.is_none()
+            && (chunk.tool_use_id.is_some() || chunk.tool_name.is_some())
+        {
+            self.handle_tool_start(chunk, &mut out);
+        }
+
+        // Tool argument delta
+        if let Some(BlockDelta::InputJsonDelta { partial_json }) = &chunk.delta {
+            let openai_idx = chunk.block_index;
+            {
+                let acc = self.tools.entry(openai_idx).or_default();
+                if !partial_json.is_empty() {
+                    acc.arguments.push_str(partial_json);
+                }
+            }
+            // Emit start if we can; stream args live once started.
+            let can_start = self
+                .tools
+                .get(&openai_idx)
+                .map(|a| !a.start_emitted && !a.name.is_empty() && !a.id.is_empty())
+                .unwrap_or(false);
+            if can_start {
+                self.stop_text(&mut out);
+                self.stop_thinking(&mut out);
+                self.emit_tool_start(openai_idx, &mut out);
+            }
+            let started = self
+                .tools
+                .get(&openai_idx)
+                .map(|a| a.start_emitted)
+                .unwrap_or(false);
+            if started && !partial_json.is_empty() {
+                let block_idx = self.tool_content_index(openai_idx);
+                out.push(input_json_delta(block_idx, partial_json));
+                if let Some(acc) = self.tools.get_mut(&openai_idx) {
+                    acc.args_live_streamed = true;
+                }
+            }
+        }
+
+        // Finish reason
+        if let Some(fr) = &chunk.finish_reason {
+            // CLIProxyAPI: if we saw real tool_use blocks, force tool_calls;
+            // if upstream said tool_calls but never emitted tools → stop.
+            if self.saw_tool_call {
+                self.finish_reason = Some(FinishReason::ToolCalls);
+            } else if matches!(fr, FinishReason::ToolCalls) {
+                self.finish_reason = Some(FinishReason::Stop);
+            } else {
+                self.finish_reason = Some(fr.clone());
+            }
+            if let Some(u) = &chunk.usage {
+                self.pending_usage = Some(u.clone());
+            }
+            self.close_open_blocks(&mut out);
+            // Emit message_delta when we have usage or immediately (CLIProxyAPI
+            // waits for usage when include_usage is on; we emit now and upgrade
+            // is not supported — emit once).
+            if !self.message_delta_sent {
+                self.emit_message_delta(&mut out);
+                self.emit_message_stop(&mut out);
+            }
+        }
+
+        out
+    }
+
+    /// Flush remaining terminal events (open blocks, message_delta, message_stop).
+    pub fn finish(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(frame) = self.ensure_message_start(0) {
+            out.push(frame);
+        }
+        self.close_open_blocks(&mut out);
+        if self.finish_reason.is_none() {
+            // Stream ended without finish_reason — treat as end_turn.
+            self.finish_reason = Some(FinishReason::Stop);
+        }
+        if !self.message_delta_sent {
+            self.emit_message_delta(&mut out);
+        }
+        self.emit_message_stop(&mut out);
+        out
+    }
+
+    fn handle_tool_start(&mut self, chunk: &CanonicalChunk, out: &mut Vec<String>) {
+        let openai_idx = chunk.block_index;
+        let acc = self.tools.entry(openai_idx).or_default();
+        if let Some(id) = &chunk.tool_use_id {
+            if !id.is_empty() {
+                acc.id = id.clone();
+            }
+        }
+        if let Some(name) = &chunk.tool_name {
+            if !name.is_empty() {
+                acc.name = name.clone();
+            }
+        }
+        if !acc.start_emitted && !acc.name.is_empty() && !acc.id.is_empty() {
+            self.stop_text(out);
+            self.stop_thinking(out);
+            self.emit_tool_start(openai_idx, out);
+        }
+    }
+
+    fn emit_tool_start(&mut self, openai_idx: u32, out: &mut Vec<String>) {
+        let (id, name, already) = {
+            let acc = self.tools.entry(openai_idx).or_default();
+            (
+                acc.id.clone(),
+                acc.name.clone(),
+                acc.start_emitted || acc.name.is_empty() || acc.id.is_empty(),
+            )
+        };
+        if already {
+            return;
+        }
+        let block_idx = self.tool_content_index(openai_idx);
+        if let Some(acc) = self.tools.get_mut(&openai_idx) {
+            acc.start_emitted = true;
+        }
+        self.saw_tool_call = true;
+        out.push(tool_use_start(block_idx, &id, &name));
+    }
+
+    fn tool_content_index(&mut self, openai_idx: u32) -> u32 {
+        if let Some(&idx) = self.tool_block_indexes.get(&openai_idx) {
+            return idx;
+        }
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        self.tool_block_indexes.insert(openai_idx, idx);
+        idx
+    }
+
+    fn ensure_text_start(&mut self, out: &mut Vec<String>) {
+        if self.text_started {
+            return;
+        }
+        if self.text_index < 0 {
+            self.text_index = self.next_block_index as i32;
+            self.next_block_index += 1;
+        }
+        let idx = self.text_index as u32;
+        out.push(text_block_start(idx));
+        self.text_started = true;
+    }
+
+    fn ensure_thinking_start(&mut self, out: &mut Vec<String>) {
+        if self.thinking_started {
+            return;
+        }
+        if self.thinking_index < 0 {
+            self.thinking_index = self.next_block_index as i32;
+            self.next_block_index += 1;
+        }
+        let idx = self.thinking_index as u32;
+        out.push(thinking_block_start(idx));
+        self.thinking_started = true;
+    }
+
+    fn stop_text(&mut self, out: &mut Vec<String>) {
+        if !self.text_started {
+            return;
+        }
+        out.push(content_block_stop(self.text_index as u32));
+        self.text_started = false;
+        self.text_index = -1;
+    }
+
+    fn stop_thinking(&mut self, out: &mut Vec<String>) {
+        if !self.thinking_started {
+            return;
+        }
+        let idx = self.thinking_index as u32;
+        out.push(signature_delta(idx, GPT_THINKING_SIGNATURE));
+        out.push(content_block_stop(idx));
+        self.thinking_started = false;
+        self.thinking_index = -1;
+    }
+
+    fn close_open_blocks(&mut self, out: &mut Vec<String>) {
+        self.stop_thinking(out);
+        self.stop_text(out);
+
+        if self.content_blocks_stopped {
+            return;
+        }
+
+        // Belated tool starts + stop all tools (CLIProxyAPI finish_reason path).
+        let indexes: Vec<u32> = self.tools.keys().copied().collect();
+        for openai_idx in indexes {
+            let needs_start = self
+                .tools
+                .get(&openai_idx)
+                .map(|a| !a.start_emitted && !a.name.is_empty())
+                .unwrap_or(false);
+            if needs_start {
+                // Synthetic id if missing (CLIProxyAPI SanitizeClaudeToolID).
+                {
+                    let acc = self.tools.entry(openai_idx).or_default();
+                    if acc.id.is_empty() {
+                        acc.id = format!("toolu_conduit_{openai_idx}");
+                    }
+                }
+                self.emit_tool_start(openai_idx, out);
+            }
+
+            let Some(acc) = self.tools.get_mut(&openai_idx) else {
+                continue;
+            };
+            if !acc.start_emitted {
+                continue;
+            }
+            let block_idx = self
+                .tool_block_indexes
+                .get(&openai_idx)
+                .copied()
+                .unwrap_or(0);
+            // Flush buffered args only when we never streamed them live
+            // (start was delayed until close).
+            if !acc.args_live_streamed && !acc.arguments.is_empty() {
+                let args = std::mem::take(&mut acc.arguments);
+                out.push(input_json_delta(block_idx, &args));
+            }
+            out.push(content_block_stop(block_idx));
+            acc.start_emitted = false;
+        }
+        self.content_blocks_stopped = true;
+    }
+
+    fn emit_message_delta(&mut self, out: &mut Vec<String>) {
+        if self.message_delta_sent {
+            return;
+        }
+        let fr = self.finish_reason.clone().unwrap_or(FinishReason::Stop);
+        let stop = finish_reason_to_anthropic(&fr);
+        let (input, output) = self
+            .pending_usage
+            .as_ref()
+            .map(|u| (u.prompt_tokens, u.completion_tokens))
+            .unwrap_or((0, 0));
+        let data = json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop, "stop_sequence": null},
+            "usage": {
+                "input_tokens": input,
+                "output_tokens": output,
+            }
+        });
+        out.push(format!("event: message_delta\ndata: {data}\n\n"));
+        self.message_delta_sent = true;
+    }
+
+    fn emit_message_stop(&mut self, out: &mut Vec<String>) {
+        if self.message_stop_sent {
+            return;
+        }
+        out.push(encode_message_stop_frame().to_string());
+        self.message_stop_sent = true;
+    }
+}
+
+// ── Frame builders ──────────────────────────────────────────────────────────
+
+pub fn encode_message_start_frame(resp_id: &str, model: &str, prompt_tokens: u32) -> String {
+    let data = json!({
+        "type": "message_start",
+        "message": {
+            "id": resp_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": model,
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {"input_tokens": prompt_tokens, "output_tokens": 0},
+        }
+    });
+    format!("event: message_start\ndata: {data}\n\n")
+}
+
+pub fn encode_message_stop_frame() -> &'static str {
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+}
+
+fn text_block_start(index: u32) -> String {
+    let data = json!({
+        "type": "content_block_start",
+        "index": index,
+        "content_block": {"type": "text", "text": ""},
+    });
+    format!("event: content_block_start\ndata: {data}\n\n")
+}
+
+fn thinking_block_start(index: u32) -> String {
+    let data = json!({
+        "type": "content_block_start",
+        "index": index,
+        "content_block": {"type": "thinking", "thinking": ""},
+    });
+    format!("event: content_block_start\ndata: {data}\n\n")
+}
+
+fn tool_use_start(index: u32, id: &str, name: &str) -> String {
+    let data = json!({
+        "type": "content_block_start",
+        "index": index,
+        "content_block": {
+            "type": "tool_use",
+            "id": id,
+            "name": name,
+            "input": {},
+        },
+    });
+    format!("event: content_block_start\ndata: {data}\n\n")
+}
+
+fn text_delta(index: u32, text: &str) -> String {
+    let data = json!({
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "text_delta", "text": text},
+    });
+    format!("event: content_block_delta\ndata: {data}\n\n")
+}
+
+fn thinking_delta(index: u32, thinking: &str) -> String {
+    let data = json!({
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "thinking_delta", "thinking": thinking},
+    });
+    format!("event: content_block_delta\ndata: {data}\n\n")
+}
+
+fn signature_delta(index: u32, signature: &str) -> String {
+    let data = json!({
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "signature_delta", "signature": signature},
+    });
+    format!("event: content_block_delta\ndata: {data}\n\n")
+}
+
+fn input_json_delta(index: u32, partial_json: &str) -> String {
+    let data = json!({
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "input_json_delta", "partial_json": partial_json},
+    });
+    format!("event: content_block_delta\ndata: {data}\n\n")
+}
+
+fn content_block_stop(index: u32) -> String {
+    let data = json!({"type": "content_block_stop", "index": index});
+    format!("event: content_block_stop\ndata: {data}\n\n")
+}
+
+pub fn finish_reason_to_anthropic(fr: &FinishReason) -> &'static str {
+    match fr {
+        FinishReason::Stop => "end_turn",
+        FinishReason::ToolCalls => "tool_use",
+        FinishReason::Length => "max_tokens",
+        FinishReason::ContentFilter => "end_turn",
+        FinishReason::Other(_) => "end_turn",
+        _ => "end_turn",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_chunk(t: &str) -> CanonicalChunk {
+        CanonicalChunk {
+            request_id: String::new(),
+            index: 0,
+            block_index: 0,
+            block_kind: Some(BlockKind::Text),
+            delta: Some(BlockDelta::TextDelta { text: t.into() }),
+            finish_reason: None,
+            usage: None,
+            tool_use_id: None,
+            tool_name: None,
+        }
+    }
+
+    fn finish(fr: FinishReason) -> CanonicalChunk {
+        CanonicalChunk {
+            request_id: String::new(),
+            index: 0,
+            block_index: 0,
+            block_kind: None,
+            delta: None,
+            finish_reason: Some(fr),
+            usage: Some(Usage {
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                total_tokens: 5,
+                ..Default::default()
+            }),
+            tool_use_id: None,
+            tool_name: None,
+        }
+    }
+
+    #[test]
+    fn text_stream_has_start_delta_stop_message_stop() {
+        let mut enc = AnthropicStreamEncoder::new("msg_1", "gpt-5.6-terra");
+        let frames: Vec<String> = enc
+            .push(&text_chunk("hi"))
+            .into_iter()
+            .chain(enc.push(&finish(FinishReason::Stop)))
+            .collect();
+        let joined = frames.join("");
+        assert!(joined.contains("event: message_start"));
+        assert!(joined.contains("content_block_start"));
+        assert!(joined.contains("text_delta"));
+        assert!(joined.contains("content_block_stop"));
+        assert!(joined.contains("message_delta"));
+        assert!(joined.contains("end_turn"));
+        assert!(joined.contains("message_stop"));
+        // Order: start before delta before stop
+        let start = joined.find("content_block_start").unwrap();
+        let delta = joined.find("text_delta").unwrap();
+        let stop = joined.find("content_block_stop").unwrap();
+        assert!(start < delta && delta < stop);
+    }
+
+    #[test]
+    fn reasoning_then_text() {
+        let mut enc = AnthropicStreamEncoder::new("msg_1", "m");
+        let think = CanonicalChunk {
+            request_id: String::new(),
+            index: 0,
+            block_index: 0,
+            block_kind: Some(BlockKind::Thinking),
+            delta: Some(BlockDelta::ThinkingDelta {
+                thinking: "plan".into(),
+            }),
+            finish_reason: None,
+            usage: None,
+            tool_use_id: None,
+            tool_name: None,
+        };
+        let frames: Vec<_> = enc
+            .push(&think)
+            .into_iter()
+            .chain(enc.push(&text_chunk("ans")))
+            .chain(enc.push(&finish(FinishReason::Stop)))
+            .collect();
+        let joined = frames.join("");
+        assert!(joined.contains("thinking_delta"));
+        assert!(joined.contains("gpt#conduit"));
+        assert!(joined.contains("text_delta"));
+    }
+
+    #[test]
+    fn tool_use_lifecycle() {
+        let mut enc = AnthropicStreamEncoder::new("msg_1", "m");
+        let start = CanonicalChunk {
+            request_id: String::new(),
+            index: 0,
+            block_index: 0,
+            block_kind: Some(BlockKind::ToolUse),
+            delta: None,
+            finish_reason: None,
+            usage: None,
+            tool_use_id: Some("call_1".into()),
+            tool_name: Some("search".into()),
+        };
+        let args = CanonicalChunk {
+            request_id: String::new(),
+            index: 0,
+            block_index: 0,
+            block_kind: Some(BlockKind::ToolUse),
+            delta: Some(BlockDelta::InputJsonDelta {
+                partial_json: r#"{"q":"x"}"#.into(),
+            }),
+            finish_reason: None,
+            usage: None,
+            tool_use_id: None,
+            tool_name: None,
+        };
+        let frames: Vec<_> = enc
+            .push(&start)
+            .into_iter()
+            .chain(enc.push(&args))
+            .chain(enc.push(&finish(FinishReason::ToolCalls)))
+            .collect();
+        let joined = frames.join("");
+        assert!(joined.contains("tool_use"));
+        assert!(joined.contains("call_1"));
+        assert!(joined.contains("input_json_delta"));
+        assert!(joined.contains("tool_use")); // stop_reason
+        assert!(joined.contains("\"stop_reason\":\"tool_use\"") || joined.contains("tool_use"));
+        // content_block_stop before message_delta
+        let cbs = joined.rfind("content_block_stop").unwrap();
+        let md = joined.find("message_delta").unwrap();
+        assert!(cbs < md);
+    }
+
+    #[test]
+    fn finish_without_tools_downgrades_tool_calls() {
+        let mut enc = AnthropicStreamEncoder::new("msg_1", "m");
+        let frames = enc.push(&finish(FinishReason::ToolCalls));
+        let joined = frames.join("");
+        assert!(joined.contains("end_turn"));
+        assert!(!joined.contains("\"stop_reason\":\"tool_use\""));
+    }
+}

@@ -1,0 +1,33 @@
+[package]
+name = "conduit-oauth"
+version = "0.1.0"
+edition = "2021"
+description = "OAuth2 PKCE / device-code flows for Claude, Codex, and Grok (xAI)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+# Firefox TLS fingerprint for Anthropic OAuth token endpoint (CLIProxyAPI utls Firefox)
+wreq = { version = "6.0.0-rc.29", features = ["json"] }
+wreq-util = "3.0.0-rc.14"
+secrecy = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+ulid = { workspace = true }
+async-trait = { workspace = true }
+sha2 = "0.10"
+rand = "0.8"
+url = "2"
+urlencoding = "2"
+futures = { workspace = true }
+parking_lot = "0.12"
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = { workspace = true }
+serde_json = { workspace = true }
