@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 use conduit_ir::trace::TraceEvent;
 pub use error::TraceError;
+use futures::StreamExt;
 pub use index::{TraceFilter, TraceIndex};
 pub use log::{DurabilityMode, LogOffset, LogReader, LogWriter};
 pub use schema::{event_to_index_row, TraceIndexRow};
@@ -54,11 +55,27 @@ impl TraceStore {
         let log = LogWriter::new(data_dir.clone()).await?;
         let index = TraceIndex::open(&data_dir.join("trace.db")).await?;
 
-        Ok(Self {
+        let store = Self {
             log,
             index,
             data_dir,
-        })
+        };
+        store.rebuild_missing_index_rows().await?;
+
+        Ok(store)
+    }
+
+    /// Restore index entries for events that reached the append-only log before
+    /// a SQLite index write failed or the process was interrupted.
+    async fn rebuild_missing_index_rows(&self) -> Result<(), TraceError> {
+        let reader = LogReader::new(self.data_dir.clone());
+        let mut events = Box::pin(reader.stream_all_with_offsets());
+        while let Some(item) = events.next().await {
+            let (event, offset) = item?;
+            let row = event_to_index_row(&event, offset.segment, offset.offset);
+            self.index.insert(&row).await?;
+        }
+        Ok(())
     }
 
     /// Append a single [`TraceEvent`] to the log and index.
@@ -204,6 +221,8 @@ mod tests {
                     stream: false,
                     stream_frames: None,
                     response_headers: None,
+                    upstream_request_headers: None,
+                    upstream_response_headers: None,
                 },
             ))
             .await
@@ -273,5 +292,22 @@ mod tests {
         let store = TraceStore::open(tmp.path().to_path_buf()).await.unwrap();
         let result = store.get_full("NONEXISTENT_ID").await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn open_rebuilds_index_for_existing_segment_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event = sample_event();
+        let event_id = event.id.clone();
+        let writer = LogWriter::new(tmp.path().to_path_buf()).await.unwrap();
+        writer.append(&[event]).await.unwrap();
+        drop(writer);
+
+        let store = TraceStore::open(tmp.path().to_path_buf()).await.unwrap();
+        let restored = store.get_full(&event_id).await.unwrap();
+        assert!(
+            restored.is_some(),
+            "opening should rebuild missing index rows"
+        );
     }
 }

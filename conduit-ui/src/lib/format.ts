@@ -86,7 +86,7 @@ export function shortId(id: string | undefined | null, head = 6): string {
   return `${id.slice(0, head)}…`;
 }
 
-/** Provider list row shape used for id → name lookup (admin `/admin/providers`). */
+/** Provider list row shape used for id → name lookup (console `/console/providers`). */
 export type ProviderNameSource = { id: string; name?: string | null };
 
 /**

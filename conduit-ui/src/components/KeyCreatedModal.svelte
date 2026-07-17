@@ -1,7 +1,7 @@
 <script lang="ts">
   import Modal from "./Modal.svelte";
   import { app } from "../state/app.svelte";
-  import type { CreateKeyResponse } from "../lib/adminClient";
+  import type { CreateKeyResponse } from "../lib/consoleClient";
 
   interface Props {
     keyData: CreateKeyResponse;

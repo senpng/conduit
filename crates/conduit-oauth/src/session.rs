@@ -23,7 +23,7 @@ pub enum SessionStatus {
     Cancelled,
 }
 
-/// Public (non-secret) view of an OAuth session for admin/CLI polling.
+/// Public (non-secret) view of an OAuth session for console/CLI polling.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionView {
     pub session_id: String,

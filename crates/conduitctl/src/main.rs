@@ -10,14 +10,14 @@ mod cmd;
 #[derive(Debug, Parser)]
 #[command(name = "conduitctl", about = "Conduit v2 gateway CLI")]
 pub struct Args {
-    /// Daemon admin address (host:port)
+    /// Daemon console address (host:port)
     #[arg(
         long,
-        env = "CONDUIT_ADMIN_ADDR",
+        env = "CONDUIT_CONSOLE_ADDR",
         default_value = "http://127.0.0.1:4001",
         global = true
     )]
-    pub admin_addr: String,
+    pub console_addr: String,
 
     /// Output format: "human" | "json"
     #[arg(long, env = "CONDUIT_OUTPUT", default_value = "human", global = true)]
@@ -58,14 +58,14 @@ async fn main() -> Result<()> {
         .init();
 
     match args.command {
-        Command::Trace(a) => cmd::trace::run(&args.admin_addr, a, &args.output).await,
-        Command::Usage(a) => cmd::usage::run(&args.admin_addr, a, &args.output).await,
-        Command::Pricing(a) => cmd::pricing::run(&args.admin_addr, a, &args.output).await,
-        Command::Provider(a) => cmd::provider::run(&args.admin_addr, a, &args.output).await,
-        Command::Route(a) => cmd::route::run(&args.admin_addr, a, &args.output).await,
-        Command::Key(a) => cmd::key::run(&args.admin_addr, a, &args.output).await,
-        Command::OAuth(a) => cmd::oauth::run(&args.admin_addr, a, &args.output).await,
-        Command::Status => cmd::status::run(&args.admin_addr).await,
-        Command::Settings(a) => cmd::settings::run(&args.admin_addr, a, &args.output).await,
+        Command::Trace(a) => cmd::trace::run(&args.console_addr, a, &args.output).await,
+        Command::Usage(a) => cmd::usage::run(&args.console_addr, a, &args.output).await,
+        Command::Pricing(a) => cmd::pricing::run(&args.console_addr, a, &args.output).await,
+        Command::Provider(a) => cmd::provider::run(&args.console_addr, a, &args.output).await,
+        Command::Route(a) => cmd::route::run(&args.console_addr, a, &args.output).await,
+        Command::Key(a) => cmd::key::run(&args.console_addr, a, &args.output).await,
+        Command::OAuth(a) => cmd::oauth::run(&args.console_addr, a, &args.output).await,
+        Command::Status => cmd::status::run(&args.console_addr).await,
+        Command::Settings(a) => cmd::settings::run(&args.console_addr, a, &args.output).await,
     }
 }

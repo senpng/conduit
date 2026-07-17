@@ -23,13 +23,13 @@ pub enum UsageCommand {
     },
 }
 
-pub async fn run(admin_addr: &str, args: UsageArgs, _output: &str) -> Result<()> {
-    let base = admin_addr.trim_end_matches('/');
+pub async fn run(console_addr: &str, args: UsageArgs, _output: &str) -> Result<()> {
+    let base = console_addr.trim_end_matches('/');
     let client = reqwest::Client::new();
 
     match args.command {
         UsageCommand::Summary { period } => {
-            let mut url = format!("{base}/admin/usage/summary");
+            let mut url = format!("{base}/console/usage/summary");
             if let Some(p) = period {
                 url.push_str(&format!("?period={}", p));
             }
@@ -38,7 +38,7 @@ pub async fn run(admin_addr: &str, args: UsageArgs, _output: &str) -> Result<()>
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
         UsageCommand::List { key_id, limit } => {
-            let mut url = format!("{base}/admin/usage?limit={limit}");
+            let mut url = format!("{base}/console/usage?limit={limit}");
             if let Some(k) = key_id {
                 url.push_str(&format!("&key_id={}", k));
             }

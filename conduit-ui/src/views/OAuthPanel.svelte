@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { app } from "../state/app.svelte";
-  import { oauth as oauthApi, providers as providersApi } from "../lib/adminClient";
-  import type { OAuthProviderMeta, OAuthSession } from "../lib/adminClient";
+  import { oauth as oauthApi, providers as providersApi } from "../lib/consoleClient";
+  import type { OAuthProviderMeta, OAuthSession } from "../lib/consoleClient";
   import { providerDisplayName } from "../lib/format";
   import Modal from "../components/Modal.svelte";
 
@@ -143,7 +143,7 @@
 
   {#if !app.isLoopback && isPkce}
     <div class="warn-bar">
-      ⚠ Admin base is not loopback. PKCE callbacks bind to the daemon machine
+      ⚠ Console endpoint is not loopback. PKCE callbacks bind to the daemon machine
       {#if selectedMeta?.callback_port}(port {selectedMeta.callback_port}){/if}
       — the browser must reach that machine. Remote-only? Use Grok device code or
       an API-key provider.

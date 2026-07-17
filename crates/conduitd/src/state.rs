@@ -21,12 +21,12 @@ use crate::{config::RuntimeSettings, oauth::OAuthRuntime};
 /// Hot-reloaded via [`ArcSwap::store`]; pipeline lookups are pure sync.
 pub type PricingMap = HashMap<(String, String), ModelPricing>;
 
-/// Runtime state shared by gateway and admin handlers.
+/// Runtime state shared by gateway and console handlers.
 ///
 /// Quota / secret / pricing / key-policy resolvers live on the shared
 /// [`PipelineHandle`] deps (constructed once at startup), not duplicated here.
 pub struct DaemonState {
-    /// Current routing table — lock-free reads via ArcSwap; admin reloads `store`.
+    /// Current routing table — lock-free reads via ArcSwap; console reloads `store`.
     pub routing_table: Arc<ArcSwap<RoutingTable>>,
 
     /// Shared pipeline handle (built once at startup).
@@ -38,16 +38,16 @@ pub struct DaemonState {
     /// On-disk trace store (query / get_full / replay).
     pub trace_store: Arc<TraceStore>,
 
-    /// Live trace event fan-out for admin SSE (`GET /admin/traces/stream`).
+    /// Live trace event fan-out for console SSE (`GET /console/traces/stream`).
     pub trace_broadcast: broadcast::Sender<conduit_ir::trace::TraceEvent>,
 
-    /// SQLite pool — used directly by admin API handlers.
+    /// SQLite pool — used directly by console API handlers.
     pub pool: StorePool,
 
-    /// Secret backend — used by admin API to store/retrieve upstream secrets.
+    /// Secret backend — used by console API to store/retrieve upstream secrets.
     pub secret_backend: Arc<dyn SecretBackend>,
 
-    /// Pricing repo — exposed so admin can trigger hot-reload.
+    /// Pricing repo — exposed so console can trigger hot-reload.
     pub pricing_repo: Arc<PricingRepo>,
 
     /// Sync pricing snapshot shared with pipeline `pricing_fn`.
@@ -65,7 +65,7 @@ pub struct DaemonState {
     /// Startup defaults from `conduit.toml` `[trace]` (segment sizes, etc.).
     pub trace_config: crate::config::TraceConfig,
 
-    /// Runtime overlay (`settings.json`); guarded for admin PUT persistence.
+    /// Runtime overlay (`settings.json`); guarded for console PUT persistence.
     pub runtime_settings: Mutex<RuntimeSettings>,
 }
 

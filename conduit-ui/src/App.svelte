@@ -65,7 +65,7 @@
         </span>
       </div>
       <div class="health-meta">
-        {app.adminBase.replace(/^https?:\/\//, "")}
+        {app.consoleBase.replace(/^https?:\/\//, "")}
         {#if app.rttMs != null}
           · {fmtMs(app.rttMs)}
         {/if}

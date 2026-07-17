@@ -25,6 +25,49 @@ use crate::{
     sse::response_to_sse,
 };
 
+/// Serialize HTTP headers without dropping multi-valued fields.
+pub fn header_pairs_to_json(headers: impl IntoIterator<Item = (String, String)>) -> Value {
+    use std::collections::BTreeMap;
+
+    let mut values: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, value) in headers {
+        values.entry(name).or_default().push(value);
+    }
+
+    let mut result = serde_json::Map::new();
+    for (name, mut entries) in values {
+        let value = if entries.len() == 1 {
+            Value::String(entries.pop().unwrap())
+        } else {
+            Value::Array(entries.into_iter().map(Value::String).collect())
+        };
+        result.insert(name, value);
+    }
+    Value::Object(result)
+}
+
+pub fn headers_to_json(headers: &reqwest::header::HeaderMap) -> Value {
+    header_pairs_to_json(headers.iter().map(|(name, value)| {
+        (
+            name.as_str().to_owned(),
+            value.to_str().unwrap_or("<non-utf8>").to_owned(),
+        )
+    }))
+}
+
+#[derive(Debug, Clone)]
+pub struct UpstreamHeaders {
+    pub request: Value,
+    pub response: Value,
+}
+
+pub type ChatResult = (CanonicalChatResponse, LossReport, UpstreamHeaders);
+pub type StreamResult = (
+    BoxStream<'static, Result<CanonicalChunk, ProviderError>>,
+    LossReport,
+    UpstreamHeaders,
+);
+
 /// Timeouts applied at each layer of the HTTP call.
 #[derive(Debug, Clone)]
 pub struct TimeoutConfig {
@@ -258,7 +301,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         &self,
         req: &CanonicalChatRequest,
         secret: &SecretString,
-    ) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
+    ) -> Result<ChatResult, ProviderError> {
         // Claude OAuth: full CLIProxyAPI relay (Chrome TLS + cloak + cch + tools).
         if claude_oauth::is_claude_oauth_kind(&self.config.kind) {
             // Prefer model_id-shaped alias when callers already rewrote it;
@@ -292,7 +335,11 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         builder = self.apply_auth(builder, secret);
         builder = self.apply_provider_headers(builder);
 
-        let resp = builder.send().await.map_err(|e| {
+        let request = builder
+            .build()
+            .map_err(|e| ProviderError::Serialization(e.to_string()))?;
+        let request_headers = headers_to_json(request.headers());
+        let resp = self.client().execute(request).await.map_err(|e| {
             if e.is_timeout() {
                 ProviderError::Timeout
             } else {
@@ -301,6 +348,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         })?;
 
         let status = resp.status();
+        let response_headers = headers_to_json(resp.headers());
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             return Err(self.map_status_error(status, &text));
@@ -316,7 +364,14 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
 
         let mut combined = encode_loss;
         combined.merge(decode_loss);
-        Ok((response, combined))
+        Ok((
+            response,
+            combined,
+            UpstreamHeaders {
+                request: request_headers,
+                response: response_headers,
+            },
+        ))
     }
 
     #[instrument(skip(self, req, secret), fields(provider = %self.config.id, alias = %req.alias))]
@@ -324,13 +379,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         &self,
         req: &CanonicalChatRequest,
         secret: &SecretString,
-    ) -> Result<
-        (
-            BoxStream<'static, Result<CanonicalChunk, ProviderError>>,
-            LossReport,
-        ),
-        ProviderError,
-    > {
+    ) -> Result<StreamResult, ProviderError> {
         if claude_oauth::is_claude_oauth_kind(&self.config.kind) {
             return claude_oauth::chat_oauth_stream::<C>(
                 &self.config.base_url,
@@ -359,7 +408,11 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         builder = self.apply_auth(builder, secret);
         builder = self.apply_provider_headers(builder);
 
-        let resp = builder.send().await.map_err(|e| {
+        let request = builder
+            .build()
+            .map_err(|e| ProviderError::Serialization(e.to_string()))?;
+        let request_headers = headers_to_json(request.headers());
+        let resp = self.client().execute(request).await.map_err(|e| {
             if e.is_timeout() {
                 ProviderError::Timeout
             } else {
@@ -368,6 +421,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         })?;
 
         let status = resp.status();
+        let response_headers = headers_to_json(resp.headers());
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             return Err(self.map_status_error(status, &text));
@@ -397,7 +451,14 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
             })
             .flat_map(futures::stream::iter);
 
-        Ok((Box::pin(stream), encode_loss))
+        Ok((
+            Box::pin(stream),
+            encode_loss,
+            UpstreamHeaders {
+                request: request_headers,
+                response: response_headers,
+            },
+        ))
     }
 
     pub async fn list_models(
@@ -456,5 +517,25 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
             Ok(_) => HealthStatus::Degraded,
             Err(_) => HealthStatus::Unhealthy,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_pairs_to_json_preserves_sensitive_and_repeated_headers() {
+        let headers = header_pairs_to_json(vec![
+            ("authorization".into(), "Bearer secret-token".into()),
+            ("set-cookie".into(), "first=value".into()),
+            ("set-cookie".into(), "second=value".into()),
+        ]);
+
+        assert_eq!(headers["authorization"], "Bearer secret-token");
+        assert_eq!(
+            headers["set-cookie"],
+            serde_json::json!(["first=value", "second=value"])
+        );
     }
 }

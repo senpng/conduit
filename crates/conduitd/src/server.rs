@@ -1,4 +1,4 @@
-//! Server startup: builds the axum router and launches the gateway + admin servers.
+//! Server startup: builds the axum router and launches the gateway + console servers.
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
@@ -73,7 +73,7 @@ pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
     trace_sink.set_enabled(trace_enabled);
     info!(trace_enabled, "trace sink ready");
 
-    // Live event bus for admin SSE tail (capacity: lag-tolerant for slow clients).
+    // Live event bus for console SSE tail (capacity: lag-tolerant for slow clients).
     // Larger buffer: stream_delta events are high-volume during live tails.
     let (trace_broadcast, _) = broadcast::channel::<TraceEvent>(8192);
     trace_sink.register(Arc::new(BroadcastTraceSubscriber {
@@ -216,34 +216,34 @@ pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
         .route("/v1/messages", post(crate::routes::messages))
         .route("/v1/models", get(crate::routes::list_models))
         .route("/health", get(crate::routes::health))
-        .layer(admin_cors_layer())
+        .layer(console_cors_layer())
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
             Duration::from_secs(300),
         ))
         .with_state(state.clone());
 
-    // ── Admin router ──────────────────────────────────────────────────────────
+    // ── Console router ──────────────────────────────────────────────────────────
     // CORS + OPTIONS short-circuit for Tauri/dev UI (localhost:1420 / tauri.localhost)
-    // calling loopback admin. Without this, MethodRouter returns 405 on preflight.
-    let admin = build_admin_router(state.clone());
+    // calling loopback console. Without this, MethodRouter returns 405 on preflight.
+    let console = build_console_router(state.clone());
 
     // Loopback by default: local-first gateway must not be an open proxy.
     // Operators can still front with a reverse proxy if they need LAN access.
     let gateway_addr: SocketAddr = format!("127.0.0.1:{}", port).parse()?;
-    let admin_addr: SocketAddr = format!("127.0.0.1:{}", cfg.gateway.admin_port).parse()?;
+    let console_addr: SocketAddr = format!("127.0.0.1:{}", cfg.gateway.console_port).parse()?;
 
     info!(%gateway_addr, "gateway listening");
-    info!(%admin_addr, "admin API listening");
+    info!(%console_addr, "console API listening");
 
     let gateway_listener = TcpListener::bind(gateway_addr).await?;
-    let admin_listener = TcpListener::bind(admin_addr).await?;
+    let console_listener = TcpListener::bind(console_addr).await?;
 
-    // Broadcast a single Ctrl-C to both servers so gateway *and* admin drain
-    // gracefully (previously only the gateway had graceful shutdown; admin
+    // Broadcast a single Ctrl-C to both servers so gateway *and* console drain
+    // gracefully (previously only the gateway had graceful shutdown; console
     // connections were cut abruptly when the select! completed).
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let admin_shutdown_rx = shutdown_rx.clone();
+    let console_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         info!("shutdown signal received");
@@ -261,12 +261,12 @@ pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
 
     let gateway_srv = axum::serve(gateway_listener, gateway)
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx));
-    let admin_srv = axum::serve(admin_listener, admin)
-        .with_graceful_shutdown(wait_for_shutdown(admin_shutdown_rx));
+    let console_srv = axum::serve(console_listener, console)
+        .with_graceful_shutdown(wait_for_shutdown(console_shutdown_rx));
 
-    let (gateway_res, admin_res) = tokio::join!(gateway_srv, admin_srv);
+    let (gateway_res, console_res) = tokio::join!(gateway_srv, console_srv);
     gateway_res?;
-    admin_res?;
+    console_res?;
 
     // ── Graceful shutdown sequence (each step with 30s timeout) ──────────────
     info!("flushing trace sink...");
@@ -319,12 +319,12 @@ impl conduit_oauth::SecretStore for SecretBackendStore {
     }
 }
 
-/// CORS policy for admin (and gateway) when the UI origin is not the same as the API.
+/// CORS policy for console (and gateway) when the UI origin is not the same as the API.
 ///
 /// - Reflect any Origin (loopback dev + tauri.localhost)
 /// - Allow private-network access preflight (Chrome → 127.0.0.1)
 /// - Explicit methods including OPTIONS
-pub fn admin_cors_layer() -> CorsLayer {
+pub fn console_cors_layer() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::mirror_request())
         .allow_methods([
@@ -386,72 +386,81 @@ pub async fn options_preflight_ok(req: Request<Body>, next: Next) -> Response {
     next.run(req).await
 }
 
-/// Build the admin API router (testable without full daemon boot).
-pub fn build_admin_router(state: Arc<crate::state::DaemonState>) -> Router {
+/// Build the console API router (testable without full daemon boot).
+pub fn build_console_router(state: Arc<crate::state::DaemonState>) -> Router {
     Router::new()
         .route("/health", get(crate::routes::health))
         // Providers
-        .route("/admin/providers", get(crate::admin::list_providers))
-        .route("/admin/providers", post(crate::admin::create_provider))
-        .route("/admin/providers/{id}", get(crate::admin::get_provider))
-        .route("/admin/providers/{id}", put(crate::admin::update_provider))
+        .route("/console/providers", get(crate::console::list_providers))
+        .route("/console/providers", post(crate::console::create_provider))
+        .route("/console/providers/{id}", get(crate::console::get_provider))
         .route(
-            "/admin/providers/{id}",
-            delete(crate::admin::delete_provider),
+            "/console/providers/{id}",
+            put(crate::console::update_provider),
         )
         .route(
-            "/admin/providers/{id}/secret",
-            put(crate::admin::set_provider_secret),
+            "/console/providers/{id}",
+            delete(crate::console::delete_provider),
+        )
+        .route(
+            "/console/providers/{id}/secret",
+            put(crate::console::set_provider_secret),
         )
         // Routes
-        .route("/admin/routes", get(crate::admin::list_routes))
-        .route("/admin/routes", post(crate::admin::create_route))
-        .route("/admin/routes/{id}", get(crate::admin::get_route))
-        .route("/admin/routes/{id}", put(crate::admin::update_route))
-        .route("/admin/routes/{id}", delete(crate::admin::delete_route))
+        .route("/console/routes", get(crate::console::list_routes))
+        .route("/console/routes", post(crate::console::create_route))
+        .route("/console/routes/{id}", get(crate::console::get_route))
+        .route("/console/routes/{id}", put(crate::console::update_route))
+        .route("/console/routes/{id}", delete(crate::console::delete_route))
         // Downstream keys
-        .route("/admin/keys", get(crate::admin::list_keys))
-        .route("/admin/keys", post(crate::admin::create_key))
-        .route("/admin/keys/{id}", get(crate::admin::get_key))
-        .route("/admin/keys/{id}", put(crate::admin::update_key))
-        .route("/admin/keys/{id}", delete(crate::admin::delete_key))
+        .route("/console/keys", get(crate::console::list_keys))
+        .route("/console/keys", post(crate::console::create_key))
+        .route("/console/keys/{id}", get(crate::console::get_key))
+        .route("/console/keys/{id}", put(crate::console::update_key))
+        .route("/console/keys/{id}", delete(crate::console::delete_key))
         // Settings (trace enable, …)
-        .route("/admin/settings", get(crate::admin::get_settings))
-        .route("/admin/settings", put(crate::admin::update_settings))
+        .route("/console/settings", get(crate::console::get_settings))
+        .route("/console/settings", put(crate::console::update_settings))
         // Usage ledger / pricing / traces
-        .route("/admin/usage", get(crate::admin::list_usage))
-        .route("/admin/usage/summary", get(crate::admin::usage_summary))
-        .route("/admin/pricing", get(crate::admin::list_pricing))
-        .route("/admin/pricing/reload", post(crate::admin::reload_pricing))
-        .route("/admin/pricing/sync", post(crate::admin::sync_pricing))
-        .route("/admin/traces", get(crate::admin::list_traces))
-        .route("/admin/traces/stream", get(crate::admin::stream_traces))
-        .route("/admin/traces/{id}", get(crate::admin::get_trace))
+        .route("/console/usage", get(crate::console::list_usage))
+        .route("/console/usage/summary", get(crate::console::usage_summary))
+        .route("/console/pricing", get(crate::console::list_pricing))
         .route(
-            "/admin/traces/{id}/replay",
-            post(crate::admin::replay_trace),
+            "/console/pricing/reload",
+            post(crate::console::reload_pricing),
+        )
+        .route("/console/pricing/sync", post(crate::console::sync_pricing))
+        .route("/console/traces", get(crate::console::list_traces))
+        .route("/console/traces/stream", get(crate::console::stream_traces))
+        .route("/console/traces/{id}", get(crate::console::get_trace))
+        .route(
+            "/console/traces/{id}/replay",
+            post(crate::console::replay_trace),
         )
         // OAuth
         .route(
-            "/admin/oauth/providers",
+            "/console/oauth/providers",
             get(crate::oauth::list_oauth_providers),
         )
-        .route("/admin/oauth/{kind}/start", post(crate::oauth::start_oauth))
         .route(
-            "/admin/oauth/sessions/{id}",
+            "/console/oauth/{kind}/start",
+            post(crate::oauth::start_oauth),
+        )
+        .route(
+            "/console/oauth/sessions/{id}",
             get(crate::oauth::get_oauth_session),
         )
         .route(
-            "/admin/oauth/sessions/{id}/cancel",
+            "/console/oauth/sessions/{id}/cancel",
             post(crate::oauth::cancel_oauth_session),
         )
         .route(
-            "/admin/oauth/{provider_id}/refresh",
+            "/console/oauth/{provider_id}/refresh",
             post(crate::oauth::refresh_provider_oauth),
         )
         // Innermost → outermost: OPTIONS short-circuit, then CorsLayer.
         .layer(middleware::from_fn(options_preflight_ok))
-        .layer(admin_cors_layer())
+        .layer(console_cors_layer())
         .with_state(state)
 }
 
@@ -521,7 +530,7 @@ pub async fn reload_routing_table(state: &DaemonState) -> Result<(), conduit_sto
 
 // ── Trace broadcast subscriber ────────────────────────────────────────────────
 
-/// Fan-out durable trace events to admin SSE clients (`GET /admin/traces/stream`).
+/// Fan-out durable trace events to console SSE clients (`GET /console/traces/stream`).
 ///
 /// `pub(crate)` so crate tests can exercise the real subscriber path.
 pub(crate) struct BroadcastTraceSubscriber {
@@ -550,16 +559,16 @@ mod cors_tests {
     use super::*;
 
     #[tokio::test]
-    async fn options_preflight_on_admin_path_is_not_405() {
+    async fn options_preflight_on_console_path_is_not_405() {
         // Minimal method-limited route that would 405 OPTIONS without middleware.
         let app = Router::new()
-            .route("/admin/providers", get(|| async { "ok" }))
+            .route("/console/providers", get(|| async { "ok" }))
             .layer(middleware::from_fn(options_preflight_ok))
-            .layer(admin_cors_layer());
+            .layer(console_cors_layer());
 
         let req = Request::builder()
             .method(Method::OPTIONS)
-            .uri("/admin/providers")
+            .uri("/console/providers")
             .header(header::ORIGIN, "http://localhost:1420")
             .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
             .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
@@ -587,13 +596,13 @@ mod cors_tests {
     #[tokio::test]
     async fn bare_options_without_preflight_headers_still_ok() {
         let app = Router::new()
-            .route("/admin/keys", get(|| async { "ok" }))
+            .route("/console/keys", get(|| async { "ok" }))
             .layer(middleware::from_fn(options_preflight_ok))
-            .layer(admin_cors_layer());
+            .layer(console_cors_layer());
 
         let req = Request::builder()
             .method(Method::OPTIONS)
-            .uri("/admin/keys")
+            .uri("/console/keys")
             .body(Body::empty())
             .unwrap();
 
@@ -644,7 +653,7 @@ mod hotpath_tests {
         let snap1 = table.load_full();
         assert_eq!(snap1.get("gpt-4o").unwrap().targets[0].model_id, "gpt-4o");
 
-        // Simulate admin reload: store new Arc (no per-request deep clone).
+        // Simulate console reload: store new Arc (no per-request deep clone).
         table.store(Arc::new(sample_table("gpt-4o", "gpt-4o-mini")));
         let snap2 = table.load_full();
         assert_eq!(

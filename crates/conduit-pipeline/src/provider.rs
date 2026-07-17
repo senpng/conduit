@@ -12,6 +12,7 @@ use conduit_ir::{
     error::ProviderError,
     loss::LossReport,
 };
+pub use conduit_upstream::provider::UpstreamHeaders;
 use conduit_upstream::provider::{ProviderClient, ProviderClientConfig};
 use futures::stream::{BoxStream, StreamExt};
 use secrecy::SecretString;
@@ -88,7 +89,7 @@ pub async fn dispatch_non_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
-) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
+) -> Result<(CanonicalChatResponse, LossReport, UpstreamHeaders), ProviderError> {
     match resolve_kind(&resolved.provider_kind)? {
         ProviderKind::OpenAi => openai_non_stream(resolved, request, auth).await,
         ProviderKind::Anthropic => anthropic_non_stream(resolved, request, auth).await,
@@ -107,6 +108,7 @@ pub async fn dispatch_stream(
     (
         BoxStream<'static, Result<CanonicalChunk, ProviderError>>,
         LossReport,
+        UpstreamHeaders,
     ),
     ProviderError,
 > {
@@ -123,7 +125,7 @@ async fn openai_non_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
-) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
+) -> Result<(CanonicalChatResponse, LossReport, UpstreamHeaders), ProviderError> {
     use conduit_codec::openai::OpenAiCodec;
     let base_url = resolved
         .base_url
@@ -142,7 +144,7 @@ async fn anthropic_non_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
-) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
+) -> Result<(CanonicalChatResponse, LossReport, UpstreamHeaders), ProviderError> {
     use conduit_codec::anthropic::AnthropicCodec;
     let mut cfg = ProviderClientConfig::anthropic(&resolved.provider_id);
     if let Some(ref url) = resolved.base_url {
@@ -184,7 +186,7 @@ async fn claude_oauth_non_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
-) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
+) -> Result<(CanonicalChatResponse, LossReport, UpstreamHeaders), ProviderError> {
     use conduit_codec::anthropic::AnthropicCodec;
     use conduit_upstream::claude_oauth;
     let base = resolved
@@ -221,10 +223,10 @@ async fn codex_oauth_non_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
-) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
+) -> Result<(CanonicalChatResponse, LossReport, UpstreamHeaders), ProviderError> {
     // CLIProxyAPI non-stream path: upstream SSE → aggregate text + usage → one response.
     let req = sanitize_codex_request(request);
-    let (mut stream, loss) = codex_oauth_stream(resolved, &req, auth).await?;
+    let (mut stream, loss, upstream_headers) = codex_oauth_stream(resolved, &req, auth).await?;
     let mut text = String::new();
     let mut finish = FinishReason::Stop;
     let mut usage = Usage::default();
@@ -264,14 +266,14 @@ async fn codex_oauth_non_stream(
         usage,
         created_at: chrono::Utc::now(),
     };
-    Ok((response, loss))
+    Ok((response, loss, upstream_headers))
 }
 
 async fn grok_oauth_non_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
-) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
+) -> Result<(CanonicalChatResponse, LossReport, UpstreamHeaders), ProviderError> {
     // CLIProxyAPI parity: OAuth chat → cli-chat-proxy + Responses API + CLI headers.
     use conduit_codec::OpenAiResponsesCodec;
     use conduit_oauth::{cli_proxy_headers, resolve_oauth_chat_base};
@@ -297,6 +299,7 @@ async fn openai_stream(
     (
         BoxStream<'static, Result<CanonicalChunk, ProviderError>>,
         LossReport,
+        UpstreamHeaders,
     ),
     ProviderError,
 > {
@@ -322,6 +325,7 @@ async fn anthropic_stream(
     (
         BoxStream<'static, Result<CanonicalChunk, ProviderError>>,
         LossReport,
+        UpstreamHeaders,
     ),
     ProviderError,
 > {
@@ -346,6 +350,7 @@ async fn claude_oauth_stream(
     (
         BoxStream<'static, Result<CanonicalChunk, ProviderError>>,
         LossReport,
+        UpstreamHeaders,
     ),
     ProviderError,
 > {
@@ -376,6 +381,7 @@ async fn codex_oauth_stream(
     (
         BoxStream<'static, Result<CanonicalChunk, ProviderError>>,
         LossReport,
+        UpstreamHeaders,
     ),
     ProviderError,
 > {
@@ -400,6 +406,7 @@ async fn grok_oauth_stream(
     (
         BoxStream<'static, Result<CanonicalChunk, ProviderError>>,
         LossReport,
+        UpstreamHeaders,
     ),
     ProviderError,
 > {

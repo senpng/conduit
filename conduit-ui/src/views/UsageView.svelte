@@ -5,12 +5,12 @@
     usage as usageApi,
     keys as keysApi,
     providers as providersApi,
-  } from "../lib/adminClient";
+  } from "../lib/consoleClient";
   import type {
     UsageSummaryResponse,
     UsageRecord,
     UsageSummaryEntry,
-  } from "../lib/adminClient";
+  } from "../lib/consoleClient";
   import {
     fmtUsd,
     fmtUsd2,

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use conduitctl::{route_admin_path, AdminClient, AdminError};
+use conduitctl::{route_console_path, ConsoleClient, ConsoleError};
 
 #[derive(Debug, Parser)]
 pub struct RouteArgs {
@@ -11,20 +11,20 @@ pub struct RouteArgs {
 #[derive(Debug, Subcommand)]
 pub enum RouteCommand {
     List,
-    /// Get a route by its **id** (not match_alias). Path: `/admin/routes/{id}`.
+    /// Get a route by its **id** (not match_alias). Path: `/console/routes/{id}`.
     Get {
         /// Route id (ULID allocated by the daemon)
         id: String,
     },
-    /// Remove a route by its **id** (not match_alias). Path: `/admin/routes/{id}`.
+    /// Remove a route by its **id** (not match_alias). Path: `/console/routes/{id}`.
     Remove {
         /// Route id (ULID allocated by the daemon)
         id: String,
     },
 }
 
-pub async fn run(admin_addr: &str, args: RouteArgs, _output: &str) -> Result<()> {
-    let client = AdminClient::new(admin_addr);
+pub async fn run(console_addr: &str, args: RouteArgs, _output: &str) -> Result<()> {
+    let client = ConsoleClient::new(console_addr);
 
     match args.command {
         RouteCommand::List => {
@@ -35,8 +35,8 @@ pub async fn run(admin_addr: &str, args: RouteArgs, _output: &str) -> Result<()>
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
         RouteCommand::Get { id } => {
-            // Path uses route id — see `route_admin_path`.
-            debug_assert_eq!(route_admin_path(&id), format!("/admin/routes/{}", id));
+            // Path uses route id — see `route_console_path`.
+            debug_assert_eq!(route_console_path(&id), format!("/console/routes/{}", id));
             let body = client
                 .get_route(&id)
                 .await
@@ -45,7 +45,7 @@ pub async fn run(admin_addr: &str, args: RouteArgs, _output: &str) -> Result<()>
         }
         RouteCommand::Remove { id } => match client.delete_route(&id).await {
             Ok(()) => println!("Route {} removed", id),
-            Err(AdminError::Http { status, body }) => {
+            Err(ConsoleError::Http { status, body }) => {
                 anyhow::bail!("failed: HTTP {} — {}", status, body);
             }
             Err(e) => anyhow::bail!("failed: {}", e),
@@ -94,10 +94,10 @@ mod tests {
     }
 
     #[test]
-    fn route_path_helper_matches_admin_contract() {
+    fn route_path_helper_matches_console_contract() {
         assert_eq!(
-            route_admin_path("01HROUTEEXAMPLE000000000000"),
-            "/admin/routes/01HROUTEEXAMPLE000000000000"
+            route_console_path("01HROUTEEXAMPLE000000000000"),
+            "/console/routes/01HROUTEEXAMPLE000000000000"
         );
     }
 }

@@ -1,41 +1,41 @@
 /**
- * Pure HTTP admin client for conduitd loopback admin API.
+ * Pure HTTP console client for conduitd loopback console API.
  *
  * Injectable `fetch` for unit tests. Default base: http://127.0.0.1:4001
- * (override via VITE_CONDUIT_ADMIN_URL or setAdminBase).
+ * (override via VITE_CONDUIT_CONSOLE_URL or setConsoleBase).
  */
 
 export type FetchLike = typeof fetch;
 
-const DEFAULT_ADMIN_BASE = "http://127.0.0.1:4001";
+const DEFAULT_CONSOLE_BASE = "http://127.0.0.1:4001";
 
-let adminBase =
+let consoleBase =
   (typeof import.meta !== "undefined" &&
-    (import.meta as ImportMeta & { env?: { VITE_CONDUIT_ADMIN_URL?: string } }).env
-      ?.VITE_CONDUIT_ADMIN_URL) ||
-  DEFAULT_ADMIN_BASE;
+    (import.meta as ImportMeta & { env?: { VITE_CONDUIT_CONSOLE_URL?: string } }).env
+      ?.VITE_CONDUIT_CONSOLE_URL) ||
+  DEFAULT_CONSOLE_BASE;
 
-export function getAdminBase(): string {
-  return adminBase.replace(/\/$/, "");
+export function getConsoleBase(): string {
+  return consoleBase.replace(/\/$/, "");
 }
 
-export function setAdminBase(url: string): void {
-  adminBase = url.replace(/\/$/, "");
+export function setConsoleBase(url: string): void {
+  consoleBase = url.replace(/\/$/, "");
 }
 
-export function adminUrl(path: string, base = getAdminBase()): string {
+export function consoleUrl(path: string, base = getConsoleBase()): string {
   const p = path.startsWith("/") ? path : `/${path}`;
   return `${base}${p}`;
 }
 
-export class AdminClientError extends Error {
+export class ConsoleClientError extends Error {
   constructor(
     public readonly status: number,
     public readonly path: string,
     public readonly body: string,
   ) {
     super(`${status} ${path}: ${body}`);
-    this.name = "AdminClientError";
+    this.name = "ConsoleClientError";
   }
 }
 
@@ -47,34 +47,30 @@ export type RequestOptions = RequestInit & {
 };
 
 /**
- * Build request headers for the admin client.
+ * Build request headers for the console client.
  * Only sets `Content-Type: application/json` when a body is present so simple
  * GET/DELETE avoid unnecessary CORS preflight from the Tauri/dev origin.
  */
-export function buildAdminHeaders(
+export function buildConsoleHeaders(
   init: RequestInit = {},
-): Record<string, string> {
-  const incoming = (init.headers ?? {}) as Record<string, string>;
-  const headers: Record<string, string> = { ...incoming };
+): Headers {
+  const headers = new Headers(init.headers);
   const hasBody = init.body != null && init.body !== "";
-  const hasContentType = Object.keys(headers).some(
-    (k) => k.toLowerCase() === "content-type",
-  );
-  if (hasBody && !hasContentType) {
-    headers["Content-Type"] = "application/json";
+  if (hasBody && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
   }
   return headers;
 }
 
-export async function adminRequest<T>(
+export async function consoleRequest<T>(
   path: string,
   init: RequestOptions = {},
 ): Promise<T> {
   const { fetchImpl = fetch, empty = false, headers, ...rest } = init;
-  const url = adminUrl(path);
-  const mergedHeaders = buildAdminHeaders({
+  const url = consoleUrl(path);
+  const mergedHeaders = buildConsoleHeaders({
     ...rest,
-    headers: headers as Record<string, string> | undefined,
+    headers,
   });
   const res = await fetchImpl(url, {
     ...rest,
@@ -82,7 +78,7 @@ export async function adminRequest<T>(
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new AdminClientError(res.status, path, text);
+    throw new ConsoleClientError(res.status, path, text);
   }
   if (empty || res.status === 204) {
     return undefined as T;
@@ -259,7 +255,7 @@ export interface TraceIndexRow {
   error_kind?: string | null;
 }
 
-/** Complete audit bundle from GET /admin/traces/{id}. */
+/** Complete audit bundle from GET /console/traces/{id}. */
 export interface TraceAuditBundle {
   trace_id: string;
   events: unknown[];
@@ -313,7 +309,7 @@ export interface OAuthSession {
 
 // ── Domain clients ───────────────────────────────────────────────────────────
 
-export function createAdminApi(fetchImpl?: FetchLike) {
+export function createConsoleApi(fetchImpl?: FetchLike) {
   const opts = (init?: RequestOptions): RequestOptions => ({
     ...init,
     fetchImpl: init?.fetchImpl ?? fetchImpl,
@@ -321,13 +317,13 @@ export function createAdminApi(fetchImpl?: FetchLike) {
 
   return {
     health: {
-      check: () => adminRequest<HealthResponse>("/health", opts()),
+      check: () => consoleRequest<HealthResponse>("/health", opts()),
     },
 
     settings: {
-      get: () => adminRequest<SettingsResponse>("/admin/settings", opts()),
+      get: () => consoleRequest<SettingsResponse>("/console/settings", opts()),
       update: (body: { trace?: { enabled?: boolean } }) =>
-        adminRequest<SettingsResponse>("/admin/settings", {
+        consoleRequest<SettingsResponse>("/console/settings", {
           ...opts(),
           method: "PUT",
           body: JSON.stringify(body),
@@ -335,11 +331,11 @@ export function createAdminApi(fetchImpl?: FetchLike) {
     },
 
     providers: {
-      list: () => adminRequest<Provider[]>("/admin/providers", opts()),
+      list: () => consoleRequest<Provider[]>("/console/providers", opts()),
       get: (id: string) =>
-        adminRequest<Provider>(`/admin/providers/${id}`, opts()),
+        consoleRequest<Provider>(`/console/providers/${id}`, opts()),
       create: (body: CreateProviderBody) =>
-        adminRequest<Provider>("/admin/providers", {
+        consoleRequest<Provider>("/console/providers", {
           ...opts(),
           method: "POST",
           body: JSON.stringify(body),
@@ -348,19 +344,19 @@ export function createAdminApi(fetchImpl?: FetchLike) {
         id: string,
         body: { name?: string; base_url?: string },
       ) =>
-        adminRequest<Provider>(`/admin/providers/${id}`, {
+        consoleRequest<Provider>(`/console/providers/${id}`, {
           ...opts(),
           method: "PUT",
           body: JSON.stringify(body),
         }),
       delete: (id: string) =>
-        adminRequest<void>(`/admin/providers/${id}`, {
+        consoleRequest<void>(`/console/providers/${id}`, {
           ...opts({ empty: true }),
           method: "DELETE",
         }),
       /** Daemon expects `{ api_key: string }`. */
       setSecret: (id: string, api_key: string) =>
-        adminRequest<void>(`/admin/providers/${id}/secret`, {
+        consoleRequest<void>(`/console/providers/${id}/secret`, {
           ...opts({ empty: true }),
           method: "PUT",
           body: JSON.stringify({ api_key }),
@@ -368,10 +364,10 @@ export function createAdminApi(fetchImpl?: FetchLike) {
     },
 
     routes: {
-      list: () => adminRequest<Route[]>("/admin/routes", opts()),
-      get: (id: string) => adminRequest<Route>(`/admin/routes/${id}`, opts()),
+      list: () => consoleRequest<Route[]>("/console/routes", opts()),
+      get: (id: string) => consoleRequest<Route>(`/console/routes/${id}`, opts()),
       create: (body: CreateRouteBody) =>
-        adminRequest<Route>("/admin/routes", {
+        consoleRequest<Route>("/console/routes", {
           ...opts(),
           method: "POST",
           body: JSON.stringify(body),
@@ -386,28 +382,28 @@ export function createAdminApi(fetchImpl?: FetchLike) {
           enabled?: boolean;
         },
       ) =>
-        adminRequest<Route>(`/admin/routes/${id}`, {
+        consoleRequest<Route>(`/console/routes/${id}`, {
           ...opts(),
           method: "PUT",
           body: JSON.stringify(body),
         }),
       delete: (id: string) =>
-        adminRequest<void>(`/admin/routes/${id}`, {
+        consoleRequest<void>(`/console/routes/${id}`, {
           ...opts({ empty: true }),
           method: "DELETE",
         }),
     },
 
     keys: {
-      list: () => adminRequest<DownstreamKey[]>("/admin/keys", opts()),
+      list: () => consoleRequest<DownstreamKey[]>("/console/keys", opts()),
       get: (id: string) =>
-        adminRequest<DownstreamKey>(`/admin/keys/${id}`, opts()),
+        consoleRequest<DownstreamKey>(`/console/keys/${id}`, opts()),
       create: (body: {
         name: string;
         model_whitelist?: string[];
         rate_limit_rpm?: number;
       }) =>
-        adminRequest<CreateKeyResponse>("/admin/keys", {
+        consoleRequest<CreateKeyResponse>("/console/keys", {
           ...opts(),
           method: "POST",
           body: JSON.stringify(body),
@@ -421,13 +417,13 @@ export function createAdminApi(fetchImpl?: FetchLike) {
           enabled?: boolean;
         },
       ) =>
-        adminRequest<DownstreamKey>(`/admin/keys/${id}`, {
+        consoleRequest<DownstreamKey>(`/console/keys/${id}`, {
           ...opts(),
           method: "PUT",
           body: JSON.stringify(body),
         }),
       delete: (id: string) =>
-        adminRequest<void>(`/admin/keys/${id}`, {
+        consoleRequest<void>(`/console/keys/${id}`, {
           ...opts({ empty: true }),
           method: "DELETE",
         }),
@@ -443,25 +439,25 @@ export function createAdminApi(fetchImpl?: FetchLike) {
         if (period) params.set("period", period);
         if (keyId) params.set("key_id", keyId);
         const q = params.toString() ? `?${params}` : "";
-        return adminRequest<UsageSummaryResponse>(`/admin/usage/summary${q}`, opts());
+        return consoleRequest<UsageSummaryResponse>(`/console/usage/summary${q}`, opts());
       },
       list: async (limit = 50, keyId?: string) => {
-        let path = `/admin/usage?limit=${encodeURIComponent(String(limit))}`;
+        let path = `/console/usage?limit=${encodeURIComponent(String(limit))}`;
         if (keyId) path += `&key_id=${encodeURIComponent(keyId)}`;
-        return adminRequest<UsageListResponse>(path, opts());
+        return consoleRequest<UsageListResponse>(path, opts());
       },
     },
 
     pricing: {
-      list: () => adminRequest<PricingRow[]>("/admin/pricing", opts()),
+      list: () => consoleRequest<PricingRow[]>("/console/pricing", opts()),
       reload: () =>
-        adminRequest<{ status: string }>("/admin/pricing/reload", {
+        consoleRequest<{ status: string }>("/console/pricing/reload", {
           ...opts(),
           method: "POST",
         }),
       /** Fetch LiteLLM cost map, convert, cache as pricing.litellm.json, reload. */
       sync: (url?: string) =>
-        adminRequest<{
+        consoleRequest<{
           status: string;
           source?: string;
           url?: string;
@@ -469,7 +465,7 @@ export function createAdminApi(fetchImpl?: FetchLike) {
           source_models?: number;
           skipped?: number;
           total_rows?: number;
-        }>("/admin/pricing/sync", {
+        }>("/console/pricing/sync", {
           ...opts(),
           method: "POST",
           body: url ? JSON.stringify({ url }) : JSON.stringify({}),
@@ -479,52 +475,52 @@ export function createAdminApi(fetchImpl?: FetchLike) {
     traces: {
       /** Default list is one row per request; `all=true` lists every event. */
       list: (limit = 20, all = false) =>
-        adminRequest<TraceListResponse>(
-          `/admin/traces?limit=${encodeURIComponent(String(limit))}${all ? "&all=true" : ""}`,
+        consoleRequest<TraceListResponse>(
+          `/console/traces?limit=${encodeURIComponent(String(limit))}${all ? "&all=true" : ""}`,
           opts(),
         ),
       get: (id: string) =>
-        adminRequest<unknown>(`/admin/traces/${encodeURIComponent(id)}`, opts()),
+        consoleRequest<unknown>(`/console/traces/${encodeURIComponent(id)}`, opts()),
       /** Default dry-run; live execute is not supported by daemon. */
       replay: (id: string, dryRun = true) =>
-        adminRequest<ReplayPlan>(
-          `/admin/traces/${encodeURIComponent(id)}/replay?dry_run=${dryRun}`,
+        consoleRequest<ReplayPlan>(
+          `/console/traces/${encodeURIComponent(id)}/replay?dry_run=${dryRun}`,
           {
             ...opts(),
             method: "POST",
           },
         ),
-      streamUrl: () => adminUrl("/admin/traces/stream"),
+      streamUrl: () => consoleUrl("/console/traces/stream"),
     },
 
     oauth: {
       listProviders: () =>
-        adminRequest<OAuthProviderMeta[]>("/admin/oauth/providers", opts()),
+        consoleRequest<OAuthProviderMeta[]>("/console/oauth/providers", opts()),
       start: (
         kind: string,
         body: { name?: string; provider_id?: string } = {},
       ) =>
-        adminRequest<OAuthSession>(`/admin/oauth/${encodeURIComponent(kind)}/start`, {
+        consoleRequest<OAuthSession>(`/console/oauth/${encodeURIComponent(kind)}/start`, {
           ...opts(),
           method: "POST",
           body: JSON.stringify(body),
         }),
       session: (id: string) =>
-        adminRequest<OAuthSession>(
-          `/admin/oauth/sessions/${encodeURIComponent(id)}`,
+        consoleRequest<OAuthSession>(
+          `/console/oauth/sessions/${encodeURIComponent(id)}`,
           opts(),
         ),
       cancel: (id: string) =>
-        adminRequest<{ ok: boolean }>(
-          `/admin/oauth/sessions/${encodeURIComponent(id)}/cancel`,
+        consoleRequest<{ ok: boolean }>(
+          `/console/oauth/sessions/${encodeURIComponent(id)}/cancel`,
           {
             ...opts(),
             method: "POST",
           },
         ),
       refresh: (providerId: string) =>
-        adminRequest<unknown>(
-          `/admin/oauth/${encodeURIComponent(providerId)}/refresh`,
+        consoleRequest<unknown>(
+          `/console/oauth/${encodeURIComponent(providerId)}/refresh`,
           {
             ...opts(),
             method: "POST",
@@ -535,7 +531,7 @@ export function createAdminApi(fetchImpl?: FetchLike) {
 }
 
 /** Default singleton wired to global fetch. */
-export const api = createAdminApi();
+export const api = createConsoleApi();
 
 // Back-compat named exports used by views
 export const health = api.health;

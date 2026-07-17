@@ -1,4 +1,4 @@
-//! Admin OAuth flows: Claude/Codex PKCE callbacks + Grok device code.
+//! Console OAuth flows: Claude/Codex PKCE callbacks + Grok device code.
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Instant};
 

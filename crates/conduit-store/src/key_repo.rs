@@ -110,6 +110,26 @@ impl<'a> KeyRepo<'a> {
         Ok(())
     }
 
+    /// Persist all administrator-editable fields in one atomic update.
+    #[instrument(skip(self, row))]
+    pub async fn update(&self, row: &DownstreamKeyRow) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE downstream_keys
+             SET name = ?, model_whitelist = ?, rate_limit_rpm = ?, enabled = ?, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(&row.name)
+        .bind(&row.model_whitelist)
+        .bind(row.rate_limit_rpm)
+        .bind(row.enabled as i32)
+        .bind(&row.updated_at)
+        .bind(&row.id)
+        .execute(self.pool)
+        .await
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        Ok(())
+    }
+
     #[instrument(skip(self))]
     pub async fn delete(&self, id: &str) -> Result<(), StoreError> {
         sqlx::query("DELETE FROM downstream_keys WHERE id = ?")
@@ -190,5 +210,27 @@ mod tests {
         repo.insert(&make_key("k3", "ghi789")).await.unwrap();
         repo.delete("k3").await.unwrap();
         assert!(repo.get("k3").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn update_persists_all_admin_editable_fields() {
+        let pool = open_db("sqlite::memory:").await.unwrap();
+        let repo = KeyRepo::new(&pool);
+        let mut key = make_key("k4", "jkl012");
+        repo.insert(&key).await.unwrap();
+
+        key.name = "Renamed Key".into();
+        key.model_whitelist = r#"[\"gpt-4o-mini\"]"#.into();
+        key.rate_limit_rpm = Some(12);
+        key.enabled = false;
+        key.updated_at = "2026-07-18T00:00:00Z".into();
+        repo.update(&key).await.unwrap();
+
+        let stored = repo.get("k4").await.unwrap().unwrap();
+        assert_eq!(stored.name, "Renamed Key");
+        assert_eq!(stored.model_whitelist, r#"[\"gpt-4o-mini\"]"#);
+        assert_eq!(stored.rate_limit_rpm, Some(12));
+        assert!(!stored.enabled);
+        assert_eq!(stored.updated_at, "2026-07-18T00:00:00Z");
     }
 }

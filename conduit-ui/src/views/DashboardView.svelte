@@ -8,8 +8,8 @@
     keys as keysApi,
     usage as usageApi,
     traces as tracesApi,
-  } from "../lib/adminClient";
-  import type { TraceIndexRow } from "../lib/adminClient";
+  } from "../lib/consoleClient";
+  import type { TraceIndexRow } from "../lib/consoleClient";
   import { fmtUsd2, fmtMs, fmtAgo, shortId } from "../lib/format";
   import StatusPill from "../components/StatusPill.svelte";
 
@@ -56,7 +56,7 @@
 
 {#if !app.isLoopback}
   <div class="warn-bar">
-    ⚠ Admin base is not loopback ({app.adminBase}) — OAuth PKCE callbacks bind to
+    ⚠ Console endpoint is not loopback ({app.consoleBase}) — OAuth PKCE callbacks bind to
     the daemon machine; prefer device-code or API-key providers remotely.
   </div>
 {/if}

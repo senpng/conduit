@@ -1,7 +1,7 @@
 //! conduitd — the Conduit v2 daemon process.
 //!
 //! Starts the OpenAI-compatible gateway on the configured port,
-//! admin API, and all background services (trace sink, quota cleanup).
+//! console API, and all background services (trace sink, quota cleanup).
 
 use anyhow::Result;
 use clap::Parser;

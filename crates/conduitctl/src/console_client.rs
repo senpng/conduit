@@ -1,4 +1,4 @@
-//! HTTP client for the conduitd admin API.
+//! HTTP client for the conduitd console API.
 //!
 //! Shared by CLI subcommands. DTOs live in `dto`.
 
@@ -19,9 +19,9 @@ use crate::{
     util::sse::{classify_sse_frame, parse_sse_frame, SseFrame},
 };
 
-/// Errors from admin HTTP / SSE transport.
+/// Errors from console HTTP / SSE transport.
 #[derive(Debug, Error)]
-pub enum AdminError {
+pub enum ConsoleError {
     #[error("transport: {0}")]
     Transport(#[from] reqwest::Error),
     #[error("http {status}: {body}")]
@@ -32,9 +32,9 @@ pub enum AdminError {
     Sse(String),
 }
 
-/// Shared admin API client (loopback by default).
+/// Shared console API client (loopback by default).
 #[derive(Clone)]
-pub struct AdminClient {
+pub struct ConsoleClient {
     base: String,
     /// Short-lived CRUD calls (JSON).
     http: reqwest::Client,
@@ -42,10 +42,10 @@ pub struct AdminClient {
     http_sse: reqwest::Client,
 }
 
-impl AdminClient {
-    /// Create a client for `admin_addr` (e.g. `http://127.0.0.1:4001`).
-    pub fn new(admin_addr: &str) -> Self {
-        let base = admin_addr.trim_end_matches('/').to_string();
+impl ConsoleClient {
+    /// Create a client for `console_addr` (e.g. `http://127.0.0.1:4001`).
+    pub fn new(console_addr: &str) -> Self {
+        let base = console_addr.trim_end_matches('/').to_string();
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
@@ -72,49 +72,49 @@ impl AdminClient {
 
     // ── Health ──────────────────────────────────────────────────────────────
 
-    pub async fn health(&self) -> Result<HealthResponse, AdminError> {
+    pub async fn health(&self) -> Result<HealthResponse, ConsoleError> {
         let url = format!("{}/health", self.base);
         self.get_json(&url).await
     }
 
     // ── Settings ────────────────────────────────────────────────────────────
 
-    pub async fn get_settings(&self) -> Result<crate::dto::SettingsResponse, AdminError> {
-        let url = format!("{}/admin/settings", self.base);
+    pub async fn get_settings(&self) -> Result<crate::dto::SettingsResponse, ConsoleError> {
+        let url = format!("{}/console/settings", self.base);
         self.get_json(&url).await
     }
 
     pub async fn update_settings(
         &self,
         body: &crate::dto::UpdateSettingsBody,
-    ) -> Result<crate::dto::SettingsResponse, AdminError> {
-        let url = format!("{}/admin/settings", self.base);
+    ) -> Result<crate::dto::SettingsResponse, ConsoleError> {
+        let url = format!("{}/console/settings", self.base);
         self.put_json(&url, body).await
     }
 
     // ── Traces ──────────────────────────────────────────────────────────────
 
-    pub async fn list_traces(&self, limit: usize) -> Result<TraceListResponse, AdminError> {
-        let url = format!("{}/admin/traces?limit={}", self.base, limit);
+    pub async fn list_traces(&self, limit: usize) -> Result<TraceListResponse, ConsoleError> {
+        let url = format!("{}/console/traces?limit={}", self.base, limit);
         self.get_json(&url).await
     }
 
-    pub async fn get_trace_bundle(&self, id: &str) -> Result<Value, AdminError> {
-        let url = format!("{}/admin/traces/{}", self.base, id);
+    pub async fn get_trace_bundle(&self, id: &str) -> Result<Value, ConsoleError> {
+        let url = format!("{}/console/traces/{}", self.base, id);
         self.get_json(&url).await
     }
 
-    pub async fn replay_dry_run(&self, id: &str) -> Result<Value, AdminError> {
-        let url = format!("{}/admin/traces/{}/replay?dry_run=true", self.base, id);
+    pub async fn replay_dry_run(&self, id: &str) -> Result<Value, ConsoleError> {
+        let url = format!("{}/console/traces/{}/replay?dry_run=true", self.base, id);
         self.post_empty_json(&url).await
     }
 
-    /// Subscribe to `GET /admin/traces/stream` (SSE).
+    /// Subscribe to `GET /console/traces/stream` (SSE).
     ///
     /// Sends [`SseFrame`] values (trace data or lagged).
     pub fn subscribe_traces(
         &self,
-        tx: mpsc::Sender<Result<SseFrame, AdminError>>,
+        tx: mpsc::Sender<Result<SseFrame, ConsoleError>>,
     ) -> JoinHandle<()> {
         let client = self.clone();
         tokio::spawn(async move {
@@ -126,9 +126,9 @@ impl AdminClient {
 
     async fn run_trace_sse(
         &self,
-        tx: mpsc::Sender<Result<SseFrame, AdminError>>,
-    ) -> Result<(), AdminError> {
-        let url = format!("{}/admin/traces/stream", self.base);
+        tx: mpsc::Sender<Result<SseFrame, ConsoleError>>,
+    ) -> Result<(), ConsoleError> {
+        let url = format!("{}/console/traces/stream", self.base);
         // Use the SSE client (no total request timeout).
         let resp = self
             .http_sse
@@ -137,12 +137,12 @@ impl AdminClient {
             .header("cache-control", "no-cache")
             .send()
             .await
-            .map_err(|e| AdminError::Sse(format!("connect: {e}")))?;
+            .map_err(|e| ConsoleError::Sse(format!("connect: {e}")))?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(AdminError::Http { status, body });
+            return Err(ConsoleError::Http { status, body });
         }
 
         let mut stream = resp.bytes_stream();
@@ -151,7 +151,7 @@ impl AdminClient {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| {
                 // Surface common causes clearly (timeout was the usual culprit).
-                AdminError::Sse(format!("stream read: {e}"))
+                ConsoleError::Sse(format!("stream read: {e}"))
             })?;
             buf.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -164,8 +164,8 @@ impl AdminClient {
                         // Reject legacy stub payloads if reintroduced.
                         if let SseFrame::TraceData(ref payload) = classified {
                             if payload.contains("not yet implemented") {
-                                return Err(AdminError::Sse(
-                                    "received stub tail payload; admin stream is broken".into(),
+                                return Err(ConsoleError::Sse(
+                                    "received stub tail payload; console stream is broken".into(),
                                 ));
                             }
                         }
@@ -190,50 +190,50 @@ impl AdminClient {
 
     // ── Providers ───────────────────────────────────────────────────────────
 
-    pub async fn list_providers(&self) -> Result<Value, AdminError> {
-        let url = format!("{}/admin/providers", self.base);
+    pub async fn list_providers(&self) -> Result<Value, ConsoleError> {
+        let url = format!("{}/console/providers", self.base);
         self.get_json(&url).await
     }
 
-    pub async fn create_provider(&self, body: &CreateProviderBody) -> Result<Value, AdminError> {
-        let url = format!("{}/admin/providers", self.base);
+    pub async fn create_provider(&self, body: &CreateProviderBody) -> Result<Value, ConsoleError> {
+        let url = format!("{}/console/providers", self.base);
         self.post_json(&url, body).await
     }
 
-    pub async fn delete_provider(&self, id: &str) -> Result<(), AdminError> {
-        let url = format!("{}/admin/providers/{}", self.base, id);
+    pub async fn delete_provider(&self, id: &str) -> Result<(), ConsoleError> {
+        let url = format!("{}/console/providers/{}", self.base, id);
         self.delete_ok(&url).await
     }
 
     // ── Routes (path parameter is route **id**, not alias) ──────────────────
 
-    pub async fn list_routes(&self) -> Result<Value, AdminError> {
-        let url = format!("{}/admin/routes", self.base);
+    pub async fn list_routes(&self) -> Result<Value, ConsoleError> {
+        let url = format!("{}/console/routes", self.base);
         self.get_json(&url).await
     }
 
-    pub async fn get_route(&self, id: &str) -> Result<Value, AdminError> {
-        let url = format!("{}/admin/routes/{}", self.base, id);
+    pub async fn get_route(&self, id: &str) -> Result<Value, ConsoleError> {
+        let url = format!("{}/console/routes/{}", self.base, id);
         self.get_json(&url).await
     }
 
-    pub async fn delete_route(&self, id: &str) -> Result<(), AdminError> {
-        let url = format!("{}/admin/routes/{}", self.base, id);
+    pub async fn delete_route(&self, id: &str) -> Result<(), ConsoleError> {
+        let url = format!("{}/console/routes/{}", self.base, id);
         self.delete_ok(&url).await
     }
 
-    pub async fn create_route(&self, body: &CreateRouteBody) -> Result<Value, AdminError> {
-        let url = format!("{}/admin/routes", self.base);
+    pub async fn create_route(&self, body: &CreateRouteBody) -> Result<Value, ConsoleError> {
+        let url = format!("{}/console/routes", self.base);
         self.post_json(&url, body).await
     }
 
-    /// PUT /admin/routes/{id} — body uses same `targets` array shape as create.
+    /// PUT /console/routes/{id} — body uses same `targets` array shape as create.
     pub async fn update_route(
         &self,
         id: &str,
         body: &CreateRouteBody,
-    ) -> Result<Value, AdminError> {
-        let url = format!("{}/admin/routes/{}", self.base, id);
+    ) -> Result<Value, ConsoleError> {
+        let url = format!("{}/console/routes/{}", self.base, id);
         // UpdateRouteBody fields are optional; send full replace via present fields.
         let payload = serde_json::json!({
             "match_alias": body.match_alias,
@@ -248,63 +248,66 @@ impl AdminClient {
         &self,
         url: &str,
         body: &B,
-    ) -> Result<T, AdminError> {
+    ) -> Result<T, ConsoleError> {
         let resp = self.http.put(url).json(body).send().await?;
         self.json_response(resp).await
     }
 
     // ── Keys / usage / OAuth ────────────────────────────────────────────────
 
-    pub async fn list_keys(&self) -> Result<Value, AdminError> {
-        let url = format!("{}/admin/keys", self.base);
+    pub async fn list_keys(&self) -> Result<Value, ConsoleError> {
+        let url = format!("{}/console/keys", self.base);
         self.get_json(&url).await
     }
 
-    pub async fn create_key(&self, body: &CreateKeyBody) -> Result<KeyCreateResponse, AdminError> {
-        let url = format!("{}/admin/keys", self.base);
+    pub async fn create_key(
+        &self,
+        body: &CreateKeyBody,
+    ) -> Result<KeyCreateResponse, ConsoleError> {
+        let url = format!("{}/console/keys", self.base);
         self.post_json(&url, body).await
     }
 
-    pub async fn delete_key(&self, id: &str) -> Result<(), AdminError> {
-        let url = format!("{}/admin/keys/{}", self.base, id);
+    pub async fn delete_key(&self, id: &str) -> Result<(), ConsoleError> {
+        let url = format!("{}/console/keys/{}", self.base, id);
         self.delete_ok(&url).await
     }
 
-    /// Period rollup of request consumption (`GET /admin/usage/summary`).
-    pub async fn list_usage_summary(&self) -> Result<Value, AdminError> {
-        let url = format!("{}/admin/usage/summary", self.base);
+    /// Period rollup of request consumption (`GET /console/usage/summary`).
+    pub async fn list_usage_summary(&self) -> Result<Value, ConsoleError> {
+        let url = format!("{}/console/usage/summary", self.base);
         self.get_json(&url).await
     }
 
     /// Recent per-request usage rows.
-    pub async fn list_usage(&self, limit: usize) -> Result<Value, AdminError> {
-        let url = format!("{}/admin/usage?limit={limit}", self.base);
+    pub async fn list_usage(&self, limit: usize) -> Result<Value, ConsoleError> {
+        let url = format!("{}/console/usage?limit={limit}", self.base);
         self.get_json(&url).await
     }
 
-    pub async fn start_oauth(&self, kind: &str, body: &Value) -> Result<Value, AdminError> {
-        let url = format!("{}/admin/oauth/{}/start", self.base, kind);
+    pub async fn start_oauth(&self, kind: &str, body: &Value) -> Result<Value, ConsoleError> {
+        let url = format!("{}/console/oauth/{}/start", self.base, kind);
         self.post_json(&url, body).await
     }
 
-    pub async fn oauth_session(&self, id: &str) -> Result<Value, AdminError> {
-        let url = format!("{}/admin/oauth/sessions/{}", self.base, id);
+    pub async fn oauth_session(&self, id: &str) -> Result<Value, ConsoleError> {
+        let url = format!("{}/console/oauth/sessions/{}", self.base, id);
         self.get_json(&url).await
     }
 
-    pub async fn cancel_oauth(&self, id: &str) -> Result<(), AdminError> {
-        let url = format!("{}/admin/oauth/sessions/{}/cancel", self.base, id);
+    pub async fn cancel_oauth(&self, id: &str) -> Result<(), ConsoleError> {
+        let url = format!("{}/console/oauth/sessions/{}/cancel", self.base, id);
         self.post_empty_unit(&url).await
     }
 
-    async fn post_empty_unit(&self, url: &str) -> Result<(), AdminError> {
+    async fn post_empty_unit(&self, url: &str) -> Result<(), ConsoleError> {
         let resp = self.http.post(url).send().await?;
         let status = resp.status();
         if status.is_success() || status == StatusCode::NO_CONTENT {
             return Ok(());
         }
         let body = resp.text().await.unwrap_or_default();
-        Err(AdminError::Http {
+        Err(ConsoleError::Http {
             status: status.as_u16(),
             body,
         })
@@ -312,7 +315,7 @@ impl AdminClient {
 
     // ── HTTP helpers ────────────────────────────────────────────────────────
 
-    async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, AdminError> {
+    async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, ConsoleError> {
         let resp = self.http.get(url).send().await?;
         self.json_response(resp).await
     }
@@ -321,24 +324,24 @@ impl AdminClient {
         &self,
         url: &str,
         body: &B,
-    ) -> Result<T, AdminError> {
+    ) -> Result<T, ConsoleError> {
         let resp = self.http.post(url).json(body).send().await?;
         self.json_response(resp).await
     }
 
-    async fn post_empty_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, AdminError> {
+    async fn post_empty_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, ConsoleError> {
         let resp = self.http.post(url).send().await?;
         self.json_response(resp).await
     }
 
-    async fn delete_ok(&self, url: &str) -> Result<(), AdminError> {
+    async fn delete_ok(&self, url: &str) -> Result<(), ConsoleError> {
         let resp = self.http.delete(url).send().await?;
         let status = resp.status();
         if status.is_success() || status == StatusCode::NO_CONTENT {
             return Ok(());
         }
         let body = resp.text().await.unwrap_or_default();
-        Err(AdminError::Http {
+        Err(ConsoleError::Http {
             status: status.as_u16(),
             body,
         })
@@ -347,11 +350,11 @@ impl AdminClient {
     async fn json_response<T: DeserializeOwned>(
         &self,
         resp: reqwest::Response,
-    ) -> Result<T, AdminError> {
+    ) -> Result<T, ConsoleError> {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(AdminError::Http {
+            return Err(ConsoleError::Http {
                 status: status.as_u16(),
                 body,
             });
@@ -375,9 +378,9 @@ pub fn provider_create_request_body(
     body
 }
 
-/// Build the admin path segment for route get/remove (always the route **id**).
-pub fn route_admin_path(id: &str) -> String {
-    format!("/admin/routes/{}", id)
+/// Build the console path segment for route get/remove (always the route **id**).
+pub fn route_console_path(id: &str) -> String {
+    format!("/console/routes/{}", id)
 }
 
 #[cfg(test)]
@@ -414,15 +417,18 @@ mod tests {
     }
 
     #[test]
-    fn route_admin_path_uses_id_segment() {
-        assert_eq!(route_admin_path("01HQROUTEID"), "/admin/routes/01HQROUTEID");
+    fn route_console_path_uses_id_segment() {
+        assert_eq!(
+            route_console_path("01HQROUTEID"),
+            "/console/routes/01HQROUTEID"
+        );
         // Must not invent alias-based paths.
-        assert!(!route_admin_path("gpt-4o").contains("alias"));
+        assert!(!route_console_path("gpt-4o").contains("alias"));
     }
 
     #[test]
-    fn admin_client_trims_trailing_slash() {
-        let c = AdminClient::new("http://127.0.0.1:4001/");
+    fn console_client_trims_trailing_slash() {
+        let c = ConsoleClient::new("http://127.0.0.1:4001/");
         assert_eq!(c.base_url(), "http://127.0.0.1:4001");
     }
 }

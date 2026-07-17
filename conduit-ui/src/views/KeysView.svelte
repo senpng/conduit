@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { app } from "../state/app.svelte";
-  import { keys as keysApi } from "../lib/adminClient";
-  import type { DownstreamKey, CreateKeyResponse } from "../lib/adminClient";
+  import { keys as keysApi } from "../lib/consoleClient";
+  import type { DownstreamKey, CreateKeyResponse } from "../lib/consoleClient";
   import { fmtDate } from "../lib/format";
   import KeyCreatedModal from "../components/KeyCreatedModal.svelte";
 

@@ -8,7 +8,7 @@
 
 import type { TraceEvent } from "./traceTypes";
 import { lossReportNonEmpty } from "./traceTypes";
-import type { TraceIndexRow } from "./adminClient";
+import type { TraceIndexRow } from "./consoleClient";
 
 export interface LiveRequestRow {
   traceId: string;
@@ -113,7 +113,7 @@ export function applyEvent(r: LiveRollup, ev: TraceEvent): void {
 }
 
 /**
- * Merge one trace-index row (from `GET /admin/traces`) into the rollup.
+ * Merge one trace-index row (from `GET /console/traces`) into the rollup.
  * Index rows are per-event and flat; patch only the fields the row's `kind`
  * actually carries (a `request_received` anchor has status_code 0, which must
  * NOT clobber a real status merged earlier).

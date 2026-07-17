@@ -9,7 +9,7 @@ import {
 } from "./sse";
 
 describe("extractSseData", () => {
-  it("parses real admin SSE data payload with id and kind", () => {
+  it("parses real console SSE data payload with id and kind", () => {
     const frame =
       'event: message\ndata: {"id":"01TRACE","kind":{"type":"request_received","alias":"gpt-4o"}}\n';
     const data = extractSseData(frame);
@@ -64,7 +64,7 @@ describe("consumeSseFrames (event-aware)", () => {
   });
 
   it("matches daemon format_lagged_sse_frame wire shape", () => {
-    // crates/conduitd/src/admin.rs: "event: lagged\ndata: {\"skipped\":N}\n\n"
+    // crates/conduitd/src/console.rs: "event: lagged\ndata: {\"skipped\":N}\n\n"
     const frame = 'event: lagged\ndata: {"skipped":1024}\n\n';
     const out = consumeSseFrames("", frame);
     expect(out.frames).toHaveLength(1);

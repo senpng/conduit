@@ -1,7 +1,7 @@
-//! Server-Sent Events (SSE) frame parsing for admin `/admin/traces/stream`.
+//! Server-Sent Events (SSE) frame parsing for console `/console/traces/stream`.
 //!
 //! Pure string parsing — no HTTP. Used by CLI `trace tail` and
-//! `AdminClient::subscribe_traces`.
+//! `ConsoleClient::subscribe_traces`.
 
 use serde::Deserialize;
 
@@ -14,7 +14,7 @@ pub struct RawSseFrame {
     pub data: String,
 }
 
-/// Classified admin stream frame after interpreting `event:` + `data:`.
+/// Classified console stream frame after interpreting `event:` + `data:`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SseFrame {
     /// Trace event payload (JSON body of a normal / `event: message` frame).

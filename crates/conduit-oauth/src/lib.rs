@@ -31,7 +31,7 @@ pub use refresh::RefreshCoordinator;
 pub use resolver::{CredentialResolver, SecretStore};
 pub use session::{OAuthSession, SessionStatus, SessionStore, SessionView, SESSION_TTL};
 
-/// Metadata for admin UI listing.
+/// Metadata for console UI listing.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct OAuthProviderMeta {
     pub kind: &'static str,

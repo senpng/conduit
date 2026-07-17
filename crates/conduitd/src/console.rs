@@ -1,4 +1,4 @@
-//! Admin API handlers — CRUD for providers, routes, downstream keys, usage, pricing.
+//! Console API handlers — CRUD for providers, routes, downstream keys, usage, pricing.
 
 use std::sync::Arc;
 
@@ -40,7 +40,7 @@ pub struct CreateProviderBody {
     pub kind: String,
     pub base_url: String,
     /// Optional plaintext API key — stored immediately via the secret backend.
-    /// If omitted, the secret must be set separately via PUT /admin/providers/{id}/secret.
+    /// If omitted, the secret must be set separately via PUT /console/providers/{id}/secret.
     pub api_key: Option<String>,
 }
 
@@ -159,7 +159,7 @@ pub async fn delete_provider(
     }
 }
 
-/// PUT /admin/providers/{id}/secret — store or rotate the upstream API key.
+/// PUT /console/providers/{id}/secret — store or rotate the upstream API key.
 #[derive(Debug, Deserialize)]
 pub struct SetSecretBody {
     pub api_key: String,
@@ -496,13 +496,7 @@ pub async fn update_key(
         ..existing
     };
 
-    if let Err(e) = repo.set_enabled(&updated.id, updated.enabled).await {
-        return internal(e).into_response();
-    }
-    if let Err(e) = repo
-        .set_rate_limit_rpm(&updated.id, updated.rate_limit_rpm)
-        .await
-    {
+    if let Err(e) = repo.update(&updated).await {
         return internal(e).into_response();
     }
 
@@ -532,7 +526,7 @@ pub async fn delete_key(
 // Settings (runtime toggles)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// GET /admin/settings — current operator settings + effective values.
+/// GET /console/settings — current operator settings + effective values.
 pub async fn get_settings(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let runtime = state
         .runtime_settings
@@ -565,7 +559,7 @@ pub struct UpdateTraceSettingsBody {
     pub enabled: Option<bool>,
 }
 
-/// PUT /admin/settings — update runtime settings (persisted to settings.json).
+/// PUT /console/settings — update runtime settings (persisted to settings.json).
 pub async fn update_settings(
     State(state): State<Arc<DaemonState>>,
     Json(body): Json<UpdateSettingsBody>,
@@ -583,7 +577,7 @@ pub async fn update_settings(
                 changed = true;
             }
             state.trace_sink.set_enabled(enabled);
-            tracing::info!(enabled, "trace recording toggled via admin API");
+            tracing::info!(enabled, "trace recording toggled via console API");
         }
     }
 
@@ -627,7 +621,7 @@ fn default_usage_limit() -> usize {
     50
 }
 
-/// GET /admin/usage — recent per-request consumption rows.
+/// GET /console/usage — recent per-request consumption rows.
 pub async fn list_usage(
     State(state): State<Arc<DaemonState>>,
     Query(q): Query<ListUsageQuery>,
@@ -647,7 +641,7 @@ pub struct UsageSummaryQuery {
     pub key_id: Option<String>,
 }
 
-/// GET /admin/usage/summary — aggregate spend by key / day / model for a calendar month.
+/// GET /console/usage/summary — aggregate spend by key / day / model for a calendar month.
 pub async fn usage_summary(
     State(state): State<Arc<DaemonState>>,
     Query(q): Query<UsageSummaryQuery>,
@@ -739,7 +733,7 @@ pub async fn reload_pricing(State(state): State<Arc<DaemonState>>) -> impl IntoR
     }
 }
 
-/// Optional body for `POST /admin/pricing/sync`.
+/// Optional body for `POST /console/pricing/sync`.
 #[derive(Debug, Default, Deserialize)]
 pub struct SyncPricingBody {
     /// Override LiteLLM cost-map URL (default: GitHub raw main).
@@ -747,7 +741,7 @@ pub struct SyncPricingBody {
     pub url: Option<String>,
 }
 
-/// POST /admin/pricing/sync — fetch LiteLLM price map, convert, cache, reload.
+/// POST /console/pricing/sync — fetch LiteLLM price map, convert, cache, reload.
 ///
 /// Offline-friendly: never runs automatically at boot; only on explicit request.
 /// Writes `{data_dir}/pricing.litellm.json`. Operator `pricing.json` still wins
@@ -847,7 +841,7 @@ fn default_trace_limit() -> usize {
     20
 }
 
-/// GET /admin/traces — recent index rows (one row per request by default).
+/// GET /console/traces — recent index rows (one row per request by default).
 ///
 /// Defaults to `kind=request_received` so the list is one entry per gateway
 /// call (complete audit anchor). Pass `?all=true` to list every event.
@@ -870,7 +864,7 @@ pub async fn list_traces(
     }
 }
 
-/// GET /admin/traces/{id} — complete audit trail for a request.
+/// GET /console/traces/{id} — complete audit trail for a request.
 ///
 /// Accepts either an event id or a shared `trace_id`. Returns the full event
 /// bundle (request body, routing, response body, usage) in chronological order.
@@ -974,7 +968,7 @@ pub fn format_lagged_sse_frame(skipped: u64) -> String {
     )
 }
 
-/// GET /admin/traces/stream — SSE of live events after durable write.
+/// GET /console/traces/stream — SSE of live events after durable write.
 pub async fn stream_traces(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     use axum::response::sse::{Event, KeepAlive, Sse};
     use futures::stream::StreamExt;
@@ -1018,7 +1012,7 @@ fn default_true() -> bool {
     true
 }
 
-/// POST /admin/traces/{id}/replay — reconstruct routing plan from a stored event.
+/// POST /console/traces/{id}/replay — reconstruct routing plan from a stored event.
 ///
 /// Dry-run (default) returns the intended provider/target and a request summary
 /// without invoking upstream or charging quota.

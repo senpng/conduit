@@ -21,15 +21,15 @@ pub enum PricingCommand {
     },
 }
 
-pub async fn run(admin_addr: &str, args: PricingArgs, output: &str) -> Result<()> {
-    let base = admin_addr.trim_end_matches('/');
+pub async fn run(console_addr: &str, args: PricingArgs, output: &str) -> Result<()> {
+    let base = console_addr.trim_end_matches('/');
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(90))
         .build()?;
 
     match args.command {
         PricingCommand::List => {
-            let url = format!("{base}/admin/pricing");
+            let url = format!("{base}/console/pricing");
             let resp = client.get(&url).send().await?;
             if !resp.status().is_success() {
                 bail!("list pricing failed: HTTP {}", resp.status());
@@ -62,7 +62,7 @@ pub async fn run(admin_addr: &str, args: PricingArgs, output: &str) -> Result<()
             }
         }
         PricingCommand::Reload => {
-            let url = format!("{base}/admin/pricing/reload");
+            let url = format!("{base}/console/pricing/reload");
             let resp = client.post(&url).send().await?;
             let status = resp.status();
             let body: serde_json::Value = resp.json().await?;
@@ -76,7 +76,7 @@ pub async fn run(admin_addr: &str, args: PricingArgs, output: &str) -> Result<()
             }
         }
         PricingCommand::Sync { url: source_url } => {
-            let url = format!("{base}/admin/pricing/sync");
+            let url = format!("{base}/console/pricing/sync");
             let mut req = client.post(&url);
             if let Some(u) = source_url {
                 req = req.json(&serde_json::json!({ "url": u }));

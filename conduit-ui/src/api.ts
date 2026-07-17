@@ -1,13 +1,13 @@
 /**
  * Public API surface for the operator UI.
- * Implementation lives in `lib/adminClient.ts` (injectable pure HTTP client).
+ * Implementation lives in `lib/consoleClient.ts` (injectable pure HTTP client).
  */
 export {
   api,
-  adminUrl,
-  getAdminBase,
-  setAdminBase,
-  createAdminApi,
+  consoleUrl,
+  getConsoleBase,
+  setConsoleBase,
+  createConsoleApi,
   health,
   providers,
   routes,
@@ -15,8 +15,8 @@ export {
   usage,
   pricing,
   traces,
-  AdminClientError,
-} from "./lib/adminClient";
+  ConsoleClientError,
+} from "./lib/consoleClient";
 
 export type {
   Provider,
@@ -32,4 +32,4 @@ export type {
   TraceIndexRow,
   TraceListResponse,
   ReplayPlan,
-} from "./lib/adminClient";
+} from "./lib/consoleClient";

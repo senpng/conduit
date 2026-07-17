@@ -338,7 +338,14 @@ impl LogReader {
                     match read_frame_len(&mut file).await {
                         Ok(frame_len) => {
                             let mut compressed = vec![0u8; frame_len as usize];
-                            file.read_exact(&mut compressed).await.map_err(TraceError::Io)?;
+                            if let Err(error) = file.read_exact(&mut compressed).await {
+                                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                                    // A process can be interrupted while writing the final
+                                    // frame. Earlier complete frames remain recoverable.
+                                    break;
+                                }
+                                Err(TraceError::Io(error))?;
+                            }
                             let json = decompress(&compressed)?;
                             let event: TraceEvent = serde_json::from_slice(&json)
                                 .map_err(|e| TraceError::Serialization(e.to_string()))?;
@@ -349,6 +356,59 @@ impl LogReader {
                             break;
                         }
                         Err(e) => { Err(e)?; break; }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stream every event with the physical location needed to rebuild the
+    /// SQLite index after an interrupted index write.
+    pub fn stream_all_with_offsets(
+        &self,
+    ) -> impl Stream<Item = Result<(TraceEvent, LogOffset), TraceError>> + '_ {
+        let dir = self.dir.clone();
+        async_stream::try_stream! {
+            let seg_dir = dir.join(SEGMENTS_DIR);
+            let mut entries: Vec<PathBuf> = Vec::new();
+
+            let mut rd = fs::read_dir(&seg_dir).await.map_err(TraceError::Io)?;
+            while let Some(entry) = rd.next_entry().await.map_err(TraceError::Io)? {
+                let path = entry.path();
+                if path.extension().and_then(|extension| extension.to_str()) == Some(SEGMENT_EXT) {
+                    entries.push(path);
+                }
+            }
+            entries.sort();
+
+            for seg_path in entries {
+                let segment = seg_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| TraceError::Serialization("invalid segment filename".into()))?
+                    .to_string();
+                let mut file = fs::File::open(&seg_path).await.map_err(TraceError::Io)?;
+                let mut offset = 0u64;
+                loop {
+                    match read_frame_len(&mut file).await {
+                        Ok(frame_len) => {
+                            let mut compressed = vec![0u8; frame_len as usize];
+                            if let Err(error) = file.read_exact(&mut compressed).await {
+                                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                                    break;
+                                }
+                                Err(TraceError::Io(error))?;
+                            }
+                            let json = decompress(&compressed)?;
+                            let event: TraceEvent = serde_json::from_slice(&json)
+                                .map_err(|e| TraceError::Serialization(e.to_string()))?;
+                            yield (event, LogOffset { segment: segment.clone(), offset });
+                            offset += 4 + frame_len as u64;
+                        }
+                        Err(TraceError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            break;
+                        }
+                        Err(error) => { Err(error)?; break; }
                     }
                 }
             }
@@ -467,6 +527,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(streamed.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn stream_all_with_offsets_ignores_incomplete_final_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = LogWriter::new(tmp.path().to_path_buf()).await.unwrap();
+        let offsets = writer.append(&[sample_event()]).await.unwrap();
+        drop(writer);
+
+        let path = tmp.path().join(SEGMENTS_DIR).join(&offsets[0].segment);
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(&10u32.to_be_bytes()).unwrap();
+        file.write_all(&[1, 2, 3]).unwrap();
+
+        let reader = LogReader::new(tmp.path().to_path_buf());
+        let events = reader
+            .stream_all_with_offsets()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(events.len(), 1);
     }
 
     #[tokio::test]

@@ -41,11 +41,11 @@ conduitctl oauth start grok   # device code flow — prints user_code
 ```
 
 OAuth credentials are stored in the secret backend; tokens refresh automatically near expiry.
-See [ARCHITECTURE.md](ARCHITECTURE.md#oauth-providers) for ports, kinds, and admin API.
+See [ARCHITECTURE.md](ARCHITECTURE.md#oauth-providers) for ports, kinds, and console API.
 
 ### Operator UI
 
-Desktop console lives in `conduit-ui/` (Tauri + Svelte). It talks to the same loopback admin API as `conduitctl` (`http://127.0.0.1:4001`). Design notes: [`docs/design/conduit-ui-rewrite.md`](docs/design/conduit-ui-rewrite.md).
+Desktop console lives in `conduit-ui/` (Tauri + Svelte). It talks to the same loopback console API as `conduitctl` (`http://127.0.0.1:4001`). Design notes: [`docs/design/conduit-ui-rewrite.md`](docs/design/conduit-ui-rewrite.md).
 
 ```bash
 cd conduit-ui && npm install && npm run tauri dev
@@ -83,7 +83,7 @@ cargo deny check
 
 ### Local run (daemon + CLI)
 
-Default ports: gateway `4000`, admin `4001` (see `conduit.toml` / defaults).
+Default ports: gateway `4000`, console `4001` (see `conduit.toml` / defaults).
 
 ```bash
 # Build debug binaries
@@ -98,9 +98,9 @@ cargo run -p conduitd -- --port 4000 --data-dir /tmp/conduit-dev --log info
 # Verbose daemon logs
 CONDUIT_LOG=debug cargo run -p conduitd -- --log-format pretty
 
-# One-shot CLI against local admin API
+# One-shot CLI against local console API
 cargo run -p conduitctl -- status
-cargo run -p conduitctl -- --admin-addr http://127.0.0.1:4001 status
+cargo run -p conduitctl -- --console-addr http://127.0.0.1:4001 status
 cargo run -p conduitctl -- trace list
 cargo run -p conduitctl -- trace tail          # SSE live events (Ctrl+C to stop)
 cargo run -p conduitctl -- --output json provider list
@@ -112,10 +112,10 @@ cargo run -p conduitctl -- --output json provider list
 # Health (same as conduitctl status)
 curl -s http://127.0.0.1:4001/health | jq .
 
-# Admin traces (list / single / live SSE)
-curl -s 'http://127.0.0.1:4001/admin/traces?limit=20' | jq .
-curl -s http://127.0.0.1:4001/admin/traces/<id> | jq .
-curl -N -H 'accept: text/event-stream' http://127.0.0.1:4001/admin/traces/stream
+# Console traces (list / single / live SSE)
+curl -s 'http://127.0.0.1:4001/console/traces?limit=20' | jq .
+curl -s http://127.0.0.1:4001/console/traces/<id> | jq .
+curl -N -H 'accept: text/event-stream' http://127.0.0.1:4001/console/traces/stream
 
 # Chat completions smoke (gateway; needs routes/providers configured)
 curl -s http://127.0.0.1:4000/v1/chat/completions \
@@ -133,14 +133,14 @@ cargo run -p conduitctl -- provider add --help
 
 | Variable | Used by | Default / notes |
 |----------|---------|-----------------|
-| `CONDUIT_ADMIN_ADDR` | `conduitctl` | `http://127.0.0.1:4001` |
+| `CONDUIT_CONSOLE_ADDR` | `conduitctl` | `http://127.0.0.1:4001` |
 | `CONDUIT_OUTPUT` | `conduitctl` | `human` \| `json` |
 | `CONDUIT_CONFIG` | `conduitd` | `conduit.toml` |
 | `CONDUIT_PORT` | `conduitd` | gateway port override |
 | `CONDUIT_DATA_DIR` | `conduitd` | `~/.conduit` |
 | `CONDUIT_LOG` | `conduitd` | `info` (e.g. `debug`, `conduitd=trace`) |
 | `CONDUIT_LOG_FORMAT` | `conduitd` | `pretty` \| `json` |
-| `VITE_CONDUIT_ADMIN_URL` | `conduit-ui` | admin base for the desktop console |
+| `VITE_CONDUIT_CONSOLE_URL` | `conduit-ui` | console base for the desktop console |
 | `RUST_LOG` | any | optional extra filter if used by tools |
 
 ## Project Structure

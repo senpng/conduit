@@ -32,7 +32,7 @@ pub struct IngressWire {
     pub format: WireFormat,
     /// Original JSON body as received from the client (before IR decode).
     pub body: Value,
-    /// Client request headers (already redacted). JSON object map.
+    /// Original client request headers. JSON object map.
     pub headers: Value,
 }
 

@@ -3,8 +3,8 @@
   import {
     routes as routesApi,
     providers as providersApi,
-  } from "../lib/adminClient";
-  import type { Provider, Route } from "../lib/adminClient";
+  } from "../lib/consoleClient";
+  import type { Provider, Route } from "../lib/consoleClient";
   import Modal from "../components/Modal.svelte";
 
   interface Props {

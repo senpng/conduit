@@ -28,6 +28,19 @@ impl SlidingWindowCounter {
         *entry
     }
 
+    /// Atomically reserve one request when the current bucket is below `limit`.
+    /// Returns `true` only when this call incremented the bucket.
+    pub async fn check_and_increment(&self, key: &str, limit: u64) -> bool {
+        let bucket = bucket_key(key);
+        let mut guard = self.counts.lock().await;
+        let entry = guard.entry(bucket).or_insert(0);
+        if *entry >= limit {
+            return false;
+        }
+        *entry += 1;
+        true
+    }
+
     /// Return the counter for `key` in the current minute without changing it.
     pub async fn get(&self, key: &str) -> u64 {
         let bucket = bucket_key(key);
@@ -139,6 +152,24 @@ mod tests {
 
         let total = counter.get("concurrent_key").await;
         assert_eq!(total, 100, "all 100 concurrent increments must be recorded");
+    }
+
+    #[tokio::test]
+    async fn concurrent_check_and_increment_never_exceeds_limit() {
+        let counter = Arc::new(SlidingWindowCounter::new());
+        let tasks: Vec<_> = (0..100)
+            .map(|_| {
+                let counter = counter.clone();
+                tokio::spawn(async move { counter.check_and_increment("limited_key", 1).await })
+            })
+            .collect();
+
+        let mut allowed = 0;
+        for task in tasks {
+            allowed += task.await.expect("task should not panic") as u32;
+        }
+        assert_eq!(allowed, 1);
+        assert_eq!(counter.get("limited_key").await, 1);
     }
 }
 

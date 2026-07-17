@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { app } from "../state/app.svelte";
-  import { routes as routesApi, providers as providersApi } from "../lib/adminClient";
-  import type { Provider, Route } from "../lib/adminClient";
+  import { routes as routesApi, providers as providersApi } from "../lib/consoleClient";
+  import type { Provider, Route } from "../lib/consoleClient";
   import { fmtDate, providerDisplayName } from "../lib/format";
   import JsonView from "../components/JsonView.svelte";
   import RouteWizard from "./RouteWizard.svelte";

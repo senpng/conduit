@@ -1,6 +1,6 @@
 /**
  * Types mirroring daemon trace contract (`conduit-ir/src/trace.rs`,
- * `conduitd/src/admin.rs`). SSE frames carry the full TraceEvent JSON with an
+ * `conduitd/src/console.rs`). SSE frames carry the full TraceEvent JSON with an
  * internally-tagged `kind` (`kind.type`).
  */
 
@@ -82,7 +82,7 @@ export type TraceEventKind =
     }
   | { type: "error"; kind: string; message: string };
 
-/** Full event JSON pushed on `GET /admin/traces/stream`. */
+/** Full event JSON pushed on `GET /console/traces/stream`. */
 export interface TraceEvent {
   id: string;
   trace_id?: string;
@@ -90,7 +90,7 @@ export interface TraceEvent {
   kind: TraceEventKind;
 }
 
-/** Complete audit bundle from `GET /admin/traces/{id}`. */
+/** Complete audit bundle from `GET /console/traces/{id}`. */
 export interface TraceBundle {
   trace_id: string;
   events: TraceEvent[];

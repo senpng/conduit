@@ -4,8 +4,8 @@
  * from App.svelte onMount) so no $effect roots leak.
  */
 
-import { health as healthApi, getAdminBase } from "../lib/adminClient";
-import type { HealthResponse } from "../lib/adminClient";
+import { health as healthApi, getConsoleBase } from "../lib/consoleClient";
+import type { HealthResponse } from "../lib/consoleClient";
 
 export type ScreenId =
   | "dashboard"
@@ -67,9 +67,9 @@ class AppState {
   private gPrefixAt = 0;
   private refreshers = new Map<ScreenId, () => void>();
 
-  readonly adminBase = getAdminBase();
+  readonly consoleBase = getConsoleBase();
   readonly isLoopback = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(
-    this.adminBase,
+    this.consoleBase,
   );
 
   start(): void {

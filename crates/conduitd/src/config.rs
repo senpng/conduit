@@ -12,7 +12,7 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
     pub port: u16,
-    pub admin_port: u16,
+    pub console_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,7 +40,7 @@ impl Default for Config {
         Self {
             gateway: GatewayConfig {
                 port: 4000,
-                admin_port: 4001,
+                console_port: 4001,
             },
             security: SecurityConfig {
                 backend: "keychain".to_string(),
@@ -116,7 +116,7 @@ mod tests {
         let toml = r#"
 [gateway]
 port = 4000
-admin_port = 4001
+console_port = 4001
 [security]
 backend = "keychain"
 [trace]

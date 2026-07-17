@@ -28,6 +28,7 @@ use ulid::Ulid;
 use super::{
     context::client_response_headers,
     egress::{compute_cost, ModelPricing},
+    provider::UpstreamHeaders,
 };
 
 pub type PricingFn = Arc<dyn Fn(&str, &str) -> Option<ModelPricing> + Send + Sync>;
@@ -67,6 +68,7 @@ pub struct InstrumentedStream {
     loss_report: LossReport,
     trace_id: String,
     wire_format: WireFormat,
+    upstream_headers: UpstreamHeaders,
     /// Stateful Anthropic SSE encoder for client-facing audit frames.
     anthropic_encoder: Option<AnthropicStreamEncoder>,
 }
@@ -87,6 +89,7 @@ impl InstrumentedStream {
         loss_report: LossReport,
         trace_id: String,
         wire_format: WireFormat,
+        upstream_headers: UpstreamHeaders,
     ) -> Self {
         let resp_id = Ulid::new().to_string();
         let anthropic_encoder = if wire_format == WireFormat::AnthropicMessages {
@@ -119,6 +122,7 @@ impl InstrumentedStream {
             loss_report,
             trace_id,
             wire_format,
+            upstream_headers,
             anthropic_encoder,
         }
     }
@@ -241,6 +245,8 @@ impl InstrumentedStream {
                 stream: true,
                 stream_frames: Some(std::mem::take(&mut self.stream_frames)),
                 response_headers: Some(response_headers),
+                upstream_request_headers: Some(self.upstream_headers.request.clone()),
+                upstream_response_headers: Some(self.upstream_headers.response.clone()),
             },
         );
         self.emit(upstream_event);
@@ -330,12 +336,59 @@ impl InstrumentedStream {
                 stream: true,
                 stream_frames: frames,
                 response_headers: Some(client_response_headers(self.wire_format, true)),
+                upstream_request_headers: Some(self.upstream_headers.request.clone()),
+                upstream_response_headers: Some(self.upstream_headers.response.clone()),
             },
         ));
         self.emit(TraceEvent::with_trace_id(
             self.trace_id.clone(),
             TraceEventKind::Error { kind, message },
         ));
+
+        let pf = &*self.pricing_fn;
+        let cost_usd = compute_cost(
+            &self.provider_kind,
+            &self.model_id,
+            &self.usage_acc,
+            |pk, mid| pf(pk, mid),
+        );
+        self.emit(TraceEvent::with_trace_id(
+            self.trace_id.clone(),
+            TraceEventKind::FinalUsage {
+                usage: self.usage_acc.clone(),
+                cost_usd,
+                loss_report: self.loss_report.clone(),
+                downstream_key_id: self.downstream_key_id.clone(),
+            },
+        ));
+
+        let key_id = self
+            .downstream_key_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "_anonymous".into());
+        let record = QuotaRecordRequest {
+            request_id: self.trace_id.clone(),
+            downstream_key_id: key_id,
+            alias: Some(self.alias.clone()),
+            provider_id: Some(self.provider_id.clone()),
+            provider_kind: Some(self.provider_kind.clone()),
+            model_id: Some(self.model_id.clone()),
+            prompt_tokens: self.usage_acc.prompt_tokens,
+            completion_tokens: self.usage_acc.completion_tokens,
+            total_tokens: self.usage_acc.total_tokens,
+            reasoning_tokens: self.usage_acc.reasoning_tokens,
+            cache_read_tokens: self.usage_acc.cache_read_tokens,
+            cache_write_tokens: self.usage_acc.cache_write_tokens,
+            cost_usd,
+            stream: true,
+        };
+        let quota = self.quota.clone();
+        tokio::spawn(async move {
+            if let Err(e) = quota.record(&record).await {
+                warn!(error = %e, "stream usage record failed");
+            }
+        });
     }
 }
 
@@ -384,7 +437,7 @@ impl Stream for InstrumentedStream {
                 }
 
                 // Capture + live-emit the real client-facing SSE frame(s) so
-                // `trace tail` / admin SSE show stream content in real time.
+                // `trace tail` / console SSE show stream content in real time.
                 let text_delta = match &chunk.delta {
                     Some(BlockDelta::TextDelta { text }) if !text.is_empty() => Some(text.clone()),
                     _ => None,
@@ -527,6 +580,10 @@ mod tests {
             LossReport::default(),
             "trace-xyz".into(),
             WireFormat::OpenaiChat,
+            UpstreamHeaders {
+                request: json!({"authorization": "Bearer upstream-secret"}),
+                response: json!({"x-request-id": "upstream-1"}),
+            },
         );
 
         // Consume exactly one chunk, then drop mid-stream (client disconnect).
@@ -552,5 +609,44 @@ mod tests {
             1,
             "usage must still be recorded on client disconnect (billing not lost)"
         );
+    }
+
+    #[tokio::test]
+    async fn upstream_error_after_usage_still_records_usage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(TraceStore::open(tmp.path().to_path_buf()).await.unwrap());
+        let (sink, _h) = TraceSink::start(store).await;
+        let sink = Arc::new(sink);
+        let recorded = Arc::new(Mutex::new(0u32));
+        let quota = Arc::new(RecordingQuota {
+            recorded: recorded.clone(),
+        });
+        let err = ProviderError::Network("connection reset".into());
+        let inner = futures::stream::iter(vec![Ok(text_chunk("hi")), Err(err)]).boxed();
+        let mut stream = InstrumentedStream::new(
+            inner,
+            sink.clone(),
+            Arc::new(|_, _| None),
+            quota,
+            Some("key-1".into()),
+            Utc::now(),
+            "gpt-4o".into(),
+            "prov-1".into(),
+            "openai".into(),
+            "gpt-4o".into(),
+            LossReport::default(),
+            "trace-error".into(),
+            WireFormat::OpenaiChat,
+            UpstreamHeaders {
+                request: json!({"authorization": "Bearer upstream-secret"}),
+                response: json!({"x-request-id": "upstream-2"}),
+            },
+        );
+
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        assert!(matches!(stream.next().await, Some(Err(_))));
+        sink.drain().await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(*recorded.lock().unwrap(), 1);
     }
 }

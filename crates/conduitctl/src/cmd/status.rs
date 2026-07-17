@@ -1,8 +1,8 @@
 use anyhow::Result;
-use conduitctl::AdminClient;
+use conduitctl::ConsoleClient;
 
-pub async fn run(admin_addr: &str) -> Result<()> {
-    let client = AdminClient::new(admin_addr);
+pub async fn run(console_addr: &str) -> Result<()> {
+    let client = ConsoleClient::new(console_addr);
     match client.health().await {
         Ok(body) => {
             println!("conduitd: {}", body.status);
@@ -12,11 +12,11 @@ pub async fn run(admin_addr: &str) -> Result<()> {
             }
             Ok(())
         }
-        Err(conduitctl::AdminError::Http { status, .. }) => {
+        Err(conduitctl::ConsoleError::Http { status, .. }) => {
             anyhow::bail!("daemon returned HTTP {}", status)
         }
-        Err(conduitctl::AdminError::Transport(e)) => {
-            anyhow::bail!("cannot reach daemon at {}: {}", admin_addr, e)
+        Err(conduitctl::ConsoleError::Transport(e)) => {
+            anyhow::bail!("cannot reach daemon at {}: {}", console_addr, e)
         }
         Err(e) => anyhow::bail!("{}", e),
     }

@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { app } from "../state/app.svelte";
-  import { pricing as pricingApi } from "../lib/adminClient";
-  import type { PricingRow } from "../lib/adminClient";
+  import { pricing as pricingApi } from "../lib/consoleClient";
+  import type { PricingRow } from "../lib/consoleClient";
 
   let list = $state<PricingRow[]>([]);
   let loading = $state(true);

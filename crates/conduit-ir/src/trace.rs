@@ -110,7 +110,7 @@ pub enum TraceEventKind {
 
     /// One client-facing SSE frame emitted during a streaming response.
     ///
-    /// Sent as the stream progresses so live `trace tail` / admin SSE can show
+    /// Sent as the stream progresses so live `trace tail` / console SSE can show
     /// content in real time. Also persisted for complete stream audit.
     StreamDelta {
         /// 0-based sequence within this request's stream.
@@ -145,9 +145,15 @@ pub enum TraceEventKind {
         /// Each entry is a full frame text, e.g. `"data: {...}\n\n"`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stream_frames: Option<Vec<String>>,
-        /// Client-facing response headers (as set by the gateway). JSON object map.
+        /// Client-facing response headers. JSON object map.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         response_headers: Option<Value>,
+        /// Complete headers sent to the upstream provider. JSON object map.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upstream_request_headers: Option<Value>,
+        /// Complete headers returned by the upstream provider. JSON object map.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upstream_response_headers: Option<Value>,
     },
 
     /// Token usage and cost summary for the completed request.

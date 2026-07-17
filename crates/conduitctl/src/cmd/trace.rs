@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use conduitctl::{AdminClient, AdminError, SseFrame};
+use conduitctl::{ConsoleClient, ConsoleError, SseFrame};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Parser)]
@@ -20,7 +20,7 @@ pub enum TraceCommand {
     },
     /// Get a specific trace by ID
     Get { id: String },
-    /// Tail trace events in real-time (SSE from admin API)
+    /// Tail trace events in real-time (SSE from console API)
     Tail,
     /// Replay a request from a trace (default: dry-run, no upstream / billing)
     Replay {
@@ -31,8 +31,8 @@ pub enum TraceCommand {
     },
 }
 
-pub async fn run(admin_addr: &str, args: TraceArgs, output: &str) -> Result<()> {
-    let client = AdminClient::new(admin_addr);
+pub async fn run(console_addr: &str, args: TraceArgs, output: &str) -> Result<()> {
+    let client = ConsoleClient::new(console_addr);
 
     match args.command {
         TraceCommand::List { limit } => {
@@ -56,13 +56,13 @@ pub async fn run(admin_addr: &str, args: TraceArgs, output: &str) -> Result<()> 
         TraceCommand::Tail => {
             // Banner goes to stderr so `--output json` stdout stays pure JSONL.
             eprintln!(
-                "Tailing traces from {}/admin/traces/stream … (Ctrl+C to stop)",
+                "Tailing traces from {}/console/traces/stream … (Ctrl+C to stop)",
                 client.base_url()
             );
             // Reconnect loop: daemon restart / transient disconnect should not kill tail.
             let mut backoff_ms: u64 = 500;
             loop {
-                let (tx, mut rx) = mpsc::channel::<Result<SseFrame, AdminError>>(256);
+                let (tx, mut rx) = mpsc::channel::<Result<SseFrame, ConsoleError>>(256);
                 let handle = client.subscribe_traces(tx);
                 let mut saw_error = false;
                 while let Some(item) = rx.recv().await {
@@ -97,7 +97,7 @@ pub async fn run(admin_addr: &str, args: TraceArgs, output: &str) -> Result<()> 
                 );
             }
             let body = client.replay_dry_run(&id).await.map_err(|e| match e {
-                AdminError::Http { status, body } => {
+                ConsoleError::Http { status, body } => {
                     anyhow::anyhow!("replay failed: HTTP {} — {}", status, body)
                 }
                 other => anyhow::anyhow!("replay request failed: {}", other),

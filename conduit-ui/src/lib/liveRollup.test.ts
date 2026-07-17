@@ -10,7 +10,7 @@ import {
   type LiveRollup,
 } from "./liveRollup";
 import type { TraceEvent } from "./traceTypes";
-import type { TraceIndexRow } from "./adminClient";
+import type { TraceIndexRow } from "./consoleClient";
 
 function ev(traceId: string, kind: TraceEvent["kind"], ts = "2026-07-17T12:00:00Z"): TraceEvent {
   return { id: `e-${traceId}-${kind.type}`, trace_id: traceId, ts, kind };

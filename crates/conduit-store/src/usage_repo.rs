@@ -257,7 +257,7 @@ impl<'a> UsageRepo<'a> {
     }
 }
 
-/// Period rollup used by admin summary.
+/// Period rollup used by console summary.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageSummaryRow {
     pub downstream_key_id: String,

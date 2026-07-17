@@ -35,7 +35,7 @@
 
 - **位置**：`crates/conduitctl/src/cmd/{provider,route,key,status}.rs`
 - **现状**：~~`clap` 定义齐全，`run()` 未实现~~ **已实现**
-- **需要做**（每条都对应 admin API，HTTP 复用 trace/budget 已有的 client 模板）：
+- **需要做**（每条都对应 console API，HTTP 复用 trace/budget 已有的 client 模板）：
   - [x] `conduitctl status` —— 调用 `GET /health` + 汇总 daemon 关键指标
   - [x] `conduitctl provider list/add/remove/health`
   - [x] `conduitctl route list/get/remove`
@@ -89,9 +89,9 @@
 - **位置**：`crates/conduitd/src/{routes,state,server}.rs`、`conduit-pipeline` `PipelineDeps`
 - **现状**：~~每请求 clone + new handle~~ **已实现** `ArcSwap` + 启动时共享 `PipelineHandle`
 - **需要做**：
-  - [x] routing_table 改为 `Arc<ArcSwap<RoutingTable>>`，admin 改表 `store(new)`，读路径无锁
+  - [x] routing_table 改为 `Arc<ArcSwap<RoutingTable>>`，console 改表 `store(new)`，读路径无锁
   - [x] `PipelineHandle` 在 daemon 启动时构一次存 `DaemonState`，handler 直接复用
-- **验收**：热路径 `load_full()` 无写锁；admin reload 后后续请求可见新表 ✅（单测覆盖；未跑 cargo bench）
+- **验收**：热路径 `load_full()` 无写锁；console reload 后后续请求可见新表 ✅（单测覆盖；未跑 cargo bench）
 
 ### A6. Append-only log 缺 fsync 保证（P1） ✅（写路径 fsync；CRC trailer 仍 P2）
 
@@ -105,11 +105,11 @@
 
 ### O1. `conduitctl trace tail` / `trace replay` 未实现 ✅（dry-run）
 
-- **位置**：`crates/conduitctl/src/cmd/trace.rs`、`conduitd` admin traces API
+- **位置**：`crates/conduitctl/src/cmd/trace.rs`、`conduitd` console traces API
 - **现状**：~~mock / bail~~ **已实现** SSE tail + dry-run replay
 - **需要做**：
-  - [x] `trace tail`：admin `GET /admin/traces/stream` + CLI SSE 订阅
-  - [x] `trace replay <trace-id>`：默认 dry-run（`POST /admin/traces/{id}/replay?dry_run=true`），打印 intended provider/target + request summary，不调上游、不计费
+  - [x] `trace tail`：console `GET /console/traces/stream` + CLI SSE 订阅
+  - [x] `trace replay <trace-id>`：默认 dry-run（`POST /console/traces/{id}/replay?dry_run=true`），打印 intended provider/target + request summary，不调上游、不计费
   - [ ] live replay（`--execute` / `dry_run=false`）仍未实现
 - **验收**：tail 订阅真实 SSE 事件；replay dry-run 输出 provider + summary 且 `billed=false`
 
@@ -147,13 +147,13 @@
 
 ### OAuth1. Provider OAuth 支持 ✅
 
-- **位置**：`crates/conduit-oauth/`、`conduit-upstream`、`conduit-pipeline`、`conduitd` oauth admin、`conduitctl oauth`、UI Providers
+- **位置**：`crates/conduit-oauth/`、`conduit-upstream`、`conduit-pipeline`、`conduitd` oauth console、`conduitctl oauth`、UI Providers
 - **完成内容**：
   - [x] `conduit-oauth`：PKCE、Claude/Codex 授权码、Grok Device Code、credential JSON、refresh singleflight
   - [x] 热路径 `CredentialResolver`：读 secret → 近过期刷新 → Bearer + 扩展头
   - [x] `ProviderKind`：`claude-oauth` / `codex-oauth` / `grok-oauth`
   - [x] Codex 最小 Responses codec（`/responses`）
-  - [x] Admin：`/admin/oauth/{kind}/start`、sessions、cancel、refresh + 本机 callback
+  - [x] Console：`/console/oauth/{kind}/start`、sessions、cancel、refresh + 本机 callback
   - [x] CLI：`conduitctl oauth start|status|cancel|refresh|list`
   - [x] UI：Providers 页「OAuth 登录」
   - [x] Claude OAuth relay 全量对齐 CLIProxyAPI：Chrome TLS（wreq）、Firefox token TLS、cloak/cch/tool-remap/signature/cache、headers（`conduit-upstream/src/claude_oauth/`）
@@ -186,7 +186,7 @@
 - **现状**：所有测试都嵌在各 crate `lib.rs` 中，`tests/` 目录为 0
 - **需要做**：
   - [ ] 顶层 `tests/end_to_end.rs`：启动 daemon + wiremock provider + 一次完整 chat completion，验证 trace 落盘 + budget 扣减
-  - [ ] 顶层 `tests/admin_api.rs`：覆盖 admin CRUD（provider / route / key / budget）
+  - [ ] 顶层 `tests/console_api.rs`：覆盖 console CRUD（provider / route / key / budget）
 - **验收**：`cargo nextest run` 能跑 E2E
 
 ### Q4. CI / 发布管线未建立（CI 已有，release 未建）
@@ -201,10 +201,10 @@
 ### Q5. Tauri 后端绑定未审计 ✅
 
 - **位置**：`conduit-ui/src-tauri/`、`ARCHITECTURE.md`
-- **现状**：~~未定形态~~ **已选定 A**：Tauri = 窗口壳；Svelte 经 loopback HTTP 调 admin（默认 `127.0.0.1:4001`）。无 admin IPC。
+- **现状**：~~未定形态~~ **已选定 A**：Tauri = 窗口壳；Svelte 经 loopback HTTP 调 console（默认 `127.0.0.1:4001`）。无 console IPC。
 - **需要做**：
   - [x] 决定形态 A 并写入 ARCHITECTURE.md
-  - [x] 前端 admin client 与 daemon 契约对齐（`api_key` / `key` / budget envelope / traces）
+  - [x] 前端 console client 与 daemon 契约对齐（`api_key` / `key` / budget envelope / traces）
   - [x] Traces 视图：list / detail / SSE tail / dry-run replay
 - **验收**：文档与实现一致；`npm test` + `npm run build` 通过
 
@@ -234,7 +234,7 @@
 
 ### D1. OpenTelemetry / Prometheus 指标 ~~尚未串通~~ 已决定不做
 
-- **结论（2026-07-17）**：local-first 个人网关不需要 OTLP/Prometheus 导出。`tracing-opentelemetry`、`opentelemetry{,_sdk,-otlp}`、`metrics`、`metrics-exporter-prometheus` 依赖已从未使用状态中移除（此前代码零引用，纯依赖负担）。可观测性由 trace 日志 + SQLite 索引 + admin API 承担。如未来确有需要再单独评估引入。
+- **结论（2026-07-17）**：local-first 个人网关不需要 OTLP/Prometheus 导出。`tracing-opentelemetry`、`opentelemetry{,_sdk,-otlp}`、`metrics`、`metrics-exporter-prometheus` 依赖已从未使用状态中移除（此前代码零引用，纯依赖负担）。可观测性由 trace 日志 + SQLite 索引 + console API 承担。如未来确有需要再单独评估引入。
 
 ### D2. ARCHITECTURE.md 未写部分补齐
 
@@ -280,7 +280,7 @@
 | conduit-router | ✅ ~95% | 单测全绿（26/26） |
 | conduit-upstream | 🟢 ~85% | warning 已清零 |
 | conduit-pipeline | 🟢 ~90% | A4 typed dispatch 已完成；单测仍可加厚 |
-| conduitd | 🟢 ~85% | ArcSwap 热路径 + traces admin SSE/replay |
+| conduitd | 🟢 ~85% | ArcSwap 热路径 + traces console SSE/replay |
 | conduitctl | 🟢 ~90% | trace tail/replay dry-run 已实现 |
 | conduit-ui | ✅ 已重写（2026-07-17） | Svelte 5 operator console：Live Monitor（SSE rollup + lagged 状态）、trace 四 pane 审计、route multi-target wizard、统一 Confirm/Palette；零在线资源；49 tests + svelte-check 0 警告（见 `docs/design/conduit-ui-rewrite.md`） |
 | 测试 / CI / 发布 | 🟡 ~45% | 单元测试+CI 有；E2E/release 未建 |

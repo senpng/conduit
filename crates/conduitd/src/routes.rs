@@ -1,4 +1,4 @@
-//! Axum route handlers for the OpenAI / Anthropic-compatible gateway API + admin API.
+//! Axum route handlers for the OpenAI / Anthropic-compatible gateway API + console API.
 
 use std::sync::Arc;
 
@@ -18,7 +18,7 @@ use ulid::Ulid;
 
 use crate::state::DaemonState;
 
-/// Collect inbound headers for trace audit, with secrets redacted.
+/// Collect inbound headers for trace audit.
 ///
 /// Multi-valued headers become JSON arrays; single values stay strings.
 fn headers_for_audit(headers: &HeaderMap) -> Value {
@@ -27,9 +27,7 @@ fn headers_for_audit(headers: &HeaderMap) -> Value {
     for (name, value) in headers.iter() {
         let key = name.as_str().to_string();
         let raw = value.to_str().unwrap_or("<non-utf8>");
-        map.entry(key)
-            .or_default()
-            .push(redact_header_value(name.as_str(), raw));
+        map.entry(key).or_default().push(raw.to_string());
     }
     let mut obj = serde_json::Map::new();
     for (k, mut vs) in map {
@@ -40,21 +38,6 @@ fn headers_for_audit(headers: &HeaderMap) -> Value {
         }
     }
     Value::Object(obj)
-}
-
-fn redact_header_value(name: &str, value: &str) -> String {
-    match name.to_ascii_lowercase().as_str() {
-        "authorization" | "proxy-authorization" => {
-            // Keep scheme (e.g. "Bearer ") so the audit still shows auth mode.
-            if let Some((scheme, _)) = value.split_once(' ') {
-                format!("{scheme} [REDACTED]")
-            } else {
-                "[REDACTED]".into()
-            }
-        }
-        "x-api-key" | "api-key" | "cookie" | "set-cookie" => "[REDACTED]".into(),
-        _ => value.to_string(),
-    }
 }
 
 /// Extract raw bearer secret from Authorization header.
@@ -543,15 +526,15 @@ mod auth_status_tests {
     }
 
     #[test]
-    fn headers_for_audit_redacts_secrets() {
+    fn headers_for_audit_preserves_all_values() {
         let mut h = HeaderMap::new();
         h.insert("authorization", "Bearer sk-secret-token".parse().unwrap());
         h.insert("x-api-key", "ck_secret".parse().unwrap());
         h.insert("user-agent", "test-client/1.0".parse().unwrap());
         h.insert("content-type", "application/json".parse().unwrap());
         let v = headers_for_audit(&h);
-        assert_eq!(v["authorization"], "Bearer [REDACTED]");
-        assert_eq!(v["x-api-key"], "[REDACTED]");
+        assert_eq!(v["authorization"], "Bearer sk-secret-token");
+        assert_eq!(v["x-api-key"], "ck_secret");
         assert_eq!(v["user-agent"], "test-client/1.0");
         assert_eq!(v["content-type"], "application/json");
     }

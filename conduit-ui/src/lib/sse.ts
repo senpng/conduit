@@ -1,5 +1,5 @@
 /**
- * SSE frame helpers for the admin trace stream (`GET /admin/traces/stream`).
+ * SSE frame helpers for the console trace stream (`GET /console/traces/stream`).
  *
  * Frames come in two shapes:
  *   - default / `event: message` + `data: <TraceEvent JSON>`

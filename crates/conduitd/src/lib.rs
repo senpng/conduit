@@ -1,5 +1,5 @@
-pub mod admin;
 pub mod config;
+pub mod console;
 pub mod oauth;
 pub mod routes;
 pub mod server;

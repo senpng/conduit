@@ -1,10 +1,12 @@
-//! Library surface for `conduitctl` — shared admin client, DTOs, utilities.
+//! Library surface for `conduitctl` — shared console client, DTOs, utilities.
 
-pub mod admin_client;
+pub mod console_client;
 pub mod dto;
 pub mod util;
 
-pub use admin_client::{provider_create_request_body, route_admin_path, AdminClient, AdminError};
+pub use console_client::{
+    provider_create_request_body, route_console_path, ConsoleClient, ConsoleError,
+};
 pub use dto::{
     CreateKeyBody, CreateProviderBody, CreateRouteBody, HealthResponse, KeyCreateResponse,
     TraceIndexRowDto, TraceListResponse,

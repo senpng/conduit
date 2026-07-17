@@ -5,12 +5,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use conduit_codec::WireCodec;
-use conduit_ir::{
-    canonical::{CanonicalChatRequest, CanonicalChatResponse, CanonicalChunk},
-    error::ProviderError,
-    loss::LossReport,
-};
-use futures::stream::{BoxStream, StreamExt, TryStreamExt};
+use conduit_ir::{canonical::CanonicalChatRequest, error::ProviderError};
+use futures::stream::{StreamExt, TryStreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use tracing::warn;
@@ -23,6 +19,7 @@ use super::{
     options::ClaudeOAuthRelayOptions,
     tools::{reverse_remap_response, reverse_remap_stream_payload},
 };
+use crate::provider::{header_pairs_to_json, ChatResult, StreamResult, UpstreamHeaders};
 
 fn map_status(status: u16, body: &str) -> ProviderError {
     match status {
@@ -47,18 +44,39 @@ fn messages_url(base_url: &str) -> String {
     messages_url_with_beta(&url)
 }
 
-fn apply_headers(
-    mut builder: wreq::RequestBuilder,
+fn oauth_request_headers(
     access_token: &str,
     stream: bool,
     extra_betas: &[String],
     opts: &ClaudeOAuthRelayOptions,
+) -> Vec<(String, String)> {
+    let mut headers = vec![("Authorization".into(), format!("Bearer {access_token}"))];
+    headers.extend(build_claude_oauth_headers(
+        access_token,
+        stream,
+        extra_betas,
+        opts,
+    ));
+    headers
+}
+
+fn apply_headers(
+    mut builder: wreq::RequestBuilder,
+    headers: &[(String, String)],
 ) -> wreq::RequestBuilder {
-    builder = builder.header("Authorization", format!("Bearer {access_token}"));
-    for (k, v) in build_claude_oauth_headers(access_token, stream, extra_betas, opts) {
-        builder = builder.header(k, v);
+    for (key, value) in headers {
+        builder = builder.header(key, value);
     }
     builder
+}
+
+fn response_headers_to_json(headers: &wreq::header::HeaderMap) -> Value {
+    header_pairs_to_json(headers.iter().map(|(name, value)| {
+        (
+            name.as_str().to_owned(),
+            value.to_str().unwrap_or("<non-utf8>").to_owned(),
+        )
+    }))
 }
 
 fn apply_upstream_model(mut body: Value, upstream_model: &str) -> Value {
@@ -79,7 +97,7 @@ pub async fn chat_oauth<C: WireCodec + 'static>(
     secret: &SecretString,
     opts: &ClaudeOAuthRelayOptions,
     overall_ms: u64,
-) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
+) -> Result<ChatResult, ProviderError> {
     debug_assert!(is_claude_oauth_kind(kind));
     let url = messages_url(base_url);
     let (body, encode_loss) = C::encode_request(req, false);
@@ -95,13 +113,9 @@ pub async fn chat_oauth<C: WireCodec + 'static>(
         .post(&url)
         .timeout(Duration::from_millis(overall_ms))
         .json(&prepared.body);
-    let builder = apply_headers(
-        builder,
-        secret.expose_secret(),
-        false,
-        &prepared.extra_betas,
-        opts,
-    );
+    let request_headers =
+        oauth_request_headers(secret.expose_secret(), false, &prepared.extra_betas, opts);
+    let builder = apply_headers(builder, &request_headers);
 
     let resp = builder.send().await.map_err(|e| {
         if e.is_timeout() {
@@ -112,6 +126,7 @@ pub async fn chat_oauth<C: WireCodec + 'static>(
     })?;
 
     let status = resp.status().as_u16();
+    let response_headers = response_headers_to_json(resp.headers());
     if !(200..300).contains(&status) {
         let text = resp.text().await.unwrap_or_default();
         return Err(map_status(status, &text));
@@ -127,7 +142,14 @@ pub async fn chat_oauth<C: WireCodec + 'static>(
         .map_err(|e| ProviderError::Serialization(e.to_string()))?;
     let mut combined = encode_loss;
     combined.merge(decode_loss);
-    Ok((response, combined))
+    Ok((
+        response,
+        combined,
+        UpstreamHeaders {
+            request: header_pairs_to_json(request_headers),
+            response: response_headers,
+        },
+    ))
 }
 
 /// Streaming Claude OAuth Messages call (Chrome TLS + identity Accept-Encoding).
@@ -139,13 +161,7 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
     secret: &SecretString,
     opts: &ClaudeOAuthRelayOptions,
     overall_ms: u64,
-) -> Result<
-    (
-        BoxStream<'static, Result<CanonicalChunk, ProviderError>>,
-        LossReport,
-    ),
-    ProviderError,
-> {
+) -> Result<StreamResult, ProviderError> {
     debug_assert!(is_claude_oauth_kind(kind));
     let url = messages_url(base_url);
     let (body, encode_loss) = C::encode_request(req, true);
@@ -162,13 +178,9 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
         .post(&url)
         .timeout(Duration::from_millis(overall_ms))
         .json(&prepared.body);
-    let builder = apply_headers(
-        builder,
-        secret.expose_secret(),
-        true,
-        &prepared.extra_betas,
-        opts,
-    );
+    let request_headers =
+        oauth_request_headers(secret.expose_secret(), true, &prepared.extra_betas, opts);
+    let builder = apply_headers(builder, &request_headers);
 
     let resp = builder.send().await.map_err(|e| {
         if e.is_timeout() {
@@ -179,6 +191,7 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
     })?;
 
     let status = resp.status().as_u16();
+    let response_headers = response_headers_to_json(resp.headers());
     if !(200..300).contains(&status) {
         let text = resp.text().await.unwrap_or_default();
         return Err(map_status(status, &text));
@@ -227,5 +240,12 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
         })
         .flat_map(futures::stream::iter);
 
-    Ok((Box::pin(stream), encode_loss))
+    Ok((
+        Box::pin(stream),
+        encode_loss,
+        UpstreamHeaders {
+            request: header_pairs_to_json(request_headers),
+            response: response_headers,
+        },
+    ))
 }

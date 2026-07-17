@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { app } from "../state/app.svelte";
-  import { providers as providersApi } from "../lib/adminClient";
-  import type { Provider } from "../lib/adminClient";
+  import { providers as providersApi } from "../lib/consoleClient";
+  import type { Provider } from "../lib/consoleClient";
   import { fmtDate } from "../lib/format";
   import Modal from "../components/Modal.svelte";
   import OAuthPanel from "./OAuthPanel.svelte";

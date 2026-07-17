@@ -1,7 +1,7 @@
 <script lang="ts">
   import { app } from "../state/app.svelte";
-  import { traces as tracesApi, providers as providersApi } from "../lib/adminClient";
-  import type { Provider, ReplayPlan } from "../lib/adminClient";
+  import { traces as tracesApi, providers as providersApi } from "../lib/consoleClient";
+  import type { Provider, ReplayPlan } from "../lib/consoleClient";
   import type { TraceBundle, TraceEvent } from "../lib/traceTypes";
   import { lossReportNonEmpty } from "../lib/traceTypes";
   import {

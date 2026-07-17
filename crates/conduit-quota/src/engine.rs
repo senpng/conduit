@@ -87,18 +87,16 @@ impl InMemoryQuotaEngine {
 impl QuotaEngine for InMemoryQuotaEngine {
     async fn check(&self, req: &QuotaCheckRequest) -> Result<(), QuotaError> {
         if let Some(limit) = req.rate_limit_rpm {
-            let current = self.rpm_counter.get(&req.downstream_key_id).await;
-            if current >= limit as u64 {
+            if !self
+                .rpm_counter
+                .check_and_increment(&req.downstream_key_id, limit as u64)
+                .await
+            {
                 return Err(QuotaError::RateLimitExceeded {
                     requests_per_minute: limit,
                 });
             }
         }
-
-        if req.rate_limit_rpm.is_some() {
-            self.rpm_counter.increment(&req.downstream_key_id).await;
-        }
-
         Ok(())
     }
 
@@ -171,6 +169,25 @@ mod tests {
         engine.check(&req).await.unwrap();
         let result = engine.check(&req).await;
         assert!(matches!(result, Err(QuotaError::RateLimitExceeded { .. })));
+    }
+
+    #[tokio::test]
+    async fn concurrent_checks_do_not_exceed_rpm_limit() {
+        let engine = Arc::new(make_engine_always_ok());
+        let req = make_req(Some(1));
+        let checks: Vec<_> = (0..100)
+            .map(|_| {
+                let engine = engine.clone();
+                let req = req.clone();
+                tokio::spawn(async move { engine.check(&req).await.is_ok() })
+            })
+            .collect();
+
+        let mut allowed = 0;
+        for check in checks {
+            allowed += check.await.expect("task should not panic") as u32;
+        }
+        assert_eq!(allowed, 1);
     }
 
     #[tokio::test]

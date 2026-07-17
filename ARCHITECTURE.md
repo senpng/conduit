@@ -16,13 +16,13 @@ Conduit is a **local-first, single-binary LLM gateway** with complete audit trai
 │  (Tauri + Svelte)   │         │  one-shot operator CLI       │
 │  operator console   │         │  (scripts / automation)      │
 └─────────┬───────────┘         └──────────────┬───────────────┘
-          │   loopback HTTP + admin API         │
+          │   loopback HTTP + console API         │
           └──────────────────┬──────────────────┘
                              ▼
                   ┌──────────────────────┐
                   │     conduitd         │
                   │  (axum gateway +     │
-                  │   admin API server)  │
+                  │   console API server)  │
                   └──────────────────────┘
 ```
 
@@ -32,16 +32,16 @@ Conduit is a **local-first, single-binary LLM gateway** with complete audit trai
 
 **Chosen form: A — Tauri is a window shell only.** The Svelte frontend talks to
 `conduitd` over loopback HTTP (default `http://127.0.0.1:4001`), same as
-`conduitctl`. There is no admin IPC surface in `src-tauri`; Tauri commands are
-not used for providers/routes/keys/traces. Override the admin base with
-`VITE_CONDUIT_ADMIN_URL` at build/dev time.
+`conduitctl`. There is no console IPC surface in `src-tauri`; Tauri commands are
+not used for providers/routes/keys/traces. Override the console base with
+`VITE_CONDUIT_CONSOLE_URL` at build/dev time.
 
 **Product priority (2026-07):** `conduit-ui` is the **operator console** (Live Monitor with SSE request rollup, four-pane trace audit, multi-target route wizard; zero remote resources — see `docs/design/conduit-ui-rewrite.md`).
 
 CSP (`src-tauri/tauri.conf.json`) allows both `http://127.0.0.1:4001` and
-`http://localhost:4001` under `connect-src` for fetch/SSE. The admin listener
+`http://localhost:4001` under `connect-src` for fetch/SSE. The console listener
 applies a permissive `CorsLayer` so the Tauri/dev origin (`localhost:1420` /
-`tauri.localhost`) can call the loopback admin API; the client only sends
+`tauri.localhost`) can call the loopback console API; the client only sends
 `Content-Type: application/json` when a request body is present.
 
 ## Pipeline Layers (L1-L7)
@@ -75,7 +75,7 @@ conduit-oauth        (Claude/Codex PKCE + Grok device code; credential refresh)
 conduit-upstream     (IR + codec + reqwest HTTP client)
 conduit-pipeline     (all of the above, L1-L7 orchestration)
     ↑
-conduitd             (binary: axum server + admin API + OAuth callbacks)
+conduitd             (binary: axum server + console API + OAuth callbacks)
 conduitctl           (binary: operator CLI)
 ```
 
@@ -91,7 +91,7 @@ Conduit supports subscription-style OAuth for:
 
 Credentials (access + refresh + expiry + account metadata) are stored as JSON in the secret backend under scope `upstream_key`. On each request, `CredentialResolver` refreshes tokens near expiry (singleflight) and injects provider-specific headers (e.g. `Chatgpt-Account-Id`, `anthropic-beta`).
 
-Admin API: `POST /admin/oauth/{kind}/start`, `GET /admin/oauth/sessions/{id}`, `POST .../cancel`, `POST /admin/oauth/{provider_id}/refresh`. CLI: `conduitctl oauth start <claude|codex|grok>`.
+Console API: `POST /console/oauth/{kind}/start`, `GET /console/oauth/sessions/{id}`, `POST .../cancel`, `POST /console/oauth/{provider_id}/refresh`. CLI: `conduitctl oauth start <claude|codex|grok>`.
 
 ### Complete audit trail
 
@@ -107,8 +107,8 @@ preserving the **real client wire format** (OpenAI chat vs Anthropic messages, s
 | `final_usage` | tokens + cost |
 | `error` | kind + message |
 
-`GET /admin/traces` lists one row per request (`kind=request_received`).  
-`GET /admin/traces/{id}` returns a **bundle**:
+`GET /console/traces` lists one row per request (`kind=request_received`).
+`GET /console/traces/{id}` returns a **bundle**:
 
 ```json
 {
@@ -164,7 +164,7 @@ Every completed request with non-zero tokens or cost is inserted into
 `usage_records` from the pipeline (non-stream + stream finalize paths).
 Recording does **not** go through the trace event bus, so the ledger remains
 complete when tracing is disabled. Aggregate views
-(`GET /admin/usage/summary`) are SQL rollups over this table.
+(`GET /console/usage/summary`) are SQL rollups over this table.
 
 Hard monthly budget *caps* are not enforced; RPM rate limits remain.
 
@@ -185,11 +185,11 @@ Later layers win on `(provider_kind, model_id)`.
 (chat/completion only; per-token → per-MTok). Sync is **explicit** (local-first —
 no fetch on boot):
 
-- `POST /admin/pricing/sync` (optional body `{ "url": "..." }`)
+- `POST /console/pricing/sync` (optional body `{ "url": "..." }`)
 - `conduitctl pricing sync`
 - UI: Pricing → “Sync LiteLLM”
 
-Reload layers without network: `POST /admin/pricing/reload` / `conduitctl pricing reload`.
+Reload layers without network: `POST /console/pricing/reload` / `conduitctl pricing reload`.
 
 ## Trace Switch
 
@@ -201,7 +201,7 @@ Request auditing can be turned off without affecting usage:
 | Live SSE | No new events (historical list/get still work) |
 | Usage ledger | Still records tokens + cost |
 | Config | `conduit.toml` `[trace] enabled = true\|false` (default true) |
-| Runtime | `PUT /admin/settings` `{ "trace": { "enabled": false } }` → `data_dir/settings.json` |
+| Runtime | `PUT /console/settings` `{ "trace": { "enabled": false } }` → `data_dir/settings.json` |
 
 Effective value = runtime override if set, else config default.
 

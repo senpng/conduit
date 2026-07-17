@@ -39,7 +39,7 @@ pub use super::stream_probe::PricingFn;
 
 /// Dependencies injected into the pipeline at startup.
 ///
-/// `routing_table` is an [`arc_swap::ArcSwap`] so admin reloads can publish a
+/// `routing_table` is an [`arc_swap::ArcSwap`] so console reloads can publish a
 /// new snapshot without per-request deep clones or write locks on the hot path.
 pub struct PipelineDeps {
     pub routing_table: Arc<arc_swap::ArcSwap<RoutingTable>>,
@@ -113,7 +113,7 @@ impl PipelineHandle {
         // Stable ledger / audit identity only (never the raw bearer).
         let ledger_key_id = policy.key_id.clone();
 
-        // Lock-free load of the current routing snapshot (admin stores a new Arc).
+        // Lock-free load of the current routing snapshot (console stores a new Arc).
         let table_snap = self.deps.routing_table.load_full();
         let stream = request.stream;
         let alias = request.alias.clone();
@@ -199,7 +199,7 @@ impl PipelineHandle {
             let result = dispatch_non_stream(&resolved, &upstream_req, &auth).await;
 
             match result {
-                Ok((resp, loss)) => {
+                Ok((resp, loss, upstream_headers)) => {
                     attach_attempt_loss(&mut ctx.events, &loss);
                     ctx.loss_report = loss;
                     ctx.merge_usage(&resp.usage);
@@ -224,6 +224,8 @@ impl PipelineHandle {
                         stream: false,
                         stream_frames: None,
                         response_headers: Some(client_response_headers(wire_fmt, false)),
+                        upstream_request_headers: Some(upstream_headers.request),
+                        upstream_response_headers: Some(upstream_headers.response),
                     });
                     egress::finalize(&mut ctx, cost_usd);
 
@@ -283,7 +285,7 @@ impl PipelineHandle {
             let result = dispatch_stream(&resolved, &upstream_req, &auth).await;
 
             match result {
-                Ok((stream, loss)) => {
+                Ok((stream, loss, upstream_headers)) => {
                     attach_attempt_loss(&mut ctx.events, &loss);
                     ctx.loss_report = loss;
                     // Pin the provider that accepted the stream; stream may still
@@ -310,6 +312,7 @@ impl PipelineHandle {
                         ctx.loss_report.clone(),
                         ctx.trace_id.clone(),
                         wire_fmt,
+                        upstream_headers,
                     );
 
                     return Ok(PipelineResult::Streaming(Box::pin(instrumented)));

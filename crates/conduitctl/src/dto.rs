@@ -1,6 +1,6 @@
-//! Typed DTOs for admin HTTP responses/requests used by `AdminClient`.
+//! Typed DTOs for console HTTP responses/requests used by `ConsoleClient`.
 //!
-//! Field names mirror `conduitd` admin handlers (not the UI). Keep deserialize
+//! Field names mirror `conduitd` console handlers (not the UI). Keep deserialize
 //! loose (`default`) where the daemon may omit optional columns.
 
 use serde::{Deserialize, Serialize};
@@ -80,7 +80,7 @@ pub struct TraceIndexRowDto {
 
 // ── Providers ───────────────────────────────────────────────────────────────
 
-/// Body for `POST /admin/providers` — must match daemon `CreateProviderBody`.
+/// Body for `POST /console/providers` — must match daemon `CreateProviderBody`.
 ///
 /// **No client-supplied `id`**: the daemon allocates a ULID.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -136,7 +136,7 @@ pub struct RouteTargetSpec {
     pub base_url: Option<String>,
 }
 
-/// Body for `POST /admin/routes` — matches daemon `CreateRouteBody`.
+/// Body for `POST /console/routes` — matches daemon `CreateRouteBody`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CreateRouteBody {
     pub match_alias: String,

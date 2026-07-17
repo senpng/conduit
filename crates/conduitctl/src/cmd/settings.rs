@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use conduitctl::{
     dto::{UpdateSettingsBody, UpdateTraceSettingsBody},
-    AdminClient,
+    ConsoleClient,
 };
 
 #[derive(Debug, Parser)]
@@ -22,8 +22,8 @@ pub enum SettingsCommand {
     },
 }
 
-pub async fn run(admin_addr: &str, args: SettingsArgs, output: &str) -> Result<()> {
-    let client = AdminClient::new(admin_addr);
+pub async fn run(console_addr: &str, args: SettingsArgs, output: &str) -> Result<()> {
+    let client = ConsoleClient::new(console_addr);
 
     match args.command {
         SettingsCommand::Show => {

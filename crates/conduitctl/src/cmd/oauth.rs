@@ -33,14 +33,14 @@ pub enum OAuthCommand {
     Refresh { provider_id: String },
 }
 
-pub async fn run(admin_addr: &str, args: OAuthArgs, _output: &str) -> Result<()> {
-    let base = admin_addr.trim_end_matches('/');
+pub async fn run(console_addr: &str, args: OAuthArgs, _output: &str) -> Result<()> {
+    let base = console_addr.trim_end_matches('/');
     let client = reqwest::Client::new();
 
     match args.command {
         OAuthCommand::List => {
             let resp = client
-                .get(format!("{base}/admin/oauth/providers"))
+                .get(format!("{base}/console/oauth/providers"))
                 .send()
                 .await?;
             let body: serde_json::Value = resp.json().await?;
@@ -60,7 +60,7 @@ pub async fn run(admin_addr: &str, args: OAuthArgs, _output: &str) -> Result<()>
                 body["provider_id"] = serde_json::json!(p);
             }
             let resp = client
-                .post(format!("{base}/admin/oauth/{kind}/start"))
+                .post(format!("{base}/console/oauth/{kind}/start"))
                 .json(&body)
                 .send()
                 .await?;
@@ -93,7 +93,7 @@ pub async fn run(admin_addr: &str, args: OAuthArgs, _output: &str) -> Result<()>
                 loop {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     let st = client
-                        .get(format!("{base}/admin/oauth/sessions/{sid}"))
+                        .get(format!("{base}/console/oauth/sessions/{sid}"))
                         .send()
                         .await?
                         .json::<serde_json::Value>()
@@ -121,7 +121,7 @@ pub async fn run(admin_addr: &str, args: OAuthArgs, _output: &str) -> Result<()>
         }
         OAuthCommand::Status { session_id } => {
             let resp = client
-                .get(format!("{base}/admin/oauth/sessions/{session_id}"))
+                .get(format!("{base}/console/oauth/sessions/{session_id}"))
                 .send()
                 .await?;
             let body: serde_json::Value = resp.json().await?;
@@ -129,7 +129,7 @@ pub async fn run(admin_addr: &str, args: OAuthArgs, _output: &str) -> Result<()>
         }
         OAuthCommand::Cancel { session_id } => {
             let resp = client
-                .post(format!("{base}/admin/oauth/sessions/{session_id}/cancel"))
+                .post(format!("{base}/console/oauth/sessions/{session_id}/cancel"))
                 .send()
                 .await?;
             if resp.status().is_success() {
@@ -140,7 +140,7 @@ pub async fn run(admin_addr: &str, args: OAuthArgs, _output: &str) -> Result<()>
         }
         OAuthCommand::Refresh { provider_id } => {
             let resp = client
-                .post(format!("{base}/admin/oauth/{provider_id}/refresh"))
+                .post(format!("{base}/console/oauth/{provider_id}/refresh"))
                 .send()
                 .await?;
             if !resp.status().is_success() {

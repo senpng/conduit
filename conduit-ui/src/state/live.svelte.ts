@@ -7,8 +7,8 @@
  * (UI-side analog of a full event channel).
  */
 
-import { traces as tracesApi, providers as providersApi } from "../lib/adminClient";
-import type { Provider } from "../lib/adminClient";
+import { traces as tracesApi, providers as providersApi } from "../lib/consoleClient";
+import type { Provider } from "../lib/consoleClient";
 import { consumeSseFrames, parseLaggedSkipped, isStubTailPayload } from "../lib/sse";
 import { parseTraceEvent } from "../lib/traceTypes";
 import { providerNameMap } from "../lib/format";
@@ -58,6 +58,7 @@ class LiveState {
   private retryMs = BACKOFF_START_MS;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
+  private generation = 0;
 
   get rows(): LiveRequestRow[] {
     void this.version; // dependency
@@ -82,10 +83,12 @@ class LiveState {
   start(): void {
     if (this.running) return;
     this.running = true;
-    void this.seedThenStream();
+    const generation = ++this.generation;
+    void this.seedThenStream(generation);
   }
 
   stop(): void {
+    this.generation++;
     this.running = false;
     this.ac?.abort();
     this.ac = null;
@@ -111,35 +114,43 @@ class LiveState {
     this.version++;
   }
 
-  private async refreshProviders(): Promise<void> {
+  private isCurrent(generation: number): boolean {
+    return this.running && this.generation === generation;
+  }
+
+  private async refreshProviders(generation: number): Promise<void> {
     try {
-      this.providers = await providersApi.list();
+      const providers = await providersApi.list();
+      if (this.isCurrent(generation)) this.providers = providers;
     } catch {
       /* keep last good cache; live still works with raw ids */
     }
   }
 
-  private async seedThenStream(): Promise<void> {
-    void this.refreshProviders();
+  private async seedThenStream(generation: number): Promise<void> {
+    void this.refreshProviders(generation);
     try {
       const res = await tracesApi.list(SEED_LIMIT, true);
+      if (!this.isCurrent(generation)) return;
       seedFromIndex(this.rollup, res.traces ?? []);
       this.bump();
     } catch {
       // Seed failure is non-fatal: the stream still delivers new events.
     }
-    while (this.running) {
-      await this.streamOnce();
-      if (!this.running) break;
+    while (this.isCurrent(generation)) {
+      await this.streamOnce(generation);
+      if (!this.isCurrent(generation)) break;
       this.sse = "reconnecting";
       await new Promise((resolve) => {
         this.retryTimer = setTimeout(resolve, this.retryMs);
       });
+      if (!this.isCurrent(generation)) break;
       this.retryMs = Math.min(this.retryMs * 2, BACKOFF_MAX_MS);
     }
   }
 
-  private async streamOnce(): Promise<void> {
+  private async streamOnce(generation: number): Promise<void> {
+    if (!this.isCurrent(generation)) return;
     this.sse = this.sse === "reconnecting" ? "reconnecting" : "connecting";
     const ac = new AbortController();
     this.ac = ac;
@@ -151,6 +162,7 @@ class LiveState {
       if (!res.ok || !res.body) {
         throw new Error(`stream HTTP ${res.status}`);
       }
+      if (!this.isCurrent(generation)) return;
       this.sse = "connected";
       this.retryMs = BACKOFF_START_MS;
       this.lastLaggedSkipped = null;
@@ -158,7 +170,7 @@ class LiveState {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      while (this.running) {
+      while (this.isCurrent(generation)) {
         const { done, value } = await reader.read();
         if (done) break;
         const out = consumeSseFrames(buffer, decoder.decode(value, { stream: true }));
@@ -172,7 +184,7 @@ class LiveState {
             continue;
           }
           if (isStubTailPayload(frame.data)) {
-            throw new Error("admin stream returned stub payload");
+            throw new Error("console stream returned stub payload");
           }
           if (this.paused) {
             this.pauseDrop += 1;
@@ -192,11 +204,11 @@ class LiveState {
       }
     } catch (e: unknown) {
       if ((e as { name?: string })?.name === "AbortError") return;
-      if (this.running) this.sse = "reconnecting";
+      if (this.isCurrent(generation)) this.sse = "reconnecting";
     } finally {
       if (this.ac === ac) this.ac = null;
     }
-    if (this.running && this.sse !== "reconnecting") {
+    if (this.isCurrent(generation) && this.sse !== "reconnecting") {
       // Clean EOF from server: treat as reconnect.
       this.sse = "reconnecting";
     }

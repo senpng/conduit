@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use conduitctl::{provider_create_request_body, AdminClient, AdminError};
+use conduitctl::{provider_create_request_body, ConsoleClient, ConsoleError};
 
 #[derive(Debug, Parser)]
 pub struct ProviderArgs {
@@ -34,8 +34,8 @@ pub enum ProviderCommand {
     },
 }
 
-pub async fn run(admin_addr: &str, args: ProviderArgs, _output: &str) -> Result<()> {
-    let client = AdminClient::new(admin_addr);
+pub async fn run(console_addr: &str, args: ProviderArgs, _output: &str) -> Result<()> {
+    let client = ConsoleClient::new(console_addr);
 
     match args.command {
         ProviderCommand::List => {
@@ -65,7 +65,7 @@ pub async fn run(admin_addr: &str, args: ProviderArgs, _output: &str) -> Result<
                         .unwrap_or("(unknown)");
                     println!("Provider {} added (name={})", id, name);
                 }
-                Err(AdminError::Http { status, body }) => {
+                Err(ConsoleError::Http { status, body }) => {
                     anyhow::bail!("failed: HTTP {} — {}", status, body);
                 }
                 Err(e) => anyhow::bail!("failed: {}", e),
@@ -82,7 +82,7 @@ pub async fn run(admin_addr: &str, args: ProviderArgs, _output: &str) -> Result<
             // Endpoint may be missing on older daemons; keep direct call for now.
             let base = client.base_url();
             let resp = reqwest::Client::new()
-                .get(format!("{}/admin/providers/{}/health", base, id))
+                .get(format!("{}/console/providers/{}/health", base, id))
                 .send()
                 .await?;
             let body: serde_json::Value = resp.json().await?;

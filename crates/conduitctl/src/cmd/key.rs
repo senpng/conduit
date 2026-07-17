@@ -21,19 +21,19 @@ pub enum KeyCommand {
     },
 }
 
-pub async fn run(admin_addr: &str, args: KeyArgs, _output: &str) -> Result<()> {
-    let base = admin_addr.trim_end_matches('/');
+pub async fn run(console_addr: &str, args: KeyArgs, _output: &str) -> Result<()> {
+    let base = console_addr.trim_end_matches('/');
     let client = reqwest::Client::new();
 
     match args.command {
         KeyCommand::List => {
-            let resp = client.get(format!("{}/admin/keys", base)).send().await?;
+            let resp = client.get(format!("{}/console/keys", base)).send().await?;
             let body: serde_json::Value = resp.json().await?;
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
         KeyCommand::Create { name, rpm } => {
             let resp = client
-                .post(format!("{}/admin/keys", base))
+                .post(format!("{}/console/keys", base))
                 .json(&serde_json::json!({"name": name, "rate_limit_rpm": rpm}))
                 .send()
                 .await?;
@@ -43,7 +43,7 @@ pub async fn run(admin_addr: &str, args: KeyArgs, _output: &str) -> Result<()> {
         }
         KeyCommand::Revoke { id } => {
             let resp = client
-                .delete(format!("{}/admin/keys/{}", base, id))
+                .delete(format!("{}/console/keys/{}", base, id))
                 .send()
                 .await?;
             if resp.status().is_success() {

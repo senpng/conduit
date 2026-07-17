@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { app } from "../state/app.svelte";
-  import { traces as tracesApi } from "../lib/adminClient";
-  import type { TraceIndexRow } from "../lib/adminClient";
+  import { traces as tracesApi } from "../lib/consoleClient";
+  import type { TraceIndexRow } from "../lib/consoleClient";
   import { fmtAgo, fmtMs, fmtUsd, shortId } from "../lib/format";
   import StatusPill from "../components/StatusPill.svelte";
   import TraceDetail from "./TraceDetail.svelte";
