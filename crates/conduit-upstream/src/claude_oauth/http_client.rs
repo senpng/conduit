@@ -39,7 +39,6 @@ pub fn chrome_client() -> &'static Client {
                     .http2(true)
                     .build(),
             )
-            .timeout(Duration::from_secs(120))
             .connect_timeout(Duration::from_secs(5))
             .tcp_keepalive(Duration::from_secs(30))
             .pool_max_idle_per_host(20)

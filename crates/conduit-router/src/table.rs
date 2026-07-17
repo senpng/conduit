@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Map;
 
 use crate::policy::RetryPolicy;
 
@@ -51,6 +52,10 @@ pub struct RouteTarget {
     /// Relative weight for [`RoutingStrategy::Weighted`] (default 1). Zero = skip for LB pick.
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// Static request fields applied after protocol encoding for this target.
+    /// Gateway-controlled fields such as `model` and `stream` cannot be overridden.
+    #[serde(default)]
+    pub request_overrides: Map<String, serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +147,7 @@ mod tests {
             provider_kind: provider.into(),
             base_url: None,
             weight: 1,
+            request_overrides: Map::new(),
         }
     }
 

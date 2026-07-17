@@ -67,7 +67,7 @@ pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
     let (trace_sink, _trace_task) = TraceSink::start(trace_store.clone()).await;
     let trace_sink = Arc::new(trace_sink);
 
-    // Merge conduit.toml `[trace].enabled` with data_dir/settings.json overlay.
+    // Merge conduit.toml `[trace].enabled` with data_dir/settings.toml overlay.
     let runtime_settings = RuntimeSettings::load(&data_dir);
     let trace_enabled = runtime_settings.effective_trace_enabled(cfg.trace.enabled);
     trace_sink.set_enabled(trace_enabled);
@@ -213,6 +213,7 @@ pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
             "/v1/chat/completions",
             post(crate::routes::chat_completions),
         )
+        .route("/v1/responses", post(crate::routes::responses))
         .route("/v1/messages", post(crate::routes::messages))
         .route("/v1/models", get(crate::routes::list_models))
         .route("/health", get(crate::routes::health))
@@ -641,6 +642,7 @@ mod hotpath_tests {
                 provider_kind: "openai".into(),
                 base_url: Some("https://api.openai.com".into()),
                 weight: 1,
+                request_overrides: Default::default(),
             }],
             retry_policy: RetryPolicy::default(),
         }])
@@ -664,6 +666,33 @@ mod hotpath_tests {
         assert_eq!(snap1.get("gpt-4o").unwrap().targets[0].model_id, "gpt-4o");
         // Pointers differ — we publish a new Arc rather than mutate in place.
         assert!(!Arc::ptr_eq(&snap1, &snap2));
+    }
+
+    #[test]
+    fn rows_to_routes_preserves_target_request_overrides() {
+        let row = conduit_store::RouteRow {
+            id: "route-1".into(),
+            match_alias: "terra".into(),
+            strategy: "fixed".into(),
+            targets_json: r#"[{"provider_id":"codex","model_id":"gpt-5.6-terra","upstream_key_id":"key-1","provider_kind":"codex-oauth","request_overrides":{"service_tier":"priority"}}]"#.into(),
+            retry_policy_json: "{}".into(),
+            enabled: true,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        };
+        let provider_map = std::collections::HashMap::from([(
+            "codex".into(),
+            "https://chatgpt.com/backend-api/codex".into(),
+        )]);
+
+        let routes = rows_to_routes(vec![row], &provider_map).unwrap();
+        let target = &routes[0].targets[0];
+
+        assert_eq!(
+            target.base_url.as_deref(),
+            Some("https://chatgpt.com/backend-api/codex")
+        );
+        assert_eq!(target.request_overrides["service_tier"], "priority");
     }
 
     /// Honest O1 path: TraceEvent → BroadcastTraceSubscriber → channel →
@@ -771,10 +800,14 @@ mod hotpath_tests {
                 "server production source must not contain `{needle}`"
             );
         }
-        // Anthropic-native Messages ingress must be registered on the gateway router.
+        // Native ingress protocols must be registered on the gateway router.
         assert!(
             src.contains("/v1/messages") && src.contains("routes::messages"),
             "gateway router must register POST /v1/messages → routes::messages"
+        );
+        assert!(
+            src.contains("/v1/responses") && src.contains("routes::responses"),
+            "gateway router must register POST /v1/responses → routes::responses"
         );
         // Shared resolver: construct once at startup, not per request.
         let ctor = format!("{}{}", "CredentialResolver", "::new");

@@ -135,6 +135,7 @@ async fn openai_non_stream(
     if !auth.extra_headers.is_empty() {
         cfg = cfg.with_extra_headers(auth.extra_headers.clone());
     }
+    cfg = cfg.with_request_overrides(resolved.request_overrides.clone());
     ProviderClient::<OpenAiCodec>::new(cfg)
         .chat(request, &auth.token)
         .await
@@ -153,6 +154,7 @@ async fn anthropic_non_stream(
     if !auth.extra_headers.is_empty() {
         cfg = cfg.with_extra_headers(auth.extra_headers.clone());
     }
+    cfg = cfg.with_request_overrides(resolved.request_overrides.clone());
     ProviderClient::<AnthropicCodec>::new(cfg)
         .chat(request, &auth.token)
         .await
@@ -201,6 +203,7 @@ async fn claude_oauth_non_stream(
         &resolved.model_id,
         &auth.token,
         &opts,
+        &resolved.request_overrides,
         120_000,
     )
     .await
@@ -285,7 +288,8 @@ async fn grok_oauth_non_stream(
             headers.push((k, v));
         }
     }
-    let cfg = ProviderClientConfig::grok_oauth(&resolved.provider_id, base, headers);
+    let cfg = ProviderClientConfig::grok_oauth(&resolved.provider_id, base, headers)
+        .with_request_overrides(resolved.request_overrides.clone());
     ProviderClient::<OpenAiResponsesCodec>::new(cfg)
         .chat(request, &auth.token)
         .await
@@ -312,6 +316,7 @@ async fn openai_stream(
     if !auth.extra_headers.is_empty() {
         cfg = cfg.with_extra_headers(auth.extra_headers.clone());
     }
+    cfg = cfg.with_request_overrides(resolved.request_overrides.clone());
     ProviderClient::<OpenAiCodec>::new(cfg)
         .chat_stream(request, &auth.token)
         .await
@@ -337,6 +342,7 @@ async fn anthropic_stream(
     if !auth.extra_headers.is_empty() {
         cfg = cfg.with_extra_headers(auth.extra_headers.clone());
     }
+    cfg = cfg.with_request_overrides(resolved.request_overrides.clone());
     ProviderClient::<AnthropicCodec>::new(cfg)
         .chat_stream(request, &auth.token)
         .await
@@ -368,7 +374,7 @@ async fn claude_oauth_stream(
         &resolved.model_id,
         &auth.token,
         &opts,
-        120_000,
+        &resolved.request_overrides,
     )
     .await
 }
@@ -392,7 +398,8 @@ async fn codex_oauth_stream(
         .as_deref()
         .unwrap_or("https://chatgpt.com/backend-api/codex");
     let cfg =
-        ProviderClientConfig::codex_oauth(&resolved.provider_id, base, auth.extra_headers.clone());
+        ProviderClientConfig::codex_oauth(&resolved.provider_id, base, auth.extra_headers.clone())
+            .with_request_overrides(resolved.request_overrides.clone());
     ProviderClient::<OpenAiResponsesCodec>::new(cfg)
         .chat_stream(&req, &auth.token)
         .await
@@ -419,7 +426,8 @@ async fn grok_oauth_stream(
             headers.push((k, v));
         }
     }
-    let cfg = ProviderClientConfig::grok_oauth(&resolved.provider_id, base, headers);
+    let cfg = ProviderClientConfig::grok_oauth(&resolved.provider_id, base, headers)
+        .with_request_overrides(resolved.request_overrides.clone());
     ProviderClient::<OpenAiResponsesCodec>::new(cfg)
         .chat_stream(request, &auth.token)
         .await
@@ -438,6 +446,7 @@ mod tests {
             upstream_key_id: "k1".into(),
             provider_kind: kind.into(),
             base_url: Some("http://127.0.0.1:9".into()),
+            request_overrides: Default::default(),
             attempt_no: 0,
         }
     }

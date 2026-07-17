@@ -9,14 +9,23 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use conduit_codec::{anthropic::AnthropicCodec, openai::OpenAiCodec, WireCodec};
+use conduit_codec::{
+    anthropic::AnthropicCodec, openai::OpenAiCodec, response_output_items, responses_store_enabled,
+    OpenAiResponsesCodec, ResponsesStreamEncoder, WireCodec,
+};
 use conduit_ir::error::GatewayError;
+use conduit_store::ResponseContinuationRepo;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use tracing::{instrument, warn};
 use ulid::Ulid;
 
-use crate::state::DaemonState;
+use crate::{
+    responses_adapter::{
+        apply_continuation, continuation_key_scope, persist_continuation, ContinuationError,
+    },
+    state::DaemonState,
+};
 
 /// Collect inbound headers for trace audit.
 ///
@@ -136,10 +145,203 @@ fn extract_key_id(headers: &HeaderMap) -> Option<String> {
 pub fn gateway_public_paths() -> &'static [&'static str] {
     &[
         "/v1/chat/completions",
+        "/v1/responses",
         "/v1/messages",
         "/v1/models",
         "/health",
     ]
+}
+
+/// POST /v1/responses — OpenAI Responses API endpoint.
+#[instrument(skip_all)]
+pub async fn responses(
+    State(state): State<Arc<DaemonState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let key_id = extract_key_id(&headers);
+    let continuation_scope = continuation_key_scope(key_id.as_deref());
+    let store_continuation = responses_store_enabled(&body);
+    let stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let alias = match body.get("model").and_then(|v| v.as_str()) {
+        Some(model) if !model.is_empty() => model.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(OpenAiResponsesCodec::error_body(
+                    "invalid_request_error",
+                    None,
+                    "model field required",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let continuation_repo = ResponseContinuationRepo::new(&state.pool);
+    let adapted_body = match apply_continuation(
+        &continuation_repo,
+        body.clone(),
+        &continuation_scope,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(ContinuationError::Missing(message)) => {
+            return (
+                    StatusCode::BAD_REQUEST,
+                    Json(OpenAiResponsesCodec::error_body(
+                        "invalid_request_error",
+                        None,
+                        &format!(
+                            "previous_response_id `{message}` is unknown or expired; resend the full input transcript"
+                        ),
+                    )),
+                )
+                    .into_response();
+        }
+        Err(error) => {
+            warn!(error = %error, "responses continuation lookup failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(OpenAiResponsesCodec::error_body(
+                    "server_error",
+                    None,
+                    "responses continuation store unavailable",
+                )),
+            )
+                .into_response();
+        }
+    };
+    let continuation_input = adapted_body.get("input").cloned().unwrap_or(Value::Null);
+
+    let canonical_req = match OpenAiResponsesCodec::decode_request(
+        adapted_body,
+        alias.clone(),
+        stream,
+        Ulid::new().to_string(),
+        key_id.clone().unwrap_or_default(),
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(OpenAiResponsesCodec::error_body(
+                    "invalid_request_error",
+                    None,
+                    &error.to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let ingress_wire = conduit_pipeline::IngressWire {
+        format: conduit_ir::trace::WireFormat::OpenaiResponses,
+        body: body.clone(),
+        headers: headers_for_audit(&headers),
+    };
+
+    match state
+        .pipeline
+        .run(
+            canonical_req,
+            key_id,
+            extract_client_headers(&headers),
+            ingress_wire,
+        )
+        .await
+    {
+        Ok(conduit_pipeline::handle::PipelineResult::Complete(response)) => {
+            let mut response = OpenAiResponsesCodec::encode_response(&response);
+            response["store"] = Value::Bool(store_continuation);
+            if store_continuation {
+                if let Err(error) = persist_continuation(
+                    &continuation_repo,
+                    response
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    &continuation_scope,
+                    continuation_input,
+                    response_output_items(&response),
+                )
+                .await
+                {
+                    warn!(error = %error, "responses continuation write failed");
+                }
+            }
+            Json(response).into_response()
+        }
+        Ok(conduit_pipeline::handle::PipelineResult::Streaming(stream)) => {
+            let resp_id = format!("resp_{}", Ulid::new());
+            let continuation_pool = state.pool.clone();
+            let continuation_scope = continuation_scope.clone();
+            let continuation_input = continuation_input.clone();
+            let sse_stream = async_stream::stream! {
+                let mut encoder = ResponsesStreamEncoder::new_with_store(
+                    resp_id.clone(),
+                    alias,
+                    store_continuation,
+                );
+                for frame in encoder.start() {
+                    yield Ok::<_, std::convert::Infallible>(frame);
+                }
+                futures::pin_mut!(stream);
+                while let Some(result) = stream.next().await {
+                    let is_terminal = matches!(&result, Ok(chunk) if chunk.finish_reason.is_some());
+                    let frames = match result {
+                        Ok(chunk) => encoder.push(&chunk),
+                        Err(error) => vec![OpenAiResponsesCodec::stream_error_sse(&error.to_string())],
+                    };
+                    if is_terminal && store_continuation {
+                        let repo = ResponseContinuationRepo::new(&continuation_pool);
+                        if let Err(error) = persist_continuation(
+                            &repo,
+                            &resp_id,
+                            &continuation_scope,
+                            continuation_input.clone(),
+                            encoder.output_items(),
+                        )
+                        .await
+                        {
+                            warn!(error = %error, "responses continuation write failed");
+                        }
+                    }
+                    for frame in frames {
+                        yield Ok(frame);
+                    }
+                }
+            };
+            let body = Body::from_stream(sse_stream.map(
+                |result: Result<String, std::convert::Infallible>| {
+                    result.map(|frame| axum::body::Bytes::from(frame.into_bytes()))
+                },
+            ));
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .header("cache-control", "no-cache")
+                .header("x-accel-buffering", "no")
+                .body(body)
+                .unwrap()
+        }
+        Err(error) => {
+            let status = status_for_gateway_error(&error);
+            (
+                status,
+                Json(OpenAiResponsesCodec::error_body(
+                    "error",
+                    None,
+                    &error.to_string(),
+                )),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Map pipeline errors to HTTP status codes (shipped gateway path).
@@ -515,6 +717,14 @@ mod auth_status_tests {
         assert!(
             gateway_public_paths().contains(&"/v1/messages"),
             "POST /v1/messages must be part of the public gateway surface"
+        );
+    }
+
+    #[test]
+    fn gateway_registers_responses_path() {
+        assert!(
+            gateway_public_paths().contains(&"/v1/responses"),
+            "POST /v1/responses must be part of the public gateway surface"
         );
     }
 

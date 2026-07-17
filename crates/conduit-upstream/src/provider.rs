@@ -15,7 +15,7 @@ use conduit_ir::{
 use futures::stream::{BoxStream, StreamExt};
 use reqwest::StatusCode;
 use secrecy::SecretString;
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use tracing::{instrument, warn};
 
 use crate::{
@@ -111,6 +111,8 @@ pub struct ProviderClientConfig {
     pub auth: Arc<dyn AuthStrategy>,
     pub timeouts: TimeoutConfig,
     pub path: UpstreamPath,
+    /// Static target-specific fields merged after protocol encoding.
+    pub request_overrides: Map<String, Value>,
 }
 
 impl ProviderClientConfig {
@@ -122,6 +124,7 @@ impl ProviderClientConfig {
             auth: Arc::new(BearerAuth),
             timeouts: TimeoutConfig::default(),
             path: UpstreamPath::ChatCompletions,
+            request_overrides: Map::new(),
         }
     }
 
@@ -133,6 +136,7 @@ impl ProviderClientConfig {
             auth: Arc::new(HeaderAuth::anthropic()),
             timeouts: TimeoutConfig::default(),
             path: UpstreamPath::Messages,
+            request_overrides: Map::new(),
         }
     }
 
@@ -148,6 +152,7 @@ impl ProviderClientConfig {
             auth: Arc::new(CompositeAuth::bearer_with_headers(extra_headers)),
             timeouts: TimeoutConfig::default(),
             path: UpstreamPath::Messages,
+            request_overrides: Map::new(),
         }
     }
 
@@ -163,6 +168,7 @@ impl ProviderClientConfig {
             auth: Arc::new(CompositeAuth::bearer_with_headers(extra_headers)),
             timeouts: TimeoutConfig::default(),
             path: UpstreamPath::Responses,
+            request_overrides: Map::new(),
         }
     }
 
@@ -179,6 +185,7 @@ impl ProviderClientConfig {
             auth: Arc::new(CompositeAuth::bearer_with_headers(extra_headers)),
             timeouts: TimeoutConfig::default(),
             path: UpstreamPath::Responses,
+            request_overrides: Map::new(),
         }
     }
 
@@ -194,6 +201,11 @@ impl ProviderClientConfig {
             Arc::new(CompositeAuth::bearer_with_headers(headers))
         };
         self.auth = auth;
+        self
+    }
+
+    pub fn with_request_overrides(mut self, overrides: Map<String, Value>) -> Self {
+        self.request_overrides = overrides;
         self
     }
 }
@@ -313,6 +325,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
                 &req.alias,
                 secret,
                 &claude_oauth::ClaudeOAuthRelayOptions::default(),
+                &self.config.request_overrides,
                 self.config.timeouts.overall_ms,
             )
             .await;
@@ -325,7 +338,9 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         // so the error surface is clearer after rewrite.
         if self.config.kind == "codex-oauth" {
             body = apply_codex_chatgpt_account_body(body);
+            apply_codex_service_tier(&mut body, req);
         }
+        apply_request_overrides(&mut body, &self.config.request_overrides);
 
         let mut builder = self
             .client()
@@ -388,7 +403,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
                 &req.alias,
                 secret,
                 &claude_oauth::ClaudeOAuthRelayOptions::default(),
-                self.config.timeouts.overall_ms,
+                &self.config.request_overrides,
             )
             .await;
         }
@@ -398,13 +413,11 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         if self.config.kind == "codex-oauth" {
             // CLIProxyAPI: force stream/store and strip unsupported sampling fields.
             body = apply_codex_chatgpt_account_body(body);
+            apply_codex_service_tier(&mut body, req);
         }
+        apply_request_overrides(&mut body, &self.config.request_overrides);
 
-        let mut builder = self
-            .client()
-            .post(&url)
-            .timeout(Duration::from_millis(self.config.timeouts.overall_ms))
-            .json(&body);
+        let mut builder = self.client().post(&url).json(&body);
         builder = self.apply_auth(builder, secret);
         builder = self.apply_provider_headers(builder);
 
@@ -412,7 +425,13 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
             .build()
             .map_err(|e| ProviderError::Serialization(e.to_string()))?;
         let request_headers = headers_to_json(request.headers());
-        let resp = self.client().execute(request).await.map_err(|e| {
+        let resp = tokio::time::timeout(
+            Duration::from_millis(self.config.timeouts.first_byte_ms),
+            self.client().execute(request),
+        )
+        .await
+        .map_err(|_| ProviderError::Timeout)?
+        .map_err(|e| {
             if e.is_timeout() {
                 ProviderError::Timeout
             } else {
@@ -520,6 +539,27 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
     }
 }
 
+fn apply_codex_service_tier(body: &mut Value, request: &CanonicalChatRequest) {
+    if request.sampling.service_tier.as_deref() == Some("priority") {
+        body["service_tier"] = json!("priority");
+    }
+}
+
+pub(crate) fn apply_request_overrides(body: &mut Value, overrides: &Map<String, Value>) {
+    let Some(target) = body.as_object_mut() else {
+        return;
+    };
+    for (key, value) in overrides {
+        if matches!(
+            key.as_str(),
+            "model" | "stream" | "store" | "input" | "messages"
+        ) {
+            continue;
+        }
+        target.insert(key.clone(), value.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,5 +577,44 @@ mod tests {
             headers["set-cookie"],
             serde_json::json!(["first=value", "second=value"])
         );
+    }
+
+    #[test]
+    fn codex_priority_service_tier_is_added_to_the_request_body() {
+        let mut request = CanonicalChatRequest::new("gpt-5.6-terra", vec![]);
+        request.sampling.service_tier = Some("priority".into());
+        let mut body = serde_json::json!({"model": "gpt-5.6-terra"});
+
+        apply_codex_service_tier(&mut body, &request);
+
+        assert_eq!(body["service_tier"], "priority");
+    }
+
+    #[test]
+    fn request_overrides_merge_extra_fields_without_replacing_gateway_fields() {
+        let mut body = serde_json::json!({
+            "model": "gpt-5.6-terra",
+            "stream": true,
+            "store": false,
+            "input": "hello"
+        });
+        let overrides = serde_json::json!({
+            "service_tier": "priority",
+            "model": "other-model",
+            "stream": false,
+            "store": true,
+            "input": "replacement"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        apply_request_overrides(&mut body, &overrides);
+
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["model"], "gpt-5.6-terra");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["input"], "hello");
     }
 }

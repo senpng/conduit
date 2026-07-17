@@ -23,6 +23,8 @@ pub struct ResolvedProvider {
     pub upstream_key_id: String,
     pub provider_kind: String,
     pub base_url: Option<String>,
+    /// Static fields configured for the selected route target.
+    pub request_overrides: serde_json::Map<String, Value>,
     pub attempt_no: u32,
 }
 

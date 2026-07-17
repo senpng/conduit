@@ -32,6 +32,7 @@ pub fn route_request(
         upstream_key_id: decision.upstream_key_id.clone(),
         provider_kind: decision.provider_kind.clone(),
         base_url: decision.base_url.clone(),
+        request_overrides: decision.request_overrides.clone(),
         attempt_no: decision.attempt_no,
     });
 
@@ -96,6 +97,7 @@ mod tests {
                     provider_kind: "openai".into(),
                     base_url: None,
                     weight: 1,
+                    request_overrides: Default::default(),
                 },
                 RouteTarget {
                     provider_id: "b".into(),
@@ -104,6 +106,7 @@ mod tests {
                     provider_kind: "openai".into(),
                     base_url: None,
                     weight: 1,
+                    request_overrides: Default::default(),
                 },
             ],
             retry_policy: RetryPolicy {

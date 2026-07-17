@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
 use tracing::debug;
 
-use crate::{error::TraceError, schema::TraceIndexRow};
+use crate::{error::TraceError, log::LogOffset, schema::TraceIndexRow};
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -29,6 +29,12 @@ CREATE TABLE IF NOT EXISTS trace_index (
     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     cost_usd REAL NOT NULL DEFAULT 0,
     error_kind TEXT,
+    segment TEXT NOT NULL,
+    offset INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS trace_index_checkpoint (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
     segment TEXT NOT NULL,
     offset INTEGER NOT NULL
 );
@@ -138,8 +144,30 @@ impl TraceIndex {
         Ok(Self { pool })
     }
 
-    /// Insert a single row into the index.  Silently ignores duplicate IDs.
+    /// Return the location of the last event whose index row was durably written.
+    pub async fn checkpoint(&self) -> Result<Option<LogOffset>, TraceError> {
+        let row = sqlx::query_as::<_, (String, i64)>(
+            "SELECT segment, offset FROM trace_index_checkpoint WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| TraceError::Database(e.to_string()))?;
+
+        Ok(row.map(|(segment, offset)| LogOffset {
+            segment,
+            offset: offset as u64,
+        }))
+    }
+
+    /// Insert a single row and atomically record its log location as the
+    /// recovery checkpoint. Duplicate IDs are ignored.
     pub async fn insert(&self, row: &TraceIndexRow) -> Result<(), TraceError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| TraceError::Database(e.to_string()))?;
+
         sqlx::query(
             r#"
             INSERT OR IGNORE INTO trace_index
@@ -170,9 +198,29 @@ impl TraceIndex {
         .bind(&row.error_kind)
         .bind(&row.segment)
         .bind(row.offset)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|e| TraceError::Database(e.to_string()))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO trace_index_checkpoint (id, segment, offset)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                segment = excluded.segment,
+                offset = excluded.offset
+            "#,
+        )
+        .bind(&row.segment)
+        .bind(row.offset)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| TraceError::Database(e.to_string()))?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|e| TraceError::Database(e.to_string()))?;
 
         Ok(())
     }

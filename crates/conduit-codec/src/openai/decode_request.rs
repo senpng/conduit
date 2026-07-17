@@ -143,6 +143,7 @@ pub fn decode_request(
         n: body["n"].as_u64().map(|v| v as u8),
         top_k: None,
         reasoning_effort: body["reasoning_effort"].as_str().map(String::from),
+        service_tier: None,
     };
 
     Ok(CanonicalChatRequest {

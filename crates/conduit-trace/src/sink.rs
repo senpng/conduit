@@ -58,7 +58,7 @@ impl TraceSink {
     pub async fn start(store: Arc<TraceStore>) -> (Self, JoinHandle<()>) {
         let subscribers: Arc<RwLock<Vec<Arc<dyn TraceSubscriber>>>> =
             Arc::new(RwLock::new(Vec::new()));
-        let (tx, rx) = mpsc::channel::<TraceEvent>(4096);
+        let (tx, rx) = mpsc::channel::<TraceEvent>(8096);
         let handle = tokio::spawn(sink_loop(store, rx, subscribers.clone()));
         (
             Self {

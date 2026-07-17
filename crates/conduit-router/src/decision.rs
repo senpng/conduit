@@ -40,6 +40,7 @@ pub struct RoutingDecision {
     pub upstream_key_id: String,
     pub provider_kind: String,
     pub base_url: Option<String>,
+    pub request_overrides: serde_json::Map<String, serde_json::Value>,
     pub attempt_no: u32,
     pub retry_policy: RetryPolicy,
 }
@@ -124,6 +125,7 @@ pub fn route_with_seed(
         upstream_key_id: target.upstream_key_id.clone(),
         provider_kind: target.provider_kind.clone(),
         base_url: target.base_url.clone(),
+        request_overrides: target.request_overrides.clone(),
         attempt_no,
         retry_policy: r.retry_policy.clone(),
     })
@@ -225,6 +227,7 @@ mod tests {
             provider_kind: provider.into(),
             base_url: None,
             weight,
+            request_overrides: Default::default(),
         }
     }
 

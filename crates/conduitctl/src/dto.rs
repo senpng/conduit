@@ -134,6 +134,9 @@ pub struct RouteTargetSpec {
     pub provider_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Static JSON fields merged into the target's encoded upstream request.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub request_overrides: serde_json::Map<String, Value>,
 }
 
 /// Body for `POST /console/routes` — matches daemon `CreateRouteBody`.

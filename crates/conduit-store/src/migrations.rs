@@ -1,4 +1,4 @@
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use tracing::info;
 
 use crate::StoreError;
@@ -95,6 +95,22 @@ CREATE TABLE IF NOT EXISTS app_events (
 
 CREATE INDEX IF NOT EXISTS idx_events_ts
     ON app_events(ts DESC);
+
+-- Short-lived Responses API compatibility state.  This is intentionally kept
+-- separate from traces: it contains only tool-call metadata required to turn
+-- a `previous_response_id` + tool output into a complete upstream request.
+CREATE TABLE IF NOT EXISTS response_continuations (
+    response_id              TEXT NOT NULL,
+    key_scope                TEXT NOT NULL,
+    input_items_json         TEXT NOT NULL DEFAULT '[]',
+    output_items_json        TEXT NOT NULL DEFAULT '[]',
+    expires_at               TEXT NOT NULL,
+    created_at               TEXT NOT NULL,
+    PRIMARY KEY (response_id, key_scope)
+);
+
+CREATE INDEX IF NOT EXISTS idx_response_continuations_expires_at
+    ON response_continuations(expires_at);
 "#;
 
 /// Apply the schema to the database.
@@ -107,6 +123,85 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StoreError> {
         .execute(pool)
         .await
         .map_err(|e| StoreError::Migration(e.to_string()))?;
+    // `response_continuations` was initially introduced as a tool-call-only
+    // cache.  Add the transcript columns for installations that created that
+    // first schema before full Responses continuation support was available.
+    for sql in [
+        "ALTER TABLE response_continuations ADD COLUMN input_items_json TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE response_continuations ADD COLUMN output_items_json TEXT NOT NULL DEFAULT '[]'",
+    ] {
+        if let Err(error) = sqlx::query(sql).execute(pool).await {
+            // SQLite has no `ADD COLUMN IF NOT EXISTS`; a duplicate is expected
+            // on every startup after the first successful migration.
+            if !error.to_string().contains("duplicate column name") {
+                return Err(StoreError::Migration(error.to_string()));
+            }
+        }
+    }
+    remove_legacy_response_function_calls_column(pool).await?;
     info!("conduit-store schema up to date");
+    Ok(())
+}
+
+/// The first continuation schema stored function calls separately. Full
+/// Responses output now contains those calls, so rebuild the narrow table
+/// without the redundant column while preserving live continuation rows.
+async fn remove_legacy_response_function_calls_column(pool: &SqlitePool) -> Result<(), StoreError> {
+    let columns = sqlx::query("PRAGMA table_info(response_continuations)")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| StoreError::Migration(e.to_string()))?;
+    let has_legacy_column = columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "function_calls_json");
+    if !has_legacy_column {
+        return Ok(());
+    }
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| StoreError::Migration(e.to_string()))?;
+    sqlx::query(
+        r#"CREATE TABLE response_continuations_rebuilt (
+            response_id       TEXT NOT NULL,
+            key_scope         TEXT NOT NULL,
+            input_items_json  TEXT NOT NULL DEFAULT '[]',
+            output_items_json TEXT NOT NULL DEFAULT '[]',
+            expires_at        TEXT NOT NULL,
+            created_at        TEXT NOT NULL,
+            PRIMARY KEY (response_id, key_scope)
+        )"#,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| StoreError::Migration(e.to_string()))?;
+    sqlx::query(
+        r#"INSERT INTO response_continuations_rebuilt
+               (response_id, key_scope, input_items_json, output_items_json, expires_at, created_at)
+           SELECT response_id, key_scope, input_items_json, output_items_json, expires_at, created_at
+           FROM response_continuations"#,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| StoreError::Migration(e.to_string()))?;
+    sqlx::query("DROP TABLE response_continuations")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| StoreError::Migration(e.to_string()))?;
+    sqlx::query("ALTER TABLE response_continuations_rebuilt RENAME TO response_continuations")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| StoreError::Migration(e.to_string()))?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_response_continuations_expires_at \
+         ON response_continuations(expires_at)",
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| StoreError::Migration(e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| StoreError::Migration(e.to_string()))?;
     Ok(())
 }

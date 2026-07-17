@@ -65,11 +65,12 @@ impl TraceStore {
         Ok(store)
     }
 
-    /// Restore index entries for events that reached the append-only log before
-    /// a SQLite index write failed or the process was interrupted.
+    /// Restore index entries for events that reached the append-only log after
+    /// the latest durable SQLite checkpoint.
     async fn rebuild_missing_index_rows(&self) -> Result<(), TraceError> {
         let reader = LogReader::new(self.data_dir.clone());
-        let mut events = Box::pin(reader.stream_all_with_offsets());
+        let checkpoint = self.index.checkpoint().await?;
+        let mut events = Box::pin(reader.stream_after_offset(checkpoint));
         while let Some(item) = events.next().await {
             let (event, offset) = item?;
             let row = event_to_index_row(&event, offset.segment, offset.offset);
@@ -309,5 +310,33 @@ mod tests {
             restored.is_some(),
             "opening should rebuild missing index rows"
         );
+    }
+
+    #[tokio::test]
+    async fn open_recovers_only_events_after_the_index_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let store = TraceStore::open(data_dir.clone()).await.unwrap();
+
+        let indexed_event = sample_event();
+        let indexed_id = indexed_event.id.clone();
+        store.append(&indexed_event).await.unwrap();
+        let checkpoint = store.index.checkpoint().await.unwrap().unwrap();
+        drop(store);
+
+        let unindexed_event = sample_event();
+        let unindexed_id = unindexed_event.id.clone();
+        let writer = LogWriter::new(data_dir.clone()).await.unwrap();
+        let unindexed_offset = writer.append(&[unindexed_event]).await.unwrap().remove(0);
+        drop(writer);
+
+        let reopened = TraceStore::open(data_dir).await.unwrap();
+        assert!(reopened.get_full(&indexed_id).await.unwrap().is_some());
+        assert!(reopened.get_full(&unindexed_id).await.unwrap().is_some());
+        assert_eq!(
+            reopened.index.checkpoint().await.unwrap().unwrap(),
+            unindexed_offset
+        );
+        assert_ne!(checkpoint, unindexed_offset);
     }
 }

@@ -65,7 +65,7 @@ pub struct DaemonState {
     /// Startup defaults from `conduit.toml` `[trace]` (segment sizes, etc.).
     pub trace_config: crate::config::TraceConfig,
 
-    /// Runtime overlay (`settings.json`); guarded for console PUT persistence.
+    /// Runtime overlay (`settings.toml`); guarded for console PUT persistence.
     pub runtime_settings: Mutex<RuntimeSettings>,
 }
 

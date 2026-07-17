@@ -1,6 +1,7 @@
 pub mod config;
 pub mod console;
 pub mod oauth;
+mod responses_adapter;
 pub mod routes;
 pub mod server;
 pub mod state;

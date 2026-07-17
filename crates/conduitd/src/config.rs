@@ -63,7 +63,7 @@ impl Config {
     }
 }
 
-// ── Runtime settings overlay (data_dir/settings.json) ─────────────────────────
+// ── Runtime settings overlay (data_dir/settings.toml) ─────────────────────────
 
 /// Operator-tunable runtime flags persisted under the data directory.
 ///
@@ -75,15 +75,31 @@ pub struct RuntimeSettings {
     pub trace_enabled: Option<bool>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct RuntimeSettingsFile {
+    #[serde(default)]
+    trace: RuntimeTraceSettings,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct RuntimeTraceSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+}
+
 impl RuntimeSettings {
     pub fn path(data_dir: &Path) -> std::path::PathBuf {
-        data_dir.join("settings.json")
+        data_dir.join("settings.toml")
     }
 
     pub fn load(data_dir: &Path) -> Self {
         let path = Self::path(data_dir);
         match std::fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Ok(text) => toml::from_str::<RuntimeSettingsFile>(&text)
+                .map(|settings| Self {
+                    trace_enabled: settings.trace.enabled,
+                })
+                .unwrap_or_default(),
             Err(_) => Self::default(),
         }
     }
@@ -91,7 +107,11 @@ impl RuntimeSettings {
     pub fn save(&self, data_dir: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(data_dir)?;
         let path = Self::path(data_dir);
-        let text = serde_json::to_string_pretty(self)?;
+        let text = toml::to_string_pretty(&RuntimeSettingsFile {
+            trace: RuntimeTraceSettings {
+                enabled: self.trace_enabled,
+            },
+        })?;
         std::fs::write(path, text)?;
         Ok(())
     }
@@ -135,6 +155,14 @@ retention_days = 90
             trace_enabled: Some(false),
         };
         s.save(dir.path()).unwrap();
+        assert_eq!(
+            RuntimeSettings::path(dir.path()).file_name().unwrap(),
+            "settings.toml"
+        );
+        assert_eq!(
+            std::fs::read_to_string(RuntimeSettings::path(dir.path())).unwrap(),
+            "[trace]\nenabled = false\n"
+        );
         let loaded = RuntimeSettings::load(dir.path());
         assert_eq!(loaded.trace_enabled, Some(false));
         assert!(!loaded.effective_trace_enabled(true));

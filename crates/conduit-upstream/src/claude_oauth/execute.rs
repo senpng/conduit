@@ -8,7 +8,7 @@ use conduit_codec::WireCodec;
 use conduit_ir::{canonical::CanonicalChatRequest, error::ProviderError};
 use futures::stream::{StreamExt, TryStreamExt};
 use secrecy::{ExposeSecret, SecretString};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tracing::warn;
 
 use super::{
@@ -19,7 +19,9 @@ use super::{
     options::ClaudeOAuthRelayOptions,
     tools::{reverse_remap_response, reverse_remap_stream_payload},
 };
-use crate::provider::{header_pairs_to_json, ChatResult, StreamResult, UpstreamHeaders};
+use crate::provider::{
+    apply_request_overrides, header_pairs_to_json, ChatResult, StreamResult, UpstreamHeaders,
+};
 
 fn map_status(status: u16, body: &str) -> ProviderError {
     match status {
@@ -96,12 +98,14 @@ pub async fn chat_oauth<C: WireCodec + 'static>(
     upstream_model: &str,
     secret: &SecretString,
     opts: &ClaudeOAuthRelayOptions,
+    request_overrides: &Map<String, Value>,
     overall_ms: u64,
 ) -> Result<ChatResult, ProviderError> {
     debug_assert!(is_claude_oauth_kind(kind));
     let url = messages_url(base_url);
     let (body, encode_loss) = C::encode_request(req, false);
-    let body = apply_upstream_model(body, upstream_model);
+    let mut body = apply_upstream_model(body, upstream_model);
+    apply_request_overrides(&mut body, request_overrides);
     let model_for_cloak = if upstream_model.is_empty() {
         req.alias.as_str()
     } else {
@@ -160,12 +164,13 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
     upstream_model: &str,
     secret: &SecretString,
     opts: &ClaudeOAuthRelayOptions,
-    overall_ms: u64,
+    request_overrides: &Map<String, Value>,
 ) -> Result<StreamResult, ProviderError> {
     debug_assert!(is_claude_oauth_kind(kind));
     let url = messages_url(base_url);
     let (body, encode_loss) = C::encode_request(req, true);
-    let body = apply_upstream_model(body, upstream_model);
+    let mut body = apply_upstream_model(body, upstream_model);
+    apply_request_overrides(&mut body, request_overrides);
     let model_for_cloak = if upstream_model.is_empty() {
         req.alias.as_str()
     } else {
@@ -176,7 +181,6 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
 
     let builder = chrome_client()
         .post(&url)
-        .timeout(Duration::from_millis(overall_ms))
         .json(&prepared.body);
     let request_headers =
         oauth_request_headers(secret.expose_secret(), true, &prepared.extra_betas, opts);

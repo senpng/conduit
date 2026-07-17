@@ -559,7 +559,7 @@ pub struct UpdateTraceSettingsBody {
     pub enabled: Option<bool>,
 }
 
-/// PUT /console/settings — update runtime settings (persisted to settings.json).
+/// PUT /console/settings — update runtime settings (persisted to settings.toml).
 pub async fn update_settings(
     State(state): State<Arc<DaemonState>>,
     Json(body): Json<UpdateSettingsBody>,
@@ -1157,6 +1157,7 @@ mod replay_tests {
                 provider_kind: "openai".into(),
                 base_url: Some("https://api.openai.com".into()),
                 weight: 1,
+                request_overrides: Default::default(),
             }],
             retry_policy: RetryPolicy::default(),
         }])

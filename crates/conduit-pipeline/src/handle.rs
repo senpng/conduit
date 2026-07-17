@@ -2,7 +2,9 @@
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
-use conduit_codec::{anthropic::AnthropicCodec, openai::OpenAiCodec, WireCodec};
+use conduit_codec::{
+    anthropic::AnthropicCodec, openai::OpenAiCodec, OpenAiResponsesCodec, WireCodec,
+};
 use conduit_ir::{
     canonical::{CanonicalChatRequest, CanonicalChatResponse, CanonicalChunk},
     error::{GatewayError, ProviderError},
@@ -466,6 +468,7 @@ fn request_for_upstream(
 fn audit_encode_response(fmt: WireFormat, resp: &CanonicalChatResponse) -> serde_json::Value {
     match fmt {
         WireFormat::OpenaiChat => OpenAiCodec::encode_response(resp),
+        WireFormat::OpenaiResponses => OpenAiResponsesCodec::encode_response(resp),
         WireFormat::AnthropicMessages => AnthropicCodec::encode_response(resp),
         _ => OpenAiCodec::encode_response(resp),
     }
@@ -499,6 +502,7 @@ mod hotpath_tests {
                 provider_kind: "openai".into(),
                 base_url: Some("https://api.openai.com".into()),
                 weight: 1,
+                request_overrides: Default::default(),
             }],
             retry_policy: RetryPolicy::default(),
         }])
@@ -521,6 +525,7 @@ mod hotpath_tests {
             upstream_key_id: "k1".into(),
             provider_kind: "codex-oauth".into(),
             base_url: None,
+            request_overrides: Default::default(),
             attempt_no: 0,
         };
         let up = request_for_upstream(&req, &resolved);

@@ -7,7 +7,12 @@ use conduit_ir::{
     error::CodecError,
     loss::LossReport,
 };
-pub use openai_responses::{apply_codex_chatgpt_account_body, OpenAiResponsesCodec};
+pub use openai_responses::{
+    apply_codex_chatgpt_account_body, can_reset_responses_continuation,
+    merge_responses_continuation, prepare_responses_continuation, reset_responses_continuation,
+    response_output_items, responses_store_enabled, OpenAiResponsesCodec, ResponsesContinuation,
+    ResponsesContinuationRequest, ResponsesStreamEncoder,
+};
 use serde_json::Value;
 
 /// Translates between the canonical IR and provider-specific wire JSON.

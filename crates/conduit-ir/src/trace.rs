@@ -47,6 +47,8 @@ impl TraceEvent {
 pub enum WireFormat {
     /// OpenAI Chat Completions (`POST /v1/chat/completions`).
     OpenaiChat,
+    /// OpenAI Responses (`POST /v1/responses`).
+    OpenaiResponses,
     /// Anthropic Messages (`POST /v1/messages`).
     AnthropicMessages,
 }
@@ -55,6 +57,7 @@ impl WireFormat {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::OpenaiChat => "openai_chat",
+            Self::OpenaiResponses => "openai_responses",
             Self::AnthropicMessages => "anthropic_messages",
         }
     }

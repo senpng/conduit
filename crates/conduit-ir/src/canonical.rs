@@ -179,6 +179,10 @@ pub struct Sampling {
     /// Populated from Anthropic `thinking` when decoding Claude → IR.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// OpenAI Codex Responses service tier. `priority` enables the Fast tier
+    /// for models that support it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

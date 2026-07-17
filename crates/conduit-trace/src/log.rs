@@ -367,6 +367,23 @@ impl LogReader {
     pub fn stream_all_with_offsets(
         &self,
     ) -> impl Stream<Item = Result<(TraceEvent, LogOffset), TraceError>> + '_ {
+        self.stream_from_offset(None)
+    }
+
+    /// Stream every event after an optional previously indexed log location.
+    /// The checkpoint event itself is skipped because its index row is already
+    /// durable when the checkpoint is recorded.
+    pub fn stream_after_offset(
+        &self,
+        checkpoint: Option<LogOffset>,
+    ) -> impl Stream<Item = Result<(TraceEvent, LogOffset), TraceError>> + '_ {
+        self.stream_from_offset(checkpoint)
+    }
+
+    fn stream_from_offset(
+        &self,
+        checkpoint: Option<LogOffset>,
+    ) -> impl Stream<Item = Result<(TraceEvent, LogOffset), TraceError>> + '_ {
         let dir = self.dir.clone();
         async_stream::try_stream! {
             let seg_dir = dir.join(SEGMENTS_DIR);
@@ -387,8 +404,21 @@ impl LogReader {
                     .and_then(|name| name.to_str())
                     .ok_or_else(|| TraceError::Serialization("invalid segment filename".into()))?
                     .to_string();
+                if let Some(checkpoint) = checkpoint.as_ref() {
+                    if segment < checkpoint.segment {
+                        continue;
+                    }
+                }
                 let mut file = fs::File::open(&seg_path).await.map_err(TraceError::Io)?;
-                let mut offset = 0u64;
+                let mut offset = checkpoint
+                    .as_ref()
+                    .filter(|checkpoint| checkpoint.segment == segment)
+                    .map_or(0, |checkpoint| checkpoint.offset);
+                if offset > 0 {
+                    file.seek(std::io::SeekFrom::Start(offset))
+                        .await
+                        .map_err(TraceError::Io)?;
+                }
                 loop {
                     match read_frame_len(&mut file).await {
                         Ok(frame_len) => {
@@ -402,7 +432,15 @@ impl LogReader {
                             let json = decompress(&compressed)?;
                             let event: TraceEvent = serde_json::from_slice(&json)
                                 .map_err(|e| TraceError::Serialization(e.to_string()))?;
-                            yield (event, LogOffset { segment: segment.clone(), offset });
+                            let event_offset = LogOffset { segment: segment.clone(), offset };
+                            let after_checkpoint = checkpoint.as_ref().is_none_or(|checkpoint| {
+                                event_offset.segment > checkpoint.segment
+                                    || (event_offset.segment == checkpoint.segment
+                                        && event_offset.offset > checkpoint.offset)
+                            });
+                            if after_checkpoint {
+                                yield (event, event_offset);
+                            }
                             offset += 4 + frame_len as u64;
                         }
                         Err(TraceError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {

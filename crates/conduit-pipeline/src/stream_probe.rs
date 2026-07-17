@@ -11,7 +11,10 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use conduit_codec::{anthropic::stream::AnthropicStreamEncoder, openai::OpenAiCodec, WireCodec};
+use conduit_codec::{
+    anthropic::stream::AnthropicStreamEncoder, openai::OpenAiCodec, ResponsesStreamEncoder,
+    WireCodec,
+};
 use conduit_ir::{
     canonical::{BlockDelta, CanonicalChunk, Usage},
     error::ProviderError,
@@ -71,6 +74,8 @@ pub struct InstrumentedStream {
     upstream_headers: UpstreamHeaders,
     /// Stateful Anthropic SSE encoder for client-facing audit frames.
     anthropic_encoder: Option<AnthropicStreamEncoder>,
+    /// Stateful Responses SSE encoder for client-facing audit frames.
+    responses_encoder: Option<ResponsesStreamEncoder>,
 }
 
 impl InstrumentedStream {
@@ -94,6 +99,14 @@ impl InstrumentedStream {
         let resp_id = Ulid::new().to_string();
         let anthropic_encoder = if wire_format == WireFormat::AnthropicMessages {
             Some(AnthropicStreamEncoder::new(
+                resp_id.clone(),
+                model_id.clone(),
+            ))
+        } else {
+            None
+        };
+        let responses_encoder = if wire_format == WireFormat::OpenaiResponses {
+            Some(ResponsesStreamEncoder::new(
                 resp_id.clone(),
                 model_id.clone(),
             ))
@@ -124,6 +137,7 @@ impl InstrumentedStream {
             wire_format,
             upstream_headers,
             anthropic_encoder,
+            responses_encoder,
         }
     }
 
@@ -133,6 +147,13 @@ impl InstrumentedStream {
                 .0
                 .into_iter()
                 .collect(),
+            WireFormat::OpenaiResponses => {
+                if let Some(enc) = self.responses_encoder.as_mut() {
+                    enc.push(chunk)
+                } else {
+                    vec![]
+                }
+            }
             WireFormat::AnthropicMessages => {
                 if let Some(enc) = self.anthropic_encoder.as_mut() {
                     enc.push(chunk)
@@ -150,6 +171,13 @@ impl InstrumentedStream {
     fn encode_stream_done(&mut self) -> Vec<String> {
         match self.wire_format {
             WireFormat::OpenaiChat => vec!["data: [DONE]\n\n".to_string()],
+            WireFormat::OpenaiResponses => {
+                if let Some(enc) = self.responses_encoder.as_mut() {
+                    enc.finish()
+                } else {
+                    vec![]
+                }
+            }
             WireFormat::AnthropicMessages => {
                 if let Some(enc) = self.anthropic_encoder.as_mut() {
                     enc.finish()
