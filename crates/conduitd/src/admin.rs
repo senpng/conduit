@@ -390,7 +390,7 @@ pub async fn create_key(
         return err(StatusCode::BAD_REQUEST, "name is required").into_response();
     }
 
-    // Generate a cryptographically random key: "ck_" + 32-byte random hex
+    // Generate a cryptographically random key: "sk_" + 32-byte random hex
     let rand_bytes = {
         let mut buf = [0u8; 32];
         // Use blake3's keyed hash on a random ULID as entropy source
@@ -405,7 +405,7 @@ pub async fn create_key(
         buf.copy_from_slice(hash.as_bytes());
         buf
     };
-    let raw_key = format!("ck_{}", hex::encode(rand_bytes));
+    let raw_key = format!("sk_{}", hex::encode(rand_bytes));
     let key_hash = hex::encode(blake3::hash(raw_key.as_bytes()).as_bytes());
 
     let id = Ulid::new().to_string();

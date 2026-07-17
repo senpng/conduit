@@ -169,7 +169,7 @@ describe("keys client", () => {
       return jsonResponse(
         {
           id: "k1",
-          key: "ck_abc",
+          key: "sk_abc",
           name: "app",
           model_whitelist: [],
           rate_limit_rpm: 60,
@@ -180,7 +180,7 @@ describe("keys client", () => {
     });
     const api = createAdminApi(fetchImpl);
     const res = await api.keys.create({ name: "app", rate_limit_rpm: 60 });
-    expect(res.key).toBe("ck_abc");
+    expect(res.key).toBe("sk_abc");
     expect((res as { raw_key?: string }).raw_key).toBeUndefined();
   });
 });
