@@ -1,6 +1,9 @@
 //! PipelineContext: all mutable state threaded through the L1-L7 pipeline.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use chrono::{DateTime, Utc};
 use conduit_ir::{
@@ -43,11 +46,12 @@ pub struct PipelineContext {
     pub resolved: Option<ResolvedProvider>,
     pub usage: Usage,
     pub loss_report: LossReport,
-    pub ttfb_at: Option<DateTime<Utc>>,
     pub events: Vec<TraceEventKind>,
     pub attempt_no: u32,
     /// Original client wire (for faithful request/response audit).
     pub ingress_wire: Option<IngressWire>,
+    /// Fixed for the whole request so Weighted LB retries keep a stable target order.
+    pub routing_seed: u64,
 }
 
 impl PipelineContext {
@@ -56,6 +60,10 @@ impl PipelineContext {
         downstream_key_id: Option<String>,
         routing_table: Arc<RoutingTable>,
     ) -> Self {
+        let routing_seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
         Self {
             trace_id: Ulid::new().to_string(),
             started_at: Utc::now(),
@@ -65,10 +73,10 @@ impl PipelineContext {
             resolved: None,
             usage: Usage::default(),
             loss_report: LossReport::default(),
-            ttfb_at: None,
             events: Vec::new(),
             attempt_no: 0,
             ingress_wire: None,
+            routing_seed,
         }
     }
 
@@ -81,19 +89,8 @@ impl PipelineContext {
         (Utc::now() - self.started_at).num_milliseconds() as u64
     }
 
-    pub fn ttfb_ms(&self) -> Option<u64> {
-        self.ttfb_at
-            .map(|t| (t - self.started_at).num_milliseconds() as u64)
-    }
-
     pub fn push_event(&mut self, kind: TraceEventKind) {
         self.events.push(kind);
-    }
-
-    pub fn mark_ttfb(&mut self) {
-        if self.ttfb_at.is_none() {
-            self.ttfb_at = Some(Utc::now());
-        }
     }
 
     pub fn merge_usage(&mut self, delta: &Usage) {

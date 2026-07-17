@@ -11,7 +11,8 @@ use serde_json::Value;
 use crate::schema::PricingRow;
 
 /// Canonical LiteLLM pricing map URL (raw GitHub main).
-pub const DEFAULT_LITELLM_PRICING_URL: &str = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+pub const DEFAULT_LITELLM_PRICING_URL: &str =
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 
 /// Filename under the data dir for the last successful LiteLLM sync.
 pub const LITELLM_CACHE_FILENAME: &str = "pricing.litellm.json";
@@ -54,7 +55,10 @@ pub struct LiteLlmConvertStats {
 /// - Maps `litellm_provider` into Conduit `provider_kind` and emits OAuth aliases
 ///   (`claude-oauth`, `grok-oauth`, `codex-oauth`, …) so subscription routes resolve.
 /// - `effective_from` is `sync_date` (ISO date, e.g. `2026-07-17`) for all rows.
-pub fn convert_litellm_json(json_text: &str, sync_date: &str) -> Result<LiteLlmConvertStats, String> {
+pub fn convert_litellm_json(
+    json_text: &str,
+    sync_date: &str,
+) -> Result<LiteLlmConvertStats, String> {
     let root: BTreeMap<String, Value> =
         serde_json::from_str(json_text).map_err(|e| format!("invalid LiteLLM JSON: {e}"))?;
 
@@ -120,15 +124,9 @@ pub fn convert_litellm_json(json_text: &str, sync_date: &str) -> Result<LiteLlmC
             model_id: model_id.clone(),
             input_per_mtok: per_token_to_mtok(input),
             output_per_mtok: per_token_to_mtok(output),
-            cache_read_per_mtok: entry
-                .cache_read_input_token_cost
-                .map(per_token_to_mtok),
-            cache_write_per_mtok: entry
-                .cache_creation_input_token_cost
-                .map(per_token_to_mtok),
-            reasoning_per_mtok: entry
-                .output_cost_per_reasoning_token
-                .map(per_token_to_mtok),
+            cache_read_per_mtok: entry.cache_read_input_token_cost.map(per_token_to_mtok),
+            cache_write_per_mtok: entry.cache_creation_input_token_cost.map(per_token_to_mtok),
+            reasoning_per_mtok: entry.output_cost_per_reasoning_token.map(per_token_to_mtok),
             effective_from: sync_date.to_string(),
         };
 
@@ -180,10 +178,7 @@ fn oauth_aliases(primary_kind: &str) -> &'static [&'static str] {
     }
 }
 
-fn insert_with_aliases(
-    map: &mut BTreeMap<(String, String), PricingRow>,
-    row: PricingRow,
-) {
+fn insert_with_aliases(map: &mut BTreeMap<(String, String), PricingRow>, row: PricingRow) {
     for alias in oauth_aliases(&row.provider_kind) {
         let mut a = row.clone();
         a.provider_kind = (*alias).to_string();
@@ -205,10 +200,7 @@ fn normalize_model_id(key: &str, litellm_provider: &str, provider_kind: &str) ->
     }
 
     // Exact "provider/model" for matching provider.
-    for prefix in [
-        format!("{litellm_provider}/"),
-        format!("{provider_kind}/"),
-    ] {
+    for prefix in [format!("{litellm_provider}/"), format!("{provider_kind}/")] {
         if let Some(rest) = key.strip_prefix(&prefix) {
             if !rest.is_empty() {
                 return rest.to_string();

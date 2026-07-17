@@ -39,14 +39,23 @@ pub async fn run(admin_addr: &str, args: PricingArgs, output: &str) -> Result<()
                 println!("{}", serde_json::to_string_pretty(&body)?);
             } else {
                 let rows = body.as_array().cloned().unwrap_or_default();
-                println!("{:<16} {:<36} {:>10} {:>10}", "PROVIDER", "MODEL", "IN/MTok", "OUT/MTok");
+                println!(
+                    "{:<16} {:<36} {:>10} {:>10}",
+                    "PROVIDER", "MODEL", "IN/MTok", "OUT/MTok"
+                );
                 for r in &rows {
                     println!(
                         "{:<16} {:<36} {:>10.4} {:>10.4}",
-                        r.get("provider_kind").and_then(|v| v.as_str()).unwrap_or("?"),
+                        r.get("provider_kind")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?"),
                         r.get("model_id").and_then(|v| v.as_str()).unwrap_or("?"),
-                        r.get("input_per_mtok").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                        r.get("output_per_mtok").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                        r.get("input_per_mtok")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0),
+                        r.get("output_per_mtok")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0),
                     );
                 }
                 println!("{} rows", rows.len());
@@ -87,7 +96,9 @@ pub async fn run(admin_addr: &str, args: PricingArgs, output: &str) -> Result<()
                 println!(
                     "synced from {} (source_models={}, total_rows={}, skipped={})",
                     body.get("url").and_then(|v| v.as_str()).unwrap_or("?"),
-                    body.get("source_models").and_then(|v| v.as_u64()).unwrap_or(0),
+                    body.get("source_models")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
                     body.get("total_rows").and_then(|v| v.as_u64()).unwrap_or(0),
                     body.get("skipped").and_then(|v| v.as_u64()).unwrap_or(0),
                 );

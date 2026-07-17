@@ -137,14 +137,24 @@ UI Traces view shows Request / Response (wire) sections, optional SSE frames, pl
 
 ## Security Model
 
-**Two security levels** — no silent downgrade:
+**Secret backend tiers** (reported honestly by `SecurityLevel`; no tier is silently misrepresented):
 
 | Level | Implementation | Trigger |
 |-------|---------------|---------|
 | S1 Hardware | macOS Keychain / Windows DPAPI / Linux libsecret | Available by default |
 | S2 Master Password | Argon2id + AES-256-GCM encrypted files | User explicitly sets a master password |
+| S0 Plaintext File | base64 file, mode 0600, **no encryption at rest** | The keychain-mirror path (see below) |
 
 Downgrade from S1 → S2 always shows an explicit UI/CLI warning. The previous "machine-bound" S3 level is **deleted** — it provided false security (machine UUID is predictable).
+
+**Keychain mirror (local-first tradeoff).** To avoid macOS Keychain ACL prompts
+hanging the daemon, when S1 is available secrets are also mirrored to an
+unencrypted file under `{data_dir}/secrets/` (base64, mode 0600), and **reads are
+served from that file first**. This means the effective protection at rest is
+filesystem permissions, not the hardware keychain — so `FileFallbackBackend`
+reports `SecurityLevel::PlaintextFile` (not `Hardware`) and `build_backend`
+surfaces a startup notice. This is an accepted local-first tradeoff; the level is
+reported truthfully rather than claimed as hardware-backed.
 
 All secrets are held as `secrecy::SecretVec<u8>` and zeroized on drop.
 

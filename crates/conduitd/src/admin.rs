@@ -1065,7 +1065,7 @@ pub fn build_replay_plan(
             wire_format,
             ..
         } => {
-            let decision = route(alias, table, 0).ok();
+            let decision = route(alias, table, 0, None).ok();
             json!({
                 "dry_run": true,
                 "trace_id": event.id,
@@ -1162,6 +1162,7 @@ mod replay_tests {
                 upstream_key_id: "uk1".into(),
                 provider_kind: "openai".into(),
                 base_url: Some("https://api.openai.com".into()),
+                weight: 1,
             }],
             retry_policy: RetryPolicy::default(),
         }])

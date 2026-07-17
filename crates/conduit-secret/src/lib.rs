@@ -46,9 +46,21 @@ pub async fn build_backend(
         Ok(b) => {
             tracing::info!("secret backend: OS keychain (S1) + file mirror under secrets/");
             let mirrored = FileFallbackBackend::new(Arc::new(b), app_dir.join("secrets"));
+            // The keychain is used as a mirror only: reads are served from an
+            // unencrypted `secrets/*.bin` file first (base64, mode 0600) to
+            // avoid keychain ACL hangs. Surface this honestly — the effective
+            // protection at rest is filesystem permissions, not the keychain.
+            let notice = concat!(
+                "NOTICE: Secrets are mirrored to an unencrypted file under `secrets/` ",
+                "(base64, mode 0600) alongside the OS keychain, so the daemon never ",
+                "blocks on keychain ACL prompts. Effective protection at rest is ",
+                "filesystem permissions, not hardware-backed encryption."
+            )
+            .to_string();
+            tracing::warn!("{}", notice);
             return BackendResult {
                 backend: Arc::new(mirrored),
-                downgrade_warning: None,
+                downgrade_warning: Some(notice),
             };
         }
         Err(e) => {

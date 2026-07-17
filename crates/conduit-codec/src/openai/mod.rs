@@ -35,8 +35,7 @@ impl WireCodec for OpenAiCodec {
         body: Value,
         alias: &str,
     ) -> Result<(CanonicalChatResponse, LossReport), CodecError> {
-        let resp = decode_response::decode_response(body, alias)?;
-        Ok((resp, LossReport::default()))
+        decode_response::decode_response(body, alias)
     }
 
     fn encode_response(resp: &CanonicalChatResponse) -> Value {

@@ -11,9 +11,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use conduit_codec::{
-    anthropic::stream::AnthropicStreamEncoder, openai::OpenAiCodec, WireCodec,
-};
+use conduit_codec::{anthropic::stream::AnthropicStreamEncoder, openai::OpenAiCodec, WireCodec};
 use conduit_ir::{
     canonical::{BlockDelta, CanonicalChunk, Usage},
     error::ProviderError,
@@ -92,7 +90,10 @@ impl InstrumentedStream {
     ) -> Self {
         let resp_id = Ulid::new().to_string();
         let anthropic_encoder = if wire_format == WireFormat::AnthropicMessages {
-            Some(AnthropicStreamEncoder::new(resp_id.clone(), model_id.clone()))
+            Some(AnthropicStreamEncoder::new(
+                resp_id.clone(),
+                model_id.clone(),
+            ))
         } else {
             None
         };
@@ -188,7 +189,18 @@ impl InstrumentedStream {
         })
     }
 
-    fn finalize_success(&mut self) {
+    /// Send a trace event, logging (never silently dropping) a send failure.
+    ///
+    /// `TraceSink::send` only fails when the audit channel is full; per the
+    /// "trace failures are never silent" axiom we surface it as a warning so
+    /// dropped audit events are diagnosable under backpressure.
+    fn emit(&self, event: TraceEvent) {
+        if let Err(e) = self.sink.send(event) {
+            warn!(error = %e, trace_id = %self.trace_id, "trace event dropped (sink send failed)");
+        }
+    }
+
+    fn finalize(&mut self, status: u16) {
         if self.finalized {
             return;
         }
@@ -198,7 +210,7 @@ impl InstrumentedStream {
             let seq = self.stream_seq;
             self.stream_seq = self.stream_seq.saturating_add(1);
             self.stream_frames.push(done.clone());
-            let _ = self.sink.send(TraceEvent::with_trace_id(
+            self.emit(TraceEvent::with_trace_id(
                 self.trace_id.clone(),
                 TraceEventKind::StreamDelta {
                     seq,
@@ -213,19 +225,25 @@ impl InstrumentedStream {
             .ttfb_at
             .map(|t| (t - self.started_at).num_milliseconds() as u64);
 
-        let _ = self.sink.send(TraceEvent::with_trace_id(
+        // Build the event before calling `self.emit()` so the `&mut` take of
+        // `stream_frames` does not overlap the `&self` method receiver borrow.
+        let summary = self.build_summary_json();
+        let response_headers = client_response_headers(self.wire_format, true);
+        let wire_format = self.wire_format.to_string();
+        let upstream_event = TraceEvent::with_trace_id(
             self.trace_id.clone(),
             TraceEventKind::UpstreamResponse {
-                status: 200,
+                status,
                 latency_ms,
                 ttfb_ms,
-                response: Some(self.build_summary_json()),
-                wire_format: Some(self.wire_format.to_string()),
+                response: Some(summary),
+                wire_format: Some(wire_format),
                 stream: true,
                 stream_frames: Some(std::mem::take(&mut self.stream_frames)),
-                response_headers: Some(client_response_headers(self.wire_format, true)),
+                response_headers: Some(response_headers),
             },
-        ));
+        );
+        self.emit(upstream_event);
 
         let pf = &*self.pricing_fn;
         let cost_usd = compute_cost(
@@ -235,7 +253,7 @@ impl InstrumentedStream {
             |pk, mid| pf(pk, mid),
         );
 
-        let _ = self.sink.send(TraceEvent::with_trace_id(
+        self.emit(TraceEvent::with_trace_id(
             self.trace_id.clone(),
             TraceEventKind::FinalUsage {
                 usage: self.usage_acc.clone(),
@@ -301,7 +319,7 @@ impl InstrumentedStream {
             Some(std::mem::take(&mut self.stream_frames))
         };
 
-        let _ = self.sink.send(TraceEvent::with_trace_id(
+        self.emit(TraceEvent::with_trace_id(
             self.trace_id.clone(),
             TraceEventKind::UpstreamResponse {
                 status: 500,
@@ -314,7 +332,7 @@ impl InstrumentedStream {
                 response_headers: Some(client_response_headers(self.wire_format, true)),
             },
         ));
-        let _ = self.sink.send(TraceEvent::with_trace_id(
+        self.emit(TraceEvent::with_trace_id(
             self.trace_id.clone(),
             TraceEventKind::Error { kind, message },
         ));
@@ -375,7 +393,7 @@ impl Stream for InstrumentedStream {
                     let seq = self.stream_seq;
                     self.stream_seq = self.stream_seq.saturating_add(1);
                     self.stream_frames.push(frame.clone());
-                    let _ = self.sink.send(TraceEvent::with_trace_id(
+                    self.emit(TraceEvent::with_trace_id(
                         self.trace_id.clone(),
                         TraceEventKind::StreamDelta {
                             seq,
@@ -396,7 +414,7 @@ impl Stream for InstrumentedStream {
             }
 
             Poll::Ready(None) => {
-                self.finalize_success();
+                self.finalize(200);
                 Poll::Ready(None)
             }
         }
@@ -405,9 +423,134 @@ impl Stream for InstrumentedStream {
 
 impl Drop for InstrumentedStream {
     fn drop(&mut self) {
-        // If consumer stops early, still finalize audit trail with frames so far.
+        // Consumer stopped early (connection dropped before the stream ended
+        // naturally). Finalize the audit trail with frames so far, marked as a
+        // client cancellation (499) rather than a successful 200 — usage
+        // accumulated so far is still recorded (billing is not lost).
         if !self.finalized {
-            self.finalize_success();
+            self.finalize(499);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use conduit_ir::canonical::{BlockDelta, BlockKind};
+    use conduit_quota::engine::QuotaEngine;
+    use conduit_trace::{sink::TraceSubscriber, TraceStore};
+    use futures::StreamExt;
+
+    use super::*;
+
+    /// Captures the status of every UpstreamResponse event written to the sink.
+    struct StatusCapture {
+        statuses: Arc<Mutex<Vec<u16>>>,
+    }
+    #[async_trait::async_trait]
+    impl TraceSubscriber for StatusCapture {
+        async fn on_event(&self, ev: &TraceEvent) {
+            if let TraceEventKind::UpstreamResponse { status, .. } = &ev.kind {
+                self.statuses.lock().unwrap().push(*status);
+            }
+        }
+    }
+
+    /// Records whether the usage ledger was written.
+    struct RecordingQuota {
+        recorded: Arc<Mutex<u32>>,
+    }
+    #[async_trait::async_trait]
+    impl QuotaEngine for RecordingQuota {
+        async fn check(
+            &self,
+            _req: &conduit_quota::check::QuotaCheckRequest,
+        ) -> Result<(), conduit_ir::error::QuotaError> {
+            Ok(())
+        }
+        async fn record(
+            &self,
+            _req: &QuotaRecordRequest,
+        ) -> Result<(), conduit_ir::error::QuotaError> {
+            *self.recorded.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    fn text_chunk(text: &str) -> CanonicalChunk {
+        CanonicalChunk {
+            request_id: String::new(),
+            index: 0,
+            block_index: 0,
+            block_kind: Some(BlockKind::Text),
+            delta: Some(BlockDelta::TextDelta { text: text.into() }),
+            finish_reason: None,
+            usage: Some(Usage {
+                completion_tokens: 3,
+                total_tokens: 3,
+                ..Usage::default()
+            }),
+            tool_use_id: None,
+            tool_name: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_records_499_and_still_bills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(TraceStore::open(tmp.path().to_path_buf()).await.unwrap());
+        let (sink, _h) = TraceSink::start(store).await;
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        sink.register(Arc::new(StatusCapture {
+            statuses: statuses.clone(),
+        }));
+        let sink = Arc::new(sink);
+
+        let recorded = Arc::new(Mutex::new(0u32));
+        let quota = Arc::new(RecordingQuota {
+            recorded: recorded.clone(),
+        });
+
+        let inner = futures::stream::iter(vec![Ok(text_chunk("hi"))]).boxed();
+        let mut stream = InstrumentedStream::new(
+            inner,
+            sink.clone(),
+            Arc::new(|_, _| None),
+            quota,
+            Some("key-1".into()),
+            Utc::now(),
+            "gpt-4o".into(),
+            "prov-1".into(),
+            "openai".into(),
+            "gpt-4o".into(),
+            LossReport::default(),
+            "trace-xyz".into(),
+            WireFormat::OpenaiChat,
+        );
+
+        // Consume exactly one chunk, then drop mid-stream (client disconnect).
+        let first = stream.next().await;
+        assert!(matches!(first, Some(Ok(_))));
+        drop(stream);
+
+        // Let the sink flush writes and notify subscribers.
+        sink.drain().await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let seen = statuses.lock().unwrap().clone();
+        assert!(
+            seen.contains(&499),
+            "client disconnect must record status 499, got {seen:?}"
+        );
+        assert!(
+            !seen.contains(&200),
+            "client disconnect must not record 200, got {seen:?}"
+        );
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            1,
+            "usage must still be recorded on client disconnect (billing not lost)"
+        );
     }
 }

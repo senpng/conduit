@@ -7,6 +7,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
+use conduit_ir::pricing::pricing_kind_aliases;
 use conduit_pipeline::{egress::ModelPricing, handle::PipelineHandle};
 use conduit_router::table::RoutingTable;
 use conduit_secret::SecretBackend;
@@ -103,7 +104,7 @@ pub fn lookup_pricing(map: &PricingMap, kind: &str, model: &str) -> Option<Model
         }
     }
     // Prefix: "grok-4.5-build" ↔ "grok-4.5"
-    for alt in std::iter::once(kind).chain(pricing_kind_aliases(kind).into_iter()) {
+    for alt in std::iter::once(kind).chain(pricing_kind_aliases(kind).iter().copied()) {
         if let Some((_, p)) = map
             .iter()
             .find(|((k, m), _)| k == alt && (model.starts_with(m.as_str()) || m.starts_with(model)))
@@ -115,18 +116,6 @@ pub fn lookup_pricing(map: &PricingMap, kind: &str, model: &str) -> Option<Model
     map.iter()
         .find(|((_, m), _)| m == model)
         .map(|(_, p)| p.clone())
-}
-
-fn pricing_kind_aliases(kind: &str) -> Vec<&'static str> {
-    match kind.trim().to_ascii_lowercase().as_str() {
-        "grok-oauth" | "grok" | "xai-oauth" => vec!["xai", "grok-oauth", "openai"],
-        "xai" => vec!["grok-oauth", "openai"],
-        "claude-oauth" | "anthropic-oauth" => vec!["anthropic", "claude-oauth"],
-        "codex-oauth" | "codex" => vec!["codex", "codex-oauth", "openai"],
-        "anthropic" => vec!["claude-oauth"],
-        "openai" => vec!["codex-oauth"],
-        _ => vec![],
-    }
 }
 
 #[cfg(test)]

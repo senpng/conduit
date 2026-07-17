@@ -3,11 +3,21 @@ use conduit_ir::{
         CanonicalChatResponse, CanonicalContent, CanonicalMessage, FinishReason, Role, Usage,
     },
     error::CodecError,
+    loss::LossReport,
 };
 use serde_json::Value;
 
 /// Decode an OpenAI `/v1/chat/completions` response body into the canonical IR.
-pub fn decode_response(body: Value, alias: &str) -> Result<CanonicalChatResponse, CodecError> {
+///
+/// The returned [`LossReport`] records response data that the IR cannot
+/// represent (e.g. extra `choices` beyond the first, or a `refusal` message),
+/// so the audit trail reflects what was dropped instead of losing it silently.
+pub fn decode_response(
+    body: Value,
+    alias: &str,
+) -> Result<(CanonicalChatResponse, LossReport), CodecError> {
+    let mut loss = LossReport::default();
+
     let id = body["id"]
         .as_str()
         .ok_or_else(|| CodecError::MissingField { field: "id".into() })?
@@ -15,11 +25,24 @@ pub fn decode_response(body: Value, alias: &str) -> Result<CanonicalChatResponse
 
     let model = body["model"].as_str().unwrap_or(alias).to_string();
 
+    let choices = body["choices"].as_array();
     let choice = &body["choices"][0];
     if choice.is_null() {
         return Err(CodecError::MissingField {
             field: "choices[0]".into(),
         });
+    }
+    // The IR carries a single assistant message; any additional choices (n > 1)
+    // cannot be represented and are dropped.
+    if let Some(arr) = choices {
+        if arr.len() > 1 {
+            loss.add(
+                "choices",
+                format!("{} choices", arr.len()),
+                "choices[0] only",
+                "IR represents a single assistant message; extra choices (n>1) dropped",
+            );
+        }
     }
 
     let msg = &choice["message"];
@@ -31,6 +54,18 @@ pub fn decode_response(body: Value, alias: &str) -> Result<CanonicalChatResponse
             content.push(CanonicalContent::Text {
                 text: text.to_string(),
             });
+        }
+    }
+
+    // A refusal message has no IR representation; record it rather than drop it.
+    if let Some(refusal) = msg["refusal"].as_str() {
+        if !refusal.is_empty() {
+            loss.add(
+                "choices[0].message.refusal",
+                refusal,
+                "(dropped)",
+                "OpenAI refusal message has no IR representation; skipped",
+            );
         }
     }
 
@@ -69,19 +104,22 @@ pub fn decode_response(body: Value, alias: &str) -> Result<CanonicalChatResponse
 
     let created_at = chrono::Utc::now();
 
-    Ok(CanonicalChatResponse {
-        id,
-        request_id: String::new(), // filled in by the caller
-        model,
-        choices: vec![CanonicalMessage {
-            role: Role::Assistant,
-            content,
-            name: None,
-        }],
-        finish_reason,
-        usage,
-        created_at,
-    })
+    Ok((
+        CanonicalChatResponse {
+            id,
+            request_id: String::new(), // filled in by the caller
+            model,
+            choices: vec![CanonicalMessage {
+                role: Role::Assistant,
+                content,
+                name: None,
+            }],
+            finish_reason,
+            usage,
+            created_at,
+        },
+        loss,
+    ))
 }
 
 pub(crate) fn decode_finish_reason(s: Option<&str>) -> FinishReason {
@@ -155,7 +193,7 @@ mod tests {
                 "total_tokens": 15
             }
         });
-        let resp = decode_response(body, "gpt-4o").unwrap();
+        let resp = decode_response(body, "gpt-4o").unwrap().0;
         assert_eq!(resp.id, "chatcmpl-abc");
         assert_eq!(resp.finish_reason, FinishReason::Stop);
         assert_eq!(resp.usage.prompt_tokens, 10);
@@ -186,7 +224,7 @@ mod tests {
             }],
             "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}
         });
-        let resp = decode_response(body, "gpt-4o").unwrap();
+        let resp = decode_response(body, "gpt-4o").unwrap().0;
         assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
         if let CanonicalContent::ToolUse { id, name, input } = &resp.choices[0].content[0] {
             assert_eq!(id, "call_1");
@@ -214,7 +252,7 @@ mod tests {
                 "completion_tokens_details": {"reasoning_tokens": 150}
             }
         });
-        let resp = decode_response(body, "o1").unwrap();
+        let resp = decode_response(body, "o1").unwrap().0;
         assert_eq!(resp.usage.reasoning_tokens, 150);
     }
 
@@ -235,7 +273,7 @@ mod tests {
                 "prompt_tokens_details": {"cached_tokens": 80}
             }
         });
-        let resp = decode_response(body, "gpt-4o").unwrap();
+        let resp = decode_response(body, "gpt-4o").unwrap().0;
         assert_eq!(resp.usage.cache_read_tokens, 80);
     }
 

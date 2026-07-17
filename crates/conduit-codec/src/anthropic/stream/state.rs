@@ -56,17 +56,7 @@ impl AnthropicStreamState {
         self.usage.cache_read_tokens += u.cache_read_tokens;
         self.usage.cache_write_tokens += u.cache_write_tokens;
 
-        Ok(vec![CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
-            block_index: 0,
-            block_kind: None,
-            delta: None,
-            finish_reason: None,
-            usage: None,
-            tool_use_id: None,
-            tool_name: None,
-        }])
+        Ok(vec![CanonicalChunk::default()])
     }
 
     fn on_content_block_start(&mut self, data: &Value) -> Result<Vec<CanonicalChunk>, CodecError> {
@@ -98,15 +88,11 @@ impl AnthropicStreamState {
         self.open_blocks.insert(index, state);
 
         Ok(vec![CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
             block_index: index,
             block_kind: Some(kind),
-            delta: None,
-            finish_reason: None,
-            usage: None,
             tool_use_id,
             tool_name,
+            ..Default::default()
         }])
     }
 
@@ -150,15 +136,9 @@ impl AnthropicStreamState {
         };
 
         Ok(vec![CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
             block_index: index,
-            block_kind: None,
             delta: Some(block_delta),
-            finish_reason: None,
-            usage: None,
-            tool_use_id: None,
-            tool_name: None,
+            ..Default::default()
         }])
     }
 
@@ -167,15 +147,8 @@ impl AnthropicStreamState {
         self.open_blocks.remove(&index);
 
         Ok(vec![CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
             block_index: index,
-            block_kind: None,
-            delta: None,
-            finish_reason: None,
-            usage: None,
-            tool_use_id: None,
-            tool_name: None,
+            ..Default::default()
         }])
     }
 
@@ -193,32 +166,12 @@ impl AnthropicStreamState {
 
         let usage: conduit_ir::canonical::Usage = self.usage.clone().into();
 
-        Ok(vec![CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
-            block_index: 0,
-            block_kind: None,
-            delta: None,
-            finish_reason: Some(stop_reason),
-            usage: Some(usage),
-            tool_use_id: None,
-            tool_name: None,
-        }])
+        Ok(vec![CanonicalChunk::finish(stop_reason, Some(usage))])
     }
 }
 
 fn make_stop_chunk() -> CanonicalChunk {
-    CanonicalChunk {
-        request_id: String::new(),
-        index: 0,
-        block_index: 0,
-        block_kind: None,
-        delta: None,
-        finish_reason: None,
-        usage: None,
-        tool_use_id: None,
-        tool_name: None,
-    }
+    CanonicalChunk::default()
 }
 
 /// Decode a single Anthropic SSE event into canonical chunks.

@@ -217,11 +217,7 @@ fn encode_assistant_message(msg: &CanonicalMessage) -> Option<Value> {
         }
     } else {
         // OpenAI requires content field when only tools/reasoning.
-        msg_json["content"] = if has_tools {
-            Value::Null
-        } else {
-            json!("")
-        };
+        msg_json["content"] = if has_tools { Value::Null } else { json!("") };
     }
     if has_reasoning {
         msg_json["reasoning_content"] = json!(reasoning_parts.join("\n\n"));

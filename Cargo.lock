@@ -922,6 +922,7 @@ name = "conduit-router"
 version = "0.1.0"
 dependencies = [
  "conduit-ir",
+ "parking_lot",
  "serde",
  "serde_json",
  "thiserror",

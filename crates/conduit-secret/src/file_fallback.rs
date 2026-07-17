@@ -111,8 +111,11 @@ impl FileFallbackBackend {
 #[async_trait]
 impl SecretBackend for FileFallbackBackend {
     fn security_level(&self) -> SecurityLevel {
-        // Inherit primary (usually Hardware); file is a convenience mirror.
-        self.primary.security_level()
+        // Reads are served from the plaintext file mirror first (see `get`), so
+        // the *effective* protection is filesystem permissions, not the primary
+        // keychain. Report the weakest tier honestly rather than inheriting the
+        // primary's (misleading) Hardware level.
+        SecurityLevel::PlaintextFile
     }
 
     async fn put(&self, scope: &str, id: &str, secret: SecretVec<u8>) -> Result<(), SecretError> {

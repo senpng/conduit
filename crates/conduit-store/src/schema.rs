@@ -29,7 +29,7 @@ pub struct RouteRow {
     pub id: String,
     /// The virtual alias callers use (e.g. `"gpt-4o"`, `"fast"`).
     pub match_alias: String,
-    /// `"fixed"` or `"fallback"`.
+    /// `"fixed"`, `"fallback"`, or `"weighted"` (sticky pin is cross-cutting on the last two).
     pub strategy: String,
     /// JSON-encoded `Vec<RouteTarget>`.
     pub targets_json: String,

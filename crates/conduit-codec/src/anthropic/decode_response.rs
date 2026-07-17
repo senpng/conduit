@@ -3,11 +3,19 @@ use conduit_ir::{
         CanonicalChatResponse, CanonicalContent, CanonicalMessage, FinishReason, Role, Usage,
     },
     error::CodecError,
+    loss::LossReport,
 };
 use serde_json::Value;
 
 /// Decode an Anthropic Messages API response body into the canonical IR.
-pub fn decode_response(body: Value, alias: &str) -> Result<CanonicalChatResponse, CodecError> {
+///
+/// The returned [`LossReport`] records any response content that could not be
+/// represented in the IR (e.g. unknown content block types that were skipped),
+/// so the audit trail reflects what was dropped rather than silently losing it.
+pub fn decode_response(
+    body: Value,
+    alias: &str,
+) -> Result<(CanonicalChatResponse, LossReport), CodecError> {
     let id = body["id"]
         .as_str()
         .ok_or_else(|| CodecError::MissingField { field: "id".into() })?
@@ -21,28 +29,35 @@ pub fn decode_response(body: Value, alias: &str) -> Result<CanonicalChatResponse
             field: "content".into(),
         })?;
 
-    let content = decode_content_blocks(content_blocks)?;
+    let mut loss = LossReport::default();
+    let content = decode_content_blocks(content_blocks, &mut loss)?;
 
     let finish_reason = decode_finish_reason(body["stop_reason"].as_str());
 
     let usage = decode_usage(&body["usage"]);
 
-    Ok(CanonicalChatResponse {
-        id,
-        request_id: String::new(),
-        model,
-        choices: vec![CanonicalMessage {
-            role: Role::Assistant,
-            content,
-            name: None,
-        }],
-        finish_reason,
-        usage,
-        created_at: chrono::Utc::now(),
-    })
+    Ok((
+        CanonicalChatResponse {
+            id,
+            request_id: String::new(),
+            model,
+            choices: vec![CanonicalMessage {
+                role: Role::Assistant,
+                content,
+                name: None,
+            }],
+            finish_reason,
+            usage,
+            created_at: chrono::Utc::now(),
+        },
+        loss,
+    ))
 }
 
-fn decode_content_blocks(blocks: &[Value]) -> Result<Vec<CanonicalContent>, CodecError> {
+fn decode_content_blocks(
+    blocks: &[Value],
+    loss: &mut LossReport,
+) -> Result<Vec<CanonicalContent>, CodecError> {
     let mut content = Vec::new();
     for block in blocks {
         match block["type"].as_str() {
@@ -84,8 +99,21 @@ fn decode_content_blocks(blocks: &[Value]) -> Result<Vec<CanonicalContent>, Code
                     block_type = other,
                     "Skipping unknown Anthropic content block"
                 );
+                loss.add(
+                    "content[].type",
+                    other,
+                    "(dropped)",
+                    "unknown Anthropic content block type has no IR representation; skipped",
+                );
             }
-            None => {}
+            None => {
+                loss.add(
+                    "content[].type",
+                    "(missing)",
+                    "(dropped)",
+                    "Anthropic content block without a `type` field; skipped",
+                );
+            }
         }
     }
     Ok(content)
@@ -142,7 +170,7 @@ mod tests {
             "content": [{"type": "text", "text": "Hello!"}],
             "usage": {"input_tokens": 10, "output_tokens": 5}
         });
-        let resp = decode_response(body, "claude-3-5-sonnet").unwrap();
+        let resp = decode_response(body, "claude-3-5-sonnet").unwrap().0;
         assert_eq!(resp.id, "msg_abc");
         assert_eq!(resp.finish_reason, FinishReason::Stop);
         assert_eq!(resp.usage.prompt_tokens, 10);
@@ -159,7 +187,7 @@ mod tests {
             "content": [{"type": "tool_use", "id": "tu_1", "name": "search", "input": {"q": "rust"}}],
             "usage": {"input_tokens": 20, "output_tokens": 15}
         });
-        let resp = decode_response(body, "claude-3-5-sonnet").unwrap();
+        let resp = decode_response(body, "claude-3-5-sonnet").unwrap().0;
         assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
         if let CanonicalContent::ToolUse { id, name, .. } = &resp.choices[0].content[0] {
             assert_eq!(id, "tu_1");
@@ -183,7 +211,7 @@ mod tests {
                 "cache_creation_input_tokens": 20
             }
         });
-        let resp = decode_response(body, "claude-3-5-sonnet").unwrap();
+        let resp = decode_response(body, "claude-3-5-sonnet").unwrap().0;
         assert_eq!(resp.usage.cache_read_tokens, 80);
         assert_eq!(resp.usage.cache_write_tokens, 20);
     }
@@ -200,7 +228,7 @@ mod tests {
             ],
             "usage": {"input_tokens": 5, "output_tokens": 10}
         });
-        let resp = decode_response(body, "claude-3-7-sonnet").unwrap();
+        let resp = decode_response(body, "claude-3-7-sonnet").unwrap().0;
         assert_eq!(resp.choices[0].content.len(), 2);
         if let CanonicalContent::Thinking {
             thinking,
@@ -212,5 +240,25 @@ mod tests {
         } else {
             panic!("expected Thinking");
         }
+    }
+
+    #[test]
+    fn unknown_content_block_recorded_in_loss() {
+        let body = json!({
+            "id": "msg_unknown",
+            "model": "claude-3-5-sonnet",
+            "stop_reason": "end_turn",
+            "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "redacted_thinking", "data": "opaque"}
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let (resp, loss) = decode_response(body, "claude-3-5-sonnet").unwrap();
+        // Known text block is kept; the unknown block is dropped but recorded.
+        assert_eq!(resp.choices[0].content.len(), 1);
+        assert_eq!(loss.len(), 1);
+        assert_eq!(loss.warnings[0].field, "content[].type");
+        assert_eq!(loss.warnings[0].original, "redacted_thinking");
     }
 }

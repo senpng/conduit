@@ -309,7 +309,7 @@ pub enum BlockDelta {
 }
 
 /// A single streaming chunk from the provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CanonicalChunk {
     pub request_id: String,
     pub index: u32,
@@ -324,6 +324,37 @@ pub struct CanonicalChunk {
     pub tool_use_id: Option<String>,
     /// Tool name when this chunk begins a tool call block.
     pub tool_name: Option<String>,
+}
+
+impl CanonicalChunk {
+    /// A text-delta chunk (`block_kind = Text`), all other fields defaulted.
+    pub fn text_delta(text: impl Into<String>) -> Self {
+        Self {
+            block_kind: Some(BlockKind::Text),
+            delta: Some(BlockDelta::TextDelta { text: text.into() }),
+            ..Self::default()
+        }
+    }
+
+    /// A thinking-delta chunk (`block_kind = Thinking`), all other fields defaulted.
+    pub fn thinking_delta(thinking: impl Into<String>) -> Self {
+        Self {
+            block_kind: Some(BlockKind::Thinking),
+            delta: Some(BlockDelta::ThinkingDelta {
+                thinking: thinking.into(),
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// A terminal chunk carrying only a finish reason and optional usage.
+    pub fn finish(reason: FinishReason, usage: Option<Usage>) -> Self {
+        Self {
+            finish_reason: Some(reason),
+            usage,
+            ..Self::default()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

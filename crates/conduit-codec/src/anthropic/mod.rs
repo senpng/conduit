@@ -3,8 +3,6 @@ pub mod decode_response;
 pub mod encode_request;
 pub mod stream;
 
-pub use stream::{AnthropicStreamEncoder, encode_message_start, encode_message_stop};
-
 use conduit_ir::{
     canonical::{
         CanonicalChatRequest, CanonicalChatResponse, CanonicalChunk, CanonicalContent,
@@ -14,6 +12,7 @@ use conduit_ir::{
     loss::LossReport,
 };
 use serde_json::{json, Value};
+pub use stream::{encode_message_start, encode_message_stop, AnthropicStreamEncoder};
 
 use crate::WireCodec;
 
@@ -40,8 +39,7 @@ impl WireCodec for AnthropicCodec {
         body: Value,
         alias: &str,
     ) -> Result<(CanonicalChatResponse, LossReport), CodecError> {
-        let resp = decode_response::decode_response(body, alias)?;
-        Ok((resp, LossReport::default()))
+        decode_response::decode_response(body, alias)
     }
 
     fn encode_response(resp: &CanonicalChatResponse) -> Value {

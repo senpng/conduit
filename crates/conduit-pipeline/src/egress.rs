@@ -1,6 +1,6 @@
 //! L6 Egress Filter: post-response finalization — compute cost, emit final trace event.
 
-use conduit_ir::{canonical::Usage, trace::TraceEventKind};
+use conduit_ir::{canonical::Usage, pricing::pricing_kind_aliases, trace::TraceEventKind};
 
 use super::context::PipelineContext;
 
@@ -17,7 +17,7 @@ pub fn compute_cost(
 ) -> f64 {
     let price = pricing_fn(provider_kind, model_id).or_else(|| {
         // Secondary aliases when the injected fn only does exact match.
-        for alt in pricing_kind_fallbacks(provider_kind) {
+        for alt in pricing_kind_aliases(provider_kind).iter().copied() {
             if let Some(p) = pricing_fn(alt, model_id) {
                 return Some(p);
             }
@@ -41,15 +41,6 @@ pub fn compute_cost(
             tracing::warn!(provider = %provider_kind, model = %model_id, "no pricing entry; recording cost as 0");
             0.0
         }
-    }
-}
-
-fn pricing_kind_fallbacks(kind: &str) -> &'static [&'static str] {
-    match kind.trim().to_ascii_lowercase().as_str() {
-        "grok-oauth" | "grok" | "xai-oauth" => &["xai", "openai"],
-        "claude-oauth" | "anthropic-oauth" => &["anthropic"],
-        "codex-oauth" | "codex" => &["openai", "codex"],
-        _ => &[],
     }
 }
 

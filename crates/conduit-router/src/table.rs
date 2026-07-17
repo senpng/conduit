@@ -9,18 +9,29 @@ use crate::policy::RetryPolicy;
 // ---------------------------------------------------------------------------
 
 /// How the router picks a target for a given attempt number.
+///
+/// Sticky affinity (last successful provider per key+alias) is a **cross-cutting
+/// preference** applied to [`Fallback`] and [`Weighted`], not a standalone strategy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RoutingStrategy {
-    /// Always use `targets[0]`.
+    /// Always use `targets[0]`. Ignores sticky pin and weights.
     Fixed,
-    /// Use `targets[attempt_no]`, clamping to the last entry once exhausted.
+    /// Ordered failover: `targets` order (or sticky-preferred first, then the rest).
+    /// Attempt `n` uses the n-th entry, clamping to the last.
     Fallback,
+    /// Weighted load balance on attempt 0 (respects sticky pin when present);
+    /// later attempts walk remaining targets in table order.
+    Weighted,
 }
 
 // ---------------------------------------------------------------------------
 // Route target
 // ---------------------------------------------------------------------------
+
+fn default_weight() -> u32 {
+    1
+}
 
 /// A single upstream target (provider + model + key binding).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -37,6 +48,9 @@ pub struct RouteTarget {
     /// Populated from ProviderRow at route load time. Defaults to None (codec fills in the default).
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Relative weight for [`RoutingStrategy::Weighted`] (default 1). Zero = skip for LB pick.
+    #[serde(default = "default_weight")]
+    pub weight: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +141,7 @@ mod tests {
             upstream_key_id: format!("key_{provider}"),
             provider_kind: provider.into(),
             base_url: None,
+            weight: 1,
         }
     }
 
@@ -195,9 +210,26 @@ mod tests {
 
     #[test]
     fn routing_strategy_serde() {
-        let s = RoutingStrategy::Fallback;
-        let j = serde_json::to_string(&s).unwrap();
-        let back: RoutingStrategy = serde_json::from_str(&j).unwrap();
-        assert_eq!(s, back);
+        for s in [
+            RoutingStrategy::Fallback,
+            RoutingStrategy::Weighted,
+            RoutingStrategy::Fixed,
+        ] {
+            let j = serde_json::to_string(&s).unwrap();
+            let back: RoutingStrategy = serde_json::from_str(&j).unwrap();
+            assert_eq!(s, back);
+        }
+    }
+
+    #[test]
+    fn target_weight_defaults_to_one() {
+        let v = serde_json::json!({
+            "provider_id": "p",
+            "model_id": "m",
+            "upstream_key_id": "k",
+            "provider_kind": "openai"
+        });
+        let t: RouteTarget = serde_json::from_value(v).unwrap();
+        assert_eq!(t.weight, 1);
     }
 }

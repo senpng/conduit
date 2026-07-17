@@ -19,7 +19,10 @@ use conduit_pipeline::{
     UpstreamAuth,
 };
 use conduit_quota::engine::InMemoryQuotaEngine;
-use conduit_router::table::{Route, RoutingStrategy, RoutingTable};
+use conduit_router::{
+    table::{Route, RoutingStrategy, RoutingTable},
+    AffinityStore,
+};
 use conduit_store::{KeyRepo, PricingRepo, RouteRepo};
 use conduit_trace::{
     sink::{TraceSink, TraceSubscriber},
@@ -89,6 +92,20 @@ pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
     // ── Quota engine: RPM + usage ledger (independent of traces) ─────────────
     let record_fn = make_record_fn(pool.clone());
     let quota = Arc::new(InMemoryQuotaEngine::new(record_fn));
+
+    // Periodically purge stale RPM buckets so the in-memory counter's memory is
+    // bounded (each unique key+minute pair otherwise lives forever).
+    {
+        let rpm_counter = quota.rpm_counter();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                rpm_counter.cleanup_old_buckets().await;
+            }
+        });
+    }
 
     // ── key_policy_fn: async BLAKE3-hash bearer → DB lookup (no block_on) ────
     let key_pool = pool.clone();
@@ -169,6 +186,7 @@ pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
         pricing_fn,
         quota: quota.clone(),
         key_policy_fn,
+        affinity: Arc::new(AffinityStore::new()),
     })));
 
     // ── Assemble DaemonState ──────────────────────────────────────────────────
@@ -221,15 +239,34 @@ pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
     let gateway_listener = TcpListener::bind(gateway_addr).await?;
     let admin_listener = TcpListener::bind(admin_addr).await?;
 
-    let shutdown_signal = async {
+    // Broadcast a single Ctrl-C to both servers so gateway *and* admin drain
+    // gracefully (previously only the gateway had graceful shutdown; admin
+    // connections were cut abruptly when the select! completed).
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let admin_shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         info!("shutdown signal received");
+        let _ = shutdown_tx.send(true);
+    });
+
+    let wait_for_shutdown = |mut rx: tokio::sync::watch::Receiver<bool>| async move {
+        // Resolve once the signal flips to true (or the sender is dropped).
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
     };
 
-    tokio::select! {
-        res = axum::serve(gateway_listener, gateway).with_graceful_shutdown(shutdown_signal) => { res?; }
-        res = axum::serve(admin_listener, admin) => { res?; }
-    }
+    let gateway_srv = axum::serve(gateway_listener, gateway)
+        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx));
+    let admin_srv = axum::serve(admin_listener, admin)
+        .with_graceful_shutdown(wait_for_shutdown(admin_shutdown_rx));
+
+    let (gateway_res, admin_res) = tokio::join!(gateway_srv, admin_srv);
+    gateway_res?;
+    admin_res?;
 
     // ── Graceful shutdown sequence (each step with 30s timeout) ──────────────
     info!("flushing trace sink...");
@@ -449,10 +486,10 @@ pub fn rows_to_routes(
             }
             let retry_policy: conduit_router::policy::RetryPolicy =
                 serde_json::from_str(&row.retry_policy_json).unwrap_or_default();
-            let strategy = if row.strategy == "fallback" {
-                RoutingStrategy::Fallback
-            } else {
-                RoutingStrategy::Fixed
+            let strategy = match row.strategy.as_str() {
+                "fallback" => RoutingStrategy::Fallback,
+                "weighted" | "weight" | "lb" => RoutingStrategy::Weighted,
+                _ => RoutingStrategy::Fixed,
             };
             Ok(Route {
                 alias: row.match_alias,
@@ -594,6 +631,7 @@ mod hotpath_tests {
                 upstream_key_id: "k1".into(),
                 provider_kind: "openai".into(),
                 base_url: Some("https://api.openai.com".into()),
+                weight: 1,
             }],
             retry_policy: RetryPolicy::default(),
         }])

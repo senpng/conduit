@@ -19,7 +19,7 @@ pub mod stream_probe;
 
 pub use context::{IngressWire, PipelineContext};
 pub use handle::{
-    AuthFn, BoxFut, KeyPolicyFn, PipelineDeps, PipelineHandle, PipelineResult, PricingFn, SecretFn,
+    AuthFn, BoxFut, KeyPolicyFn, PipelineDeps, PipelineHandle, PipelineResult, PricingFn,
 };
 pub use ingress::KeyPolicy;
 pub use provider::{ProviderKind, UpstreamAuth};

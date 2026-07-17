@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use conduitctl::dto::{UpdateSettingsBody, UpdateTraceSettingsBody};
-use conduitctl::AdminClient;
+use conduitctl::{
+    dto::{UpdateSettingsBody, UpdateTraceSettingsBody},
+    AdminClient,
+};
 
 #[derive(Debug, Parser)]
 pub struct SettingsArgs {

@@ -169,7 +169,12 @@ impl WireCodec for OpenAiResponsesCodec {
                         }));
                     }
                     for c in &msg.content {
-                        if let CanonicalContent::ToolUse { id, name, input: args } = c {
+                        if let CanonicalContent::ToolUse {
+                            id,
+                            name,
+                            input: args,
+                        } = c
+                        {
                             let args_str = if args.is_string() {
                                 args.as_str().unwrap_or("{}").to_string()
                             } else {
@@ -280,7 +285,7 @@ impl WireCodec for OpenAiResponsesCodec {
         body: Value,
         alias: &str,
     ) -> Result<(CanonicalChatResponse, LossReport), CodecError> {
-        let loss = LossReport::default();
+        let mut loss = LossReport::default();
         let id = body
             .get("id")
             .and_then(|v| v.as_str())
@@ -313,6 +318,13 @@ impl WireCodec for OpenAiResponsesCodec {
                                             text: text.to_string(),
                                         });
                                     }
+                                } else {
+                                    loss.add(
+                                        "output[].content[].type",
+                                        pty,
+                                        "(dropped)",
+                                        "unknown Responses message content part has no IR representation; skipped",
+                                    );
                                 }
                             }
                         }
@@ -344,7 +356,14 @@ impl WireCodec for OpenAiResponsesCodec {
                             });
                         }
                     }
-                    _ => {}
+                    other => {
+                        loss.add(
+                            "output[].type",
+                            other,
+                            "(dropped)",
+                            "unknown Responses output item type has no IR representation; skipped",
+                        );
+                    }
                 }
             }
         }
@@ -504,10 +523,7 @@ fn decode_responses_sse_event_stateful(
     v: &Value,
 ) -> Vec<CanonicalChunk> {
     let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    let output_index = v
-        .get("output_index")
-        .and_then(|i| i.as_u64())
-        .unwrap_or(0) as u32;
+    let output_index = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
 
     match ty {
         // ── Text ──────────────────────────────────────────────────────────
@@ -578,15 +594,11 @@ fn decode_responses_sse_event_stateful(
                     }
                     state.saw_tool = true;
                     let mut out = vec![CanonicalChunk {
-                        request_id: String::new(),
-                        index: 0,
                         block_index: output_index,
                         block_kind: Some(BlockKind::ToolUse),
-                        delta: None,
-                        finish_reason: None,
-                        usage: None,
                         tool_use_id: if id.is_empty() { None } else { Some(id) },
                         tool_name: if name.is_empty() { None } else { Some(name) },
+                        ..Default::default()
                     }];
                     // Only take complete arguments on `added` when non-empty and
                     // not just "{}". Prefer live `function_call_arguments.delta`.
@@ -595,17 +607,12 @@ fn decode_responses_sse_event_stateful(
                         if !args.is_empty() && args != "{}" && !state.saw_tool_args {
                             state.saw_tool_args = true;
                             out.push(CanonicalChunk {
-                                request_id: String::new(),
-                                index: 0,
                                 block_index: output_index,
                                 block_kind: Some(BlockKind::ToolUse),
                                 delta: Some(BlockDelta::InputJsonDelta {
                                     partial_json: args.to_string(),
                                 }),
-                                finish_reason: None,
-                                usage: None,
-                                tool_use_id: None,
-                                tool_name: None,
+                                ..Default::default()
                             });
                         }
                     }
@@ -633,17 +640,10 @@ fn decode_responses_sse_event_stateful(
             state.saw_tool = true;
             state.saw_tool_args = true;
             vec![CanonicalChunk {
-                request_id: String::new(),
-                index: 0,
                 block_index: output_index,
                 block_kind: Some(BlockKind::ToolUse),
-                delta: Some(BlockDelta::InputJsonDelta {
-                    partial_json: args,
-                }),
-                finish_reason: None,
-                usage: None,
-                tool_use_id: None,
-                tool_name: None,
+                delta: Some(BlockDelta::InputJsonDelta { partial_json: args }),
+                ..Default::default()
             }]
         }
         "response.function_call_arguments.done" => {
@@ -662,17 +662,10 @@ fn decode_responses_sse_event_stateful(
             state.saw_tool = true;
             state.saw_tool_args = true;
             vec![CanonicalChunk {
-                request_id: String::new(),
-                index: 0,
                 block_index: output_index,
                 block_kind: Some(BlockKind::ToolUse),
-                delta: Some(BlockDelta::InputJsonDelta {
-                    partial_json: args,
-                }),
-                finish_reason: None,
-                usage: None,
-                tool_use_id: None,
-                tool_name: None,
+                delta: Some(BlockDelta::InputJsonDelta { partial_json: args }),
+                ..Default::default()
             }]
         }
         "response.output_item.done" => {
@@ -718,31 +711,20 @@ fn decode_responses_sse_event_stateful(
                     if !state.saw_tool && (!id.is_empty() || !name.is_empty()) {
                         state.saw_tool = true;
                         out.push(CanonicalChunk {
-                            request_id: String::new(),
-                            index: 0,
                             block_index: output_index,
                             block_kind: Some(BlockKind::ToolUse),
-                            delta: None,
-                            finish_reason: None,
-                            usage: None,
                             tool_use_id: if id.is_empty() { None } else { Some(id) },
                             tool_name: if name.is_empty() { None } else { Some(name) },
+                            ..Default::default()
                         });
                     }
                     if !state.saw_tool_args && !args.is_empty() && args != "{}" {
                         state.saw_tool_args = true;
                         out.push(CanonicalChunk {
-                            request_id: String::new(),
-                            index: 0,
                             block_index: output_index,
                             block_kind: Some(BlockKind::ToolUse),
-                            delta: Some(BlockDelta::InputJsonDelta {
-                                partial_json: args,
-                            }),
-                            finish_reason: None,
-                            usage: None,
-                            tool_use_id: None,
-                            tool_name: None,
+                            delta: Some(BlockDelta::InputJsonDelta { partial_json: args }),
+                            ..Default::default()
                         });
                     }
                     out
@@ -795,7 +777,9 @@ fn decode_responses_sse_event_stateful(
 
             // Buffered / incomplete streams: recover content from terminal
             // `response.output` only when we never saw live deltas.
-            if let Some(output) = response.and_then(|r| r.get("output")).and_then(|o| o.as_array())
+            if let Some(output) = response
+                .and_then(|r| r.get("output"))
+                .and_then(|o| o.as_array())
             {
                 for (idx, item) in output.iter().enumerate() {
                     let item_ty = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -829,35 +813,20 @@ fn decode_responses_sse_event_stateful(
                             if !state.saw_tool && (!id.is_empty() || !name.is_empty()) {
                                 state.saw_tool = true;
                                 out.push(CanonicalChunk {
-                                    request_id: String::new(),
-                                    index: 0,
                                     block_index: idx as u32,
                                     block_kind: Some(BlockKind::ToolUse),
-                                    delta: None,
-                                    finish_reason: None,
-                                    usage: None,
                                     tool_use_id: if id.is_empty() { None } else { Some(id) },
-                                    tool_name: if name.is_empty() {
-                                        None
-                                    } else {
-                                        Some(name)
-                                    },
+                                    tool_name: if name.is_empty() { None } else { Some(name) },
+                                    ..Default::default()
                                 });
                             }
                             if !state.saw_tool_args && !args.is_empty() && args != "{}" {
                                 state.saw_tool_args = true;
                                 out.push(CanonicalChunk {
-                                    request_id: String::new(),
-                                    index: 0,
                                     block_index: idx as u32,
                                     block_kind: Some(BlockKind::ToolUse),
-                                    delta: Some(BlockDelta::InputJsonDelta {
-                                        partial_json: args,
-                                    }),
-                                    finish_reason: None,
-                                    usage: None,
-                                    tool_use_id: None,
-                                    tool_name: None,
+                                    delta: Some(BlockDelta::InputJsonDelta { partial_json: args }),
+                                    ..Default::default()
                                 });
                             }
                         }
@@ -867,14 +836,10 @@ fn decode_responses_sse_event_stateful(
                                     if part.get("type").and_then(|t| t.as_str())
                                         == Some("summary_text")
                                     {
-                                        if let Some(t) = part.get("text").and_then(|x| x.as_str())
-                                        {
+                                        if let Some(t) = part.get("text").and_then(|x| x.as_str()) {
                                             if !t.is_empty() {
                                                 state.saw_thinking = true;
-                                                out.push(thinking_chunk(
-                                                    t.to_string(),
-                                                    idx as u32,
-                                                ));
+                                                out.push(thinking_chunk(t.to_string(), idx as u32));
                                             }
                                         }
                                     }
@@ -905,14 +870,9 @@ fn decode_responses_sse_event_stateful(
 
             out.push(CanonicalChunk {
                 request_id,
-                index: 0,
-                block_index: 0,
-                block_kind: None,
-                delta: None,
                 finish_reason: Some(finish_reason),
                 usage,
-                tool_use_id: None,
-                tool_name: None,
+                ..Default::default()
             });
             out
         }
@@ -1118,14 +1078,12 @@ mod tests {
     fn decode_function_call_added_and_args() {
         let mut st = ResponsesStreamState::default();
         let added = r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c1","name":"search"}}"#;
-        let (chunks, _) =
-            OpenAiResponsesCodec::decode_chunk_stateful(&mut st, added).unwrap();
+        let (chunks, _) = OpenAiResponsesCodec::decode_chunk_stateful(&mut st, added).unwrap();
         assert_eq!(chunks[0].tool_use_id.as_deref(), Some("c1"));
         assert_eq!(chunks[0].tool_name.as_deref(), Some("search"));
 
         let args = r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"q\":1}"}"#;
-        let (chunks, _) =
-            OpenAiResponsesCodec::decode_chunk_stateful(&mut st, args).unwrap();
+        let (chunks, _) = OpenAiResponsesCodec::decode_chunk_stateful(&mut st, args).unwrap();
         assert!(matches!(
             &chunks[0].delta,
             Some(BlockDelta::InputJsonDelta { partial_json }) if partial_json.contains("q")
@@ -1147,8 +1105,7 @@ mod tests {
                 r#"{{"type":"response.function_call_arguments.delta","output_index":0,"delta":{}}}"#,
                 serde_json::to_string(part).unwrap()
             );
-            let (chunks, _) =
-                OpenAiResponsesCodec::decode_chunk_stateful(&mut st, &ev).unwrap();
+            let (chunks, _) = OpenAiResponsesCodec::decode_chunk_stateful(&mut st, &ev).unwrap();
             assert_eq!(chunks.len(), 1);
         }
         // .done with full args must be ignored
@@ -1177,10 +1134,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !chunks.iter().any(|c| matches!(
-                &c.delta,
-                Some(BlockDelta::InputJsonDelta { .. })
-            )),
+            !chunks
+                .iter()
+                .any(|c| matches!(&c.delta, Some(BlockDelta::InputJsonDelta { .. }))),
             "completed must not re-emit args: {chunks:?}"
         );
 
@@ -1194,8 +1150,7 @@ mod tests {
             r#"{"type":"response.completed","response":{"id":"r1","output":[{"type":"function_call","call_id":"c1","name":"Bash","arguments":"{\"command\":\"pwd\"}"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#,
         ];
         for ev in events {
-            let (chunks, _) =
-                OpenAiResponsesCodec::decode_chunk_stateful(&mut st2, ev).unwrap();
+            let (chunks, _) = OpenAiResponsesCodec::decode_chunk_stateful(&mut st2, ev).unwrap();
             for c in chunks {
                 if let Some(BlockDelta::InputJsonDelta { partial_json }) = c.delta {
                     acc.push_str(&partial_json);
@@ -1253,8 +1208,7 @@ mod tests {
                 "output":[{"type":"message","content":[{"type":"output_text","text":"hi DUPLICATE"}]}]
             }
         }"#;
-        let (chunks, _) =
-            OpenAiResponsesCodec::decode_chunk_stateful(&mut st, done).unwrap();
+        let (chunks, _) = OpenAiResponsesCodec::decode_chunk_stateful(&mut st, done).unwrap();
         assert!(
             !chunks.iter().any(|c| matches!(
                 &c.delta,
@@ -1274,9 +1228,7 @@ mod tests {
             content: vec![
                 CanonicalContent::ToolResult {
                     tool_use_id: "c1".into(),
-                    content: vec![CanonicalContent::Text {
-                        text: "ok".into(),
-                    }],
+                    content: vec![CanonicalContent::Text { text: "ok".into() }],
                     is_error: None,
                 },
                 CanonicalContent::Text {

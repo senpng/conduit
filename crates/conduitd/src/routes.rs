@@ -9,8 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use conduit_codec::anthropic::AnthropicCodec;
-use conduit_codec::{openai::OpenAiCodec, WireCodec};
+use conduit_codec::{anthropic::AnthropicCodec, openai::OpenAiCodec, WireCodec};
 use conduit_ir::error::GatewayError;
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -28,17 +27,16 @@ fn headers_for_audit(headers: &HeaderMap) -> Value {
     for (name, value) in headers.iter() {
         let key = name.as_str().to_string();
         let raw = value.to_str().unwrap_or("<non-utf8>");
-        map.entry(key).or_default().push(redact_header_value(name.as_str(), raw));
+        map.entry(key)
+            .or_default()
+            .push(redact_header_value(name.as_str(), raw));
     }
     let mut obj = serde_json::Map::new();
     for (k, mut vs) in map {
         if vs.len() == 1 {
             obj.insert(k, Value::String(vs.pop().unwrap()));
         } else {
-            obj.insert(
-                k,
-                Value::Array(vs.into_iter().map(Value::String).collect()),
-            );
+            obj.insert(k, Value::Array(vs.into_iter().map(Value::String).collect()));
         }
     }
     Value::Object(obj)
@@ -475,11 +473,9 @@ pub async fn messages(
         Err(e) => {
             let status = status_for_gateway_error(&e);
             let body = match &e {
-                GatewayError::Unauthorized(msg) => AnthropicCodec::error_body(
-                    "authentication_error",
-                    Some("invalid_api_key"),
-                    msg,
-                ),
+                GatewayError::Unauthorized(msg) => {
+                    AnthropicCodec::error_body("authentication_error", Some("invalid_api_key"), msg)
+                }
                 GatewayError::Routing(msg) => {
                     AnthropicCodec::error_body("not_found_error", None, msg)
                 }
@@ -564,7 +560,9 @@ mod auth_status_tests {
 /// Tests that hit shipped Anthropic codec + route surface (no parallel reimplementation).
 #[cfg(test)]
 mod messages_ingress_tests {
-    use conduit_codec::anthropic::stream::{encode_chunk, encode_message_start, encode_message_stop};
+    use conduit_codec::anthropic::stream::{
+        encode_chunk, encode_message_start, encode_message_stop,
+    };
     use conduit_ir::canonical::{
         BlockDelta, BlockKind, CanonicalChatResponse, CanonicalChunk, CanonicalMessage,
         FinishReason, Usage,
@@ -590,7 +588,10 @@ mod messages_ingress_tests {
         assert_eq!(req.alias, "claude-sonnet-4");
         assert_eq!(req.sampling.max_tokens, Some(256));
         assert!(!req.messages.is_empty());
-        assert_eq!(req.messages.last().unwrap().role, conduit_ir::canonical::Role::User);
+        assert_eq!(
+            req.messages.last().unwrap().role,
+            conduit_ir::canonical::Role::User
+        );
     }
 
     #[test]

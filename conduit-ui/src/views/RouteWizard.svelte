@@ -20,6 +20,7 @@
     model_id: string;
     upstream_key_id: string;
     base_url: string;
+    weight: number;
   }
 
   interface ExistingTarget {
@@ -28,6 +29,7 @@
     model_id?: string;
     upstream_key_id?: string;
     base_url?: string;
+    weight?: number;
   }
 
   let providers = $state<Provider[]>([]);
@@ -57,6 +59,7 @@
             model_id: t.model_id ?? "",
             upstream_key_id: t.upstream_key_id ?? "",
             base_url: t.base_url ?? "",
+            weight: typeof t.weight === "number" && t.weight >= 0 ? t.weight : 1,
           }));
         } catch {
           app.toast("Existing targets_json is not valid JSON — starting empty", "warn");
@@ -73,7 +76,14 @@
   function addTarget() {
     targets = [
       ...targets,
-      { provider_id: "", provider_kind: "", model_id: "", upstream_key_id: "", base_url: "" },
+      {
+        provider_id: "",
+        provider_kind: "",
+        model_id: "",
+        upstream_key_id: "",
+        base_url: "",
+        weight: 1,
+      },
     ];
   }
 
@@ -121,6 +131,9 @@
     if (strategy === "fixed" && targets.length > 1) {
       app.toast("Fixed strategy only uses target #0; extras kept for reference", "warn");
     }
+    if ((strategy === "fallback" || strategy === "weighted") && targets.length < 2) {
+      app.toast("Multi-target strategies with one target behave like fixed", "warn");
+    }
     busy = true;
     try {
       const body = {
@@ -131,6 +144,7 @@
           provider_kind: t.provider_kind,
           model_id: t.model_id.trim(),
           upstream_key_id: t.upstream_key_id.trim(),
+          weight: Math.max(0, Math.floor(Number(t.weight) || 0)),
           ...(t.base_url.trim() ? { base_url: t.base_url.trim() } : {}),
         })),
         retry_policy: retryJson.trim() ? JSON.parse(retryJson) : undefined,
@@ -164,15 +178,30 @@
       Strategy
       <select bind:value={strategy}>
         <option value="fixed">Fixed — always target #0</option>
-        <option value="fallback">Fallback — try in order</option>
+        <option value="fallback">Fallback — ordered failover + sticky</option>
+        <option value="weighted">Weighted — LB by weight + sticky</option>
       </select>
+      {#if strategy === "fallback"}
+        <span class="field-hint">
+          Sticky: last successful provider per downstream key + alias is tried first
+          (in-process pin; clears on daemon restart). Retries walk remaining targets.
+        </span>
+      {:else if strategy === "weighted"}
+        <span class="field-hint">
+          Attempt 0 picks by relative weight; sticky pin overrides when present.
+          Retries walk remaining targets in table order.
+        </span>
+      {/if}
     </label>
   </div>
 
   <div>
     <div class="row-between" style="margin-bottom:8px">
       <span class="panel-title">
-        Targets {#if strategy === "fallback"}(attempt order){/if}
+        Targets
+        {#if strategy === "fallback"}(default order; sticky first)
+        {:else if strategy === "weighted"}(weights for LB; sticky overrides)
+        {/if}
       </span>
       <button class="btn-ghost btn-sm" onclick={addTarget}>＋ Add target</button>
     </div>
@@ -192,6 +221,17 @@
             placeholder="upstream_key_id"
             title="Secret scope binding; defaults to provider id"
           />
+          {#if strategy === "weighted"}
+            <input
+              type="number"
+              min="0"
+              step="1"
+              style="width:4.5rem"
+              bind:value={t.weight}
+              title="Relative weight (0 = never first-picked by LB)"
+              placeholder="weight"
+            />
+          {/if}
           <div class="target-actions">
             <button class="btn-icon" title="Move up" disabled={i === 0} onclick={() => move(i, -1)}>↑</button>
             <button class="btn-icon" title="Move down" disabled={i === targets.length - 1} onclick={() => move(i, 1)}>↓</button>

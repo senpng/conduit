@@ -53,15 +53,6 @@ impl ProviderKind {
             Self::GrokOAuth => "grok-oauth",
         }
     }
-
-    /// Pricing / loss report key (codec family).
-    pub fn pricing_kind(self) -> &'static str {
-        match self {
-            Self::OpenAi | Self::GrokOAuth => "openai",
-            Self::Anthropic | Self::ClaudeOAuth => "anthropic",
-            Self::CodexOAuth => "codex",
-        }
-    }
 }
 
 impl std::fmt::Display for ProviderKind {

@@ -1,5 +1,7 @@
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
+// Shared source of truth for pricing kind fallbacks (see `conduit_ir::pricing`).
+use conduit_ir::pricing::pricing_kind_aliases as kind_aliases;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
@@ -65,7 +67,7 @@ impl PricingSnapshot {
             return Some(r.clone());
         }
 
-        for alt in kind_aliases(kind) {
+        for alt in kind_aliases(kind).iter().copied() {
             if let Some(r) = guard
                 .iter()
                 .find(|r| r.provider_kind == alt && r.model_id == model)
@@ -75,7 +77,7 @@ impl PricingSnapshot {
         }
 
         // Prefix: "grok-4.5-build" → "grok-4.5"
-        for alt in std::iter::once(kind).chain(kind_aliases(kind).into_iter()) {
+        for alt in std::iter::once(kind).chain(kind_aliases(kind).iter().copied()) {
             if let Some(r) = guard.iter().find(|r| {
                 r.provider_kind == alt
                     && (model.starts_with(&r.model_id) || r.model_id.starts_with(model))
@@ -96,19 +98,6 @@ impl PricingSnapshot {
     /// Snapshot all rows.
     pub async fn all(&self) -> Vec<PricingRow> {
         self.0.read().await.clone()
-    }
-}
-
-/// Kind aliases used when looking up pricing for OAuth / alternate kind strings.
-fn kind_aliases(kind: &str) -> Vec<&'static str> {
-    match kind.trim().to_ascii_lowercase().as_str() {
-        "grok-oauth" | "grok" | "xai-oauth" => vec!["xai", "grok-oauth", "openai"],
-        "xai" => vec!["grok-oauth", "openai"],
-        "claude-oauth" | "anthropic-oauth" => vec!["anthropic", "claude-oauth"],
-        "codex-oauth" | "codex" => vec!["codex", "codex-oauth", "openai"],
-        "anthropic" => vec!["claude-oauth"],
-        "openai" => vec!["codex-oauth"],
-        _ => vec![],
     }
 }
 
@@ -160,8 +149,8 @@ impl PricingRepo {
         litellm_json: &str,
         sync_date: &str,
     ) -> Result<(usize, usize, usize), StoreError> {
-        let stats = convert_litellm_json(litellm_json, sync_date)
-            .map_err(StoreError::Serialization)?;
+        let stats =
+            convert_litellm_json(litellm_json, sync_date).map_err(StoreError::Serialization)?;
 
         let cache_path = app_dir.join(LITELLM_CACHE_FILENAME);
         let text = serde_json::to_string_pretty(&stats.rows)
@@ -171,9 +160,9 @@ impl PricingRepo {
                 .await
                 .map_err(|e| StoreError::Serialization(format!("create data dir: {e}")))?;
         }
-        tokio::fs::write(&cache_path, text)
-            .await
-            .map_err(|e| StoreError::Serialization(format!("write {LITELLM_CACHE_FILENAME}: {e}")))?;
+        tokio::fs::write(&cache_path, text).await.map_err(|e| {
+            StoreError::Serialization(format!("write {LITELLM_CACHE_FILENAME}: {e}"))
+        })?;
 
         info!(
             path = %cache_path.display(),
@@ -210,8 +199,12 @@ impl PricingRepo {
             .collect();
 
         // Layer 2: last LiteLLM sync (optional).
-        Self::merge_pricing_file(&mut map, &app_dir.join(LITELLM_CACHE_FILENAME), "litellm cache")
-            .await;
+        Self::merge_pricing_file(
+            &mut map,
+            &app_dir.join(LITELLM_CACHE_FILENAME),
+            "litellm cache",
+        )
+        .await;
 
         // Layer 3: operator overrides (highest priority).
         Self::merge_pricing_file(&mut map, &app_dir.join("pricing.json"), "pricing.json").await;
@@ -457,6 +450,9 @@ mod tests {
         let row = repo.get_price("openai", "new-model-xyz").await.unwrap();
         assert!((row.input_per_mtok - 1.0).abs() < 1e-9);
         // OAuth alias emitted
-        assert!(repo.get_price("codex-oauth", "new-model-xyz").await.is_some());
+        assert!(repo
+            .get_price("codex-oauth", "new-model-xyz")
+            .await
+            .is_some());
     }
 }

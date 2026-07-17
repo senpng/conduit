@@ -9,7 +9,7 @@ use conduit_ir::{
     loss::LossReport,
     trace::{TraceEvent, TraceEventKind, WireFormat},
 };
-use conduit_router::table::RoutingTable;
+use conduit_router::{table::RoutingTable, AffinityStore};
 use conduit_trace::sink::TraceSink;
 use futures::stream::BoxStream;
 use tracing::warn;
@@ -34,9 +34,6 @@ pub type KeyPolicyFn =
 /// Resolve upstream_key_id → token + optional OAuth headers.
 pub type AuthFn = Arc<dyn Fn(String) -> BoxFut<Result<UpstreamAuth, GatewayError>> + Send + Sync>;
 
-/// Back-compat alias.
-pub type SecretFn = AuthFn;
-
 /// Pure in-memory pricing lookup (sync). Must not nest block_on / DB I/O.
 pub use super::stream_probe::PricingFn;
 
@@ -55,6 +52,8 @@ pub struct PipelineDeps {
     pub quota: Arc<dyn conduit_quota::engine::QuotaEngine>,
     /// raw bearer → key policy lookup
     pub key_policy_fn: KeyPolicyFn,
+    /// Sticky provider pins for multi-target fallback / weighted routes (process-local).
+    pub affinity: Arc<AffinityStore>,
 }
 
 /// The final result of running a request through the pipeline.
@@ -140,15 +139,21 @@ impl PipelineHandle {
             warn!(error = %e, "failed to enqueue RequestReceived audit event");
         }
 
-        // L3: initial routing decision
-        if let Err(e) = route_request(&mut ctx) {
-            let _ = self.deps.trace_sink.send(TraceEvent::with_trace_id(
+        // L3: initial routing decision (affinity pin from last success for this key+alias)
+        let preferred = ctx
+            .downstream_key_id
+            .as_deref()
+            .and_then(|k| self.deps.affinity.preferred(k, &ctx.request.alias));
+        if let Err(e) = route_request(&mut ctx, preferred.as_deref()) {
+            if let Err(se) = self.deps.trace_sink.send(TraceEvent::with_trace_id(
                 ctx.trace_id.clone(),
                 TraceEventKind::Error {
                     kind: "RoutingError".into(),
                     message: e.to_string(),
                 },
-            ));
+            )) {
+                warn!(error = %se, "trace sink enqueue failed; RoutingError event dropped");
+            }
             return Err(e);
         }
 
@@ -156,13 +161,15 @@ impl PipelineHandle {
         let mut auth = match self.resolve_auth(&resolved.upstream_key_id).await {
             Ok(a) => a,
             Err(e) => {
-                let _ = self.deps.trace_sink.send(TraceEvent::with_trace_id(
+                if let Err(se) = self.deps.trace_sink.send(TraceEvent::with_trace_id(
                     ctx.trace_id.clone(),
                     TraceEventKind::Error {
                         kind: "AuthError".into(),
                         message: e.to_string(),
                     },
-                ));
+                )) {
+                    warn!(error = %se, "trace sink enqueue failed; AuthError event dropped");
+                }
                 return Err(e);
             }
         };
@@ -221,13 +228,9 @@ impl PipelineHandle {
                     egress::finalize(&mut ctx, cost_usd);
 
                     // Usage ledger is independent of traces (which may be toggled off later).
-                    self.record_usage(
-                        &ctx,
-                        &resolved,
-                        cost_usd,
-                        /* stream */ false,
-                    )
-                    .await;
+                    self.record_usage(&ctx, &resolved, cost_usd, /* stream */ false)
+                        .await;
+                    self.remember_affinity(&ctx, &resolved);
 
                     self.flush_events(&mut ctx);
 
@@ -237,7 +240,11 @@ impl PipelineHandle {
                 Err(e) => {
                     let table = ctx.routing_table.clone();
                     if should_retry(&mut ctx, &table, &e) {
-                        if let Err(routing_err) = route_request(&mut ctx) {
+                        let preferred = ctx
+                            .downstream_key_id
+                            .as_deref()
+                            .and_then(|k| self.deps.affinity.preferred(k, &ctx.request.alias));
+                        if let Err(routing_err) = route_request(&mut ctx, preferred.as_deref()) {
                             self.flush_events_with_error(&mut ctx, routing_err.to_string());
                             return Err(routing_err);
                         }
@@ -279,6 +286,9 @@ impl PipelineHandle {
                 Ok((stream, loss)) => {
                     attach_attempt_loss(&mut ctx.events, &loss);
                     ctx.loss_report = loss;
+                    // Pin the provider that accepted the stream; stream may still
+                    // fail mid-body, but opening is the same sticky signal as chat.
+                    self.remember_affinity(&ctx, &resolved);
                     self.flush_events(&mut ctx);
 
                     let wire_fmt = ctx
@@ -308,7 +318,11 @@ impl PipelineHandle {
                 Err(e) => {
                     let table = ctx.routing_table.clone();
                     if should_retry(&mut ctx, &table, &e) {
-                        if let Err(routing_err) = route_request(&mut ctx) {
+                        let preferred = ctx
+                            .downstream_key_id
+                            .as_deref()
+                            .and_then(|k| self.deps.affinity.preferred(k, &ctx.request.alias));
+                        if let Err(routing_err) = route_request(&mut ctx, preferred.as_deref()) {
                             self.flush_events_with_error(&mut ctx, routing_err.to_string());
                             return Err(routing_err);
                         }
@@ -338,6 +352,33 @@ impl PipelineHandle {
 
     async fn resolve_auth(&self, key_id: &str) -> Result<UpstreamAuth, GatewayError> {
         (self.deps.secret_fn)(key_id.to_string()).await
+    }
+
+    /// Sticky pin for multi-target fallback / weighted (fixed ignores pins).
+    fn remember_affinity(&self, ctx: &PipelineContext, resolved: &ResolvedProvider) {
+        let alias = ctx.request.alias.as_str();
+        let uses_sticky = ctx
+            .routing_table
+            .get(alias)
+            .map(|r| {
+                matches!(
+                    r.strategy,
+                    conduit_router::table::RoutingStrategy::Fallback
+                        | conduit_router::table::RoutingStrategy::Weighted
+                ) && r.targets.len() > 1
+            })
+            .unwrap_or(false);
+        if !uses_sticky {
+            return;
+        }
+        let key = ctx
+            .downstream_key_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("_anonymous");
+        self.deps
+            .affinity
+            .remember(key, alias, &resolved.provider_id);
     }
 
     /// Persist request consumption to the usage ledger (not the trace log).
@@ -427,8 +468,6 @@ fn audit_encode_response(fmt: WireFormat, resp: &CanonicalChatResponse) -> serde
     }
 }
 
-
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -456,6 +495,7 @@ mod hotpath_tests {
                 upstream_key_id: "k1".into(),
                 provider_kind: "openai".into(),
                 base_url: Some("https://api.openai.com".into()),
+                weight: 1,
             }],
             retry_policy: RetryPolicy::default(),
         }])
@@ -551,6 +591,7 @@ mod hotpath_tests {
                     ))
                 })
             }),
+            affinity: Arc::new(AffinityStore::new()),
         }));
 
         match handle
@@ -584,6 +625,7 @@ mod hotpath_tests {
             pricing_fn: Arc::new(|_, _| None),
             quota: Arc::new(NoopQuotaEngine),
             key_policy_fn: Arc::new(|_| Box::pin(async { Ok(None) })),
+            affinity: Arc::new(AffinityStore::new()),
         }));
 
         match handle
@@ -653,6 +695,7 @@ mod hotpath_tests {
             pricing_fn: Arc::new(|_, _| None),
             quota: Arc::new(CapturingQuota { ids: checked_ids2 }),
             key_policy_fn: policy_for(raw_bearer, stable_id),
+            affinity: Arc::new(AffinityStore::new()),
         }));
 
         // Will fail at upstream (no mock server) but identity path must run first.

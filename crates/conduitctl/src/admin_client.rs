@@ -11,11 +11,13 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinHandle};
 
-use crate::dto::{
-    CreateKeyBody, CreateProviderBody, CreateRouteBody, HealthResponse, KeyCreateResponse,
-    TraceListResponse,
+use crate::{
+    dto::{
+        CreateKeyBody, CreateProviderBody, CreateRouteBody, HealthResponse, KeyCreateResponse,
+        TraceListResponse,
+    },
+    util::sse::{classify_sse_frame, parse_sse_frame, SseFrame},
 };
-use crate::util::sse::{classify_sse_frame, parse_sse_frame, SseFrame};
 
 /// Errors from admin HTTP / SSE transport.
 #[derive(Debug, Error)]
@@ -226,7 +228,11 @@ impl AdminClient {
     }
 
     /// PUT /admin/routes/{id} — body uses same `targets` array shape as create.
-    pub async fn update_route(&self, id: &str, body: &CreateRouteBody) -> Result<Value, AdminError> {
+    pub async fn update_route(
+        &self,
+        id: &str,
+        body: &CreateRouteBody,
+    ) -> Result<Value, AdminError> {
         let url = format!("{}/admin/routes/{}", self.base, id);
         // UpdateRouteBody fields are optional; send full replace via present fields.
         let payload = serde_json::json!({

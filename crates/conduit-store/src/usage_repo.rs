@@ -61,8 +61,9 @@ impl<'a> UsageRepo<'a> {
     ) -> Result<Vec<UsageRecordRow>, StoreError> {
         let limit = limit.clamp(1, 500) as i64;
         let rows = match key_id {
-            Some(kid) => sqlx::query(
-                r#"SELECT id, ts, request_id, downstream_key_id, alias,
+            Some(kid) => {
+                sqlx::query(
+                    r#"SELECT id, ts, request_id, downstream_key_id, alias,
                           provider_id, provider_kind, model_id,
                           prompt_tokens, completion_tokens, total_tokens,
                           reasoning_tokens, cache_read_tokens, cache_write_tokens,
@@ -71,13 +72,15 @@ impl<'a> UsageRepo<'a> {
                    WHERE downstream_key_id = ?
                    ORDER BY ts DESC
                    LIMIT ?"#,
-            )
-            .bind(kid)
-            .bind(limit)
-            .fetch_all(self.pool)
-            .await,
-            None => sqlx::query(
-                r#"SELECT id, ts, request_id, downstream_key_id, alias,
+                )
+                .bind(kid)
+                .bind(limit)
+                .fetch_all(self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    r#"SELECT id, ts, request_id, downstream_key_id, alias,
                           provider_id, provider_kind, model_id,
                           prompt_tokens, completion_tokens, total_tokens,
                           reasoning_tokens, cache_read_tokens, cache_write_tokens,
@@ -85,10 +88,11 @@ impl<'a> UsageRepo<'a> {
                    FROM usage_records
                    ORDER BY ts DESC
                    LIMIT ?"#,
-            )
-            .bind(limit)
-            .fetch_all(self.pool)
-            .await,
+                )
+                .bind(limit)
+                .fetch_all(self.pool)
+                .await
+            }
         }
         .map_err(|e| StoreError::Sqlx(e.to_string()))?;
 
@@ -99,10 +103,7 @@ impl<'a> UsageRepo<'a> {
     ///
     /// Period is matched on the ISO timestamp prefix (`ts LIKE 'YYYY-MM%'`).
     #[instrument(skip(self))]
-    pub async fn summary_period(
-        &self,
-        period: &str,
-    ) -> Result<Vec<UsageSummaryRow>, StoreError> {
+    pub async fn summary_period(&self, period: &str) -> Result<Vec<UsageSummaryRow>, StoreError> {
         let pattern = format!("{period}%");
         let rows = sqlx::query(
             r#"SELECT
@@ -147,8 +148,9 @@ impl<'a> UsageRepo<'a> {
     ) -> Result<Vec<UsageDayRow>, StoreError> {
         let pattern = format!("{period}%");
         let rows = match key_id {
-            Some(kid) => sqlx::query(
-                r#"SELECT
+            Some(kid) => {
+                sqlx::query(
+                    r#"SELECT
                        substr(ts, 1, 10) AS day,
                        COUNT(*) AS request_count,
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
@@ -157,13 +159,15 @@ impl<'a> UsageRepo<'a> {
                    WHERE ts LIKE ? AND downstream_key_id = ?
                    GROUP BY substr(ts, 1, 10)
                    ORDER BY day ASC"#,
-            )
-            .bind(&pattern)
-            .bind(kid)
-            .fetch_all(self.pool)
-            .await,
-            None => sqlx::query(
-                r#"SELECT
+                )
+                .bind(&pattern)
+                .bind(kid)
+                .fetch_all(self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    r#"SELECT
                        substr(ts, 1, 10) AS day,
                        COUNT(*) AS request_count,
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
@@ -172,10 +176,11 @@ impl<'a> UsageRepo<'a> {
                    WHERE ts LIKE ?
                    GROUP BY substr(ts, 1, 10)
                    ORDER BY day ASC"#,
-            )
-            .bind(&pattern)
-            .fetch_all(self.pool)
-            .await,
+                )
+                .bind(&pattern)
+                .fetch_all(self.pool)
+                .await
+            }
         }
         .map_err(|e| StoreError::Sqlx(e.to_string()))?;
 
@@ -199,8 +204,9 @@ impl<'a> UsageRepo<'a> {
     ) -> Result<Vec<UsageModelRow>, StoreError> {
         let pattern = format!("{period}%");
         let rows = match key_id {
-            Some(kid) => sqlx::query(
-                r#"SELECT
+            Some(kid) => {
+                sqlx::query(
+                    r#"SELECT
                        COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
                        provider_kind,
                        COUNT(*) AS request_count,
@@ -211,13 +217,15 @@ impl<'a> UsageRepo<'a> {
                    GROUP BY COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
                             provider_kind
                    ORDER BY total_usd DESC"#,
-            )
-            .bind(&pattern)
-            .bind(kid)
-            .fetch_all(self.pool)
-            .await,
-            None => sqlx::query(
-                r#"SELECT
+                )
+                .bind(&pattern)
+                .bind(kid)
+                .fetch_all(self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    r#"SELECT
                        COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
                        provider_kind,
                        COUNT(*) AS request_count,
@@ -228,10 +236,11 @@ impl<'a> UsageRepo<'a> {
                    GROUP BY COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
                             provider_kind
                    ORDER BY total_usd DESC"#,
-            )
-            .bind(&pattern)
-            .fetch_all(self.pool)
-            .await,
+                )
+                .bind(&pattern)
+                .fetch_all(self.pool)
+                .await
+            }
         }
         .map_err(|e| StoreError::Sqlx(e.to_string()))?;
 

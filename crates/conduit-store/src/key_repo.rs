@@ -100,15 +100,13 @@ impl<'a> KeyRepo<'a> {
         rate_limit_rpm: Option<i64>,
     ) -> Result<(), StoreError> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "UPDATE downstream_keys SET rate_limit_rpm = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(rate_limit_rpm)
-        .bind(&now)
-        .bind(id)
-        .execute(self.pool)
-        .await
-        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        sqlx::query("UPDATE downstream_keys SET rate_limit_rpm = ?, updated_at = ? WHERE id = ?")
+            .bind(rate_limit_rpm)
+            .bind(&now)
+            .bind(id)
+            .execute(self.pool)
+            .await
+            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
         Ok(())
     }
 

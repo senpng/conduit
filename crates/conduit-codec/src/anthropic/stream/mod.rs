@@ -6,11 +6,11 @@ use conduit_ir::{
     canonical::{BlockDelta, BlockKind, CanonicalChunk},
     error::CodecError,
 };
-use serde_json::Value;
 pub use encoder::{
     encode_message_start_frame, encode_message_stop_frame, finish_reason_to_anthropic,
     AnthropicStreamEncoder, GPT_THINKING_SIGNATURE,
 };
+use serde_json::Value;
 pub use state::{decode_event, AnthropicStreamState};
 
 /// Decode a single Anthropic SSE line pair.
@@ -143,26 +143,17 @@ pub fn encode_message_stop() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use conduit_ir::canonical::BlockDelta;
-
-    use conduit_ir::canonical::FinishReason;
+    use conduit_ir::canonical::{BlockDelta, FinishReason};
 
     use super::*;
 
     #[test]
     fn encode_text_delta_sse() {
         let chunk = CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
-            block_index: 0,
-            block_kind: None,
             delta: Some(BlockDelta::TextDelta {
                 text: "hello".into(),
             }),
-            finish_reason: None,
-            usage: None,
-            tool_use_id: None,
-            tool_name: None,
+            ..Default::default()
         };
         let sse = encode_chunk(&chunk, "resp_1").unwrap();
         assert!(sse.contains("content_block_delta"));
@@ -173,15 +164,11 @@ mod tests {
     #[test]
     fn encode_tool_use_block_start() {
         let chunk = CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
             block_index: 1,
             block_kind: Some(BlockKind::ToolUse),
-            delta: None,
-            finish_reason: None,
-            usage: None,
             tool_use_id: Some("tu_1".into()),
             tool_name: Some("search".into()),
+            ..Default::default()
         };
         let sse = encode_chunk(&chunk, "resp_1").unwrap();
         assert!(sse.contains("content_block_start"));
@@ -192,35 +179,9 @@ mod tests {
     #[test]
     fn encoder_end_to_end_openai_style_text() {
         let mut enc = AnthropicStreamEncoder::new("msg_x", "model");
-        let delta = CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
-            block_index: 0,
-            block_kind: Some(BlockKind::Text),
-            delta: Some(BlockDelta::TextDelta {
-                text: "partial".into(),
-            }),
-            finish_reason: None,
-            usage: None,
-            tool_use_id: None,
-            tool_name: None,
-        };
-        let fin = CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
-            block_index: 0,
-            block_kind: None,
-            delta: None,
-            finish_reason: Some(FinishReason::Stop),
-            usage: None,
-            tool_use_id: None,
-            tool_name: None,
-        };
-        let joined: String = enc
-            .push(&delta)
-            .into_iter()
-            .chain(enc.push(&fin))
-            .collect();
+        let delta = CanonicalChunk::text_delta("partial");
+        let fin = CanonicalChunk::finish(FinishReason::Stop, None);
+        let joined: String = enc.push(&delta).into_iter().chain(enc.push(&fin)).collect();
         assert!(joined.contains("content_block_start"));
         assert!(joined.contains("content_block_stop"));
         assert!(joined.contains("message_stop"));

@@ -114,8 +114,9 @@ pub async fn run(admin_addr: &str, args: TraceArgs, output: &str) -> Result<()> 
 
 #[cfg(test)]
 mod extract_text_tests {
-    use super::extract_assistant_text;
     use serde_json::json;
+
+    use super::extract_assistant_text;
 
     #[test]
     fn openai_message_content() {
@@ -427,9 +428,7 @@ fn print_tail_event(payload: &str, output: &str) {
                     .pointer("/kind/stream")
                     .and_then(|s| s.as_bool())
                     .unwrap_or(false);
-                let latency = v
-                    .pointer("/kind/latency_ms")
-                    .and_then(|n| n.as_u64());
+                let latency = v.pointer("/kind/latency_ms").and_then(|n| n.as_u64());
                 let ttfb = v.pointer("/kind/ttfb_ms").and_then(|n| n.as_u64());
                 let mut parts = Vec::new();
                 if let Some(ms) = latency {

@@ -63,17 +63,7 @@ fn decode_openai_payload(val: &Value) -> Result<Vec<CanonicalChunk>, CodecError>
         if text.is_empty() {
             continue;
         }
-        out.push(CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
-            block_index: 0,
-            block_kind: Some(BlockKind::Thinking),
-            delta: Some(BlockDelta::ThinkingDelta { thinking: text }),
-            finish_reason: None,
-            usage: None,
-            tool_use_id: None,
-            tool_name: None,
-        });
+        out.push(CanonicalChunk::thinking_delta(text));
     }
 
     // Text content (string, array of parts, or null)
@@ -81,17 +71,7 @@ fn decode_openai_payload(val: &Value) -> Result<Vec<CanonicalChunk>, CodecError>
         if text.is_empty() {
             continue;
         }
-        out.push(CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
-            block_index: 0,
-            block_kind: Some(BlockKind::Text),
-            delta: Some(BlockDelta::TextDelta { text }),
-            finish_reason: None,
-            usage: None,
-            tool_use_id: None,
-            tool_name: None,
-        });
+        out.push(CanonicalChunk::text_delta(text));
     }
 
     // Some providers put assistant text in `text` (legacy) or `output_text`
@@ -104,19 +84,7 @@ fn decode_openai_payload(val: &Value) -> Result<Vec<CanonicalChunk>, CodecError>
         for key in ["text", "output_text"] {
             if let Some(t) = content_source[key].as_str() {
                 if !t.is_empty() {
-                    out.push(CanonicalChunk {
-                        request_id: String::new(),
-                        index: 0,
-                        block_index: 0,
-                        block_kind: Some(BlockKind::Text),
-                        delta: Some(BlockDelta::TextDelta {
-                            text: t.to_string(),
-                        }),
-                        finish_reason: None,
-                        usage: None,
-                        tool_use_id: None,
-                        tool_name: None,
-                    });
+                    out.push(CanonicalChunk::text_delta(t.to_string()));
                     break;
                 }
             }
@@ -155,17 +123,7 @@ fn decode_openai_payload(val: &Value) -> Result<Vec<CanonicalChunk>, CodecError>
                 if text.is_empty() {
                     continue;
                 }
-                out.push(CanonicalChunk {
-                    request_id: String::new(),
-                    index: 0,
-                    block_index: 0,
-                    block_kind: Some(BlockKind::Text),
-                    delta: Some(BlockDelta::TextDelta { text }),
-                    finish_reason: None,
-                    usage: None,
-                    tool_use_id: None,
-                    tool_name: None,
-                });
+                out.push(CanonicalChunk::text_delta(text));
             }
         }
     }
@@ -184,17 +142,7 @@ fn decode_openai_payload(val: &Value) -> Result<Vec<CanonicalChunk>, CodecError>
             } else {
                 None
             };
-            out.push(CanonicalChunk {
-                request_id: String::new(),
-                index: 0,
-                block_index: 0,
-                block_kind: None,
-                delta: None,
-                finish_reason: Some(finish_reason),
-                usage,
-                tool_use_id: None,
-                tool_name: None,
-            });
+            out.push(CanonicalChunk::finish(finish_reason, usage));
         }
     } else if !val["usage"].is_null() && out.is_empty() {
         let usage = decode_usage(&val["usage"]);
@@ -208,15 +156,8 @@ fn decode_openai_payload(val: &Value) -> Result<Vec<CanonicalChunk>, CodecError>
 
 fn usage_only_chunk(usage: Usage) -> CanonicalChunk {
     CanonicalChunk {
-        request_id: String::new(),
-        index: 0,
-        block_index: 0,
-        block_kind: None,
-        delta: None,
-        finish_reason: None,
         usage: Some(usage),
-        tool_use_id: None,
-        tool_name: None,
+        ..Default::default()
     }
 }
 
@@ -236,31 +177,22 @@ fn emit_tool_call_chunks(tc: &Value, out: &mut Vec<CanonicalChunk>) {
 
     if id.is_some() || name.is_some() {
         out.push(CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
             block_index,
             block_kind: Some(BlockKind::ToolUse),
-            delta: None,
-            finish_reason: None,
-            usage: None,
             tool_use_id: id.map(str::to_string),
             tool_name: name.map(str::to_string),
+            ..Default::default()
         });
     }
 
     if !args.is_empty() {
         out.push(CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
             block_index,
             block_kind: Some(BlockKind::ToolUse),
             delta: Some(BlockDelta::InputJsonDelta {
                 partial_json: args.to_string(),
             }),
-            finish_reason: None,
-            usage: None,
-            tool_use_id: None,
-            tool_name: None,
+            ..Default::default()
         });
     }
 }
@@ -635,7 +567,9 @@ mod tests {
             }]
         }"#;
         let chunks = decode_chunks(data).unwrap();
-        assert!(chunks.iter().any(|c| c.tool_use_id.as_deref() == Some("call_x")));
+        assert!(chunks
+            .iter()
+            .any(|c| c.tool_use_id.as_deref() == Some("call_x")));
         assert!(chunks.iter().any(|c| matches!(
             &c.delta,
             Some(BlockDelta::InputJsonDelta { partial_json }) if partial_json.contains("\"p\"")

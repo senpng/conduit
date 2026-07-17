@@ -332,10 +332,7 @@ impl AnthropicStreamEncoder {
             (
                 acc.id.clone(),
                 acc.name.clone(),
-                acc.closed
-                    || acc.start_emitted
-                    || acc.name.is_empty()
-                    || acc.id.is_empty(),
+                acc.closed || acc.start_emitted || acc.name.is_empty() || acc.id.is_empty(),
             )
         };
         if already {
@@ -614,36 +611,19 @@ mod tests {
     use super::*;
 
     fn text_chunk(t: &str) -> CanonicalChunk {
-        CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
-            block_index: 0,
-            block_kind: Some(BlockKind::Text),
-            delta: Some(BlockDelta::TextDelta { text: t.into() }),
-            finish_reason: None,
-            usage: None,
-            tool_use_id: None,
-            tool_name: None,
-        }
+        CanonicalChunk::text_delta(t)
     }
 
     fn finish(fr: FinishReason) -> CanonicalChunk {
-        CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
-            block_index: 0,
-            block_kind: None,
-            delta: None,
-            finish_reason: Some(fr),
-            usage: Some(Usage {
+        CanonicalChunk::finish(
+            fr,
+            Some(Usage {
                 prompt_tokens: 3,
                 completion_tokens: 2,
                 total_tokens: 5,
                 ..Default::default()
             }),
-            tool_use_id: None,
-            tool_name: None,
-        }
+        )
     }
 
     #[test]
@@ -672,19 +652,7 @@ mod tests {
     #[test]
     fn reasoning_then_text() {
         let mut enc = AnthropicStreamEncoder::new("msg_1", "m");
-        let think = CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
-            block_index: 0,
-            block_kind: Some(BlockKind::Thinking),
-            delta: Some(BlockDelta::ThinkingDelta {
-                thinking: "plan".into(),
-            }),
-            finish_reason: None,
-            usage: None,
-            tool_use_id: None,
-            tool_name: None,
-        };
+        let think = CanonicalChunk::thinking_delta("plan");
         let frames: Vec<_> = enc
             .push(&think)
             .into_iter()
@@ -701,28 +669,17 @@ mod tests {
     fn tool_use_lifecycle() {
         let mut enc = AnthropicStreamEncoder::new("msg_1", "m");
         let start = CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
-            block_index: 0,
             block_kind: Some(BlockKind::ToolUse),
-            delta: None,
-            finish_reason: None,
-            usage: None,
             tool_use_id: Some("call_1".into()),
             tool_name: Some("search".into()),
+            ..Default::default()
         };
         let args = CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
-            block_index: 0,
             block_kind: Some(BlockKind::ToolUse),
             delta: Some(BlockDelta::InputJsonDelta {
                 partial_json: r#"{"q":"x"}"#.into(),
             }),
-            finish_reason: None,
-            usage: None,
-            tool_use_id: None,
-            tool_name: None,
+            ..Default::default()
         };
         let frames: Vec<_> = enc
             .push(&start)
@@ -758,41 +715,19 @@ mod tests {
     fn anthropic_native_tool_stop_before_finish_does_not_reemit() {
         let mut enc = AnthropicStreamEncoder::new("msg_1", "claude-opus");
         let start = CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
-            block_index: 0,
             block_kind: Some(BlockKind::ToolUse),
-            delta: None,
-            finish_reason: None,
-            usage: None,
             tool_use_id: Some("toolu_abc".into()),
             tool_name: Some("Bash".into()),
+            ..Default::default()
         };
         let args = CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
-            block_index: 0,
-            block_kind: None,
             delta: Some(BlockDelta::InputJsonDelta {
                 partial_json: r#"{"command":"pwd"}"#.into(),
             }),
-            finish_reason: None,
-            usage: None,
-            tool_use_id: None,
-            tool_name: None,
+            ..Default::default()
         };
         // Explicit content_block_stop (all fields empty except block_index).
-        let block_stop = CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
-            block_index: 0,
-            block_kind: None,
-            delta: None,
-            finish_reason: None,
-            usage: None,
-            tool_use_id: None,
-            tool_name: None,
-        };
+        let block_stop = CanonicalChunk::default();
         let frames: Vec<_> = enc
             .push(&start)
             .into_iter()
@@ -809,8 +744,7 @@ mod tests {
             "expected single tool block start, got:\n{joined}"
         );
         assert!(
-            joined.contains(r#"{"command":"pwd"}"#)
-                || joined.contains(r#"\"command\":\"pwd\""#)
+            joined.contains(r#"{"command":"pwd"}"#) || joined.contains(r#"\"command\":\"pwd\""#)
         );
         // Ensure we did not emit a second tool_use start after stop.
         let first_stop = joined.find("event: content_block_stop").expect("stop");
@@ -825,39 +759,22 @@ mod tests {
     fn two_anthropic_tools_stop_then_finish_once_each() {
         let mut enc = AnthropicStreamEncoder::new("msg_1", "claude-opus");
         let mk_start = |idx: u32, id: &str, name: &str| CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
             block_index: idx,
             block_kind: Some(BlockKind::ToolUse),
-            delta: None,
-            finish_reason: None,
-            usage: None,
             tool_use_id: Some(id.into()),
             tool_name: Some(name.into()),
+            ..Default::default()
         };
         let mk_args = |idx: u32, json: &str| CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
             block_index: idx,
-            block_kind: None,
             delta: Some(BlockDelta::InputJsonDelta {
                 partial_json: json.into(),
             }),
-            finish_reason: None,
-            usage: None,
-            tool_use_id: None,
-            tool_name: None,
+            ..Default::default()
         };
         let mk_stop = |idx: u32| CanonicalChunk {
-            request_id: String::new(),
-            index: 0,
             block_index: idx,
-            block_kind: None,
-            delta: None,
-            finish_reason: None,
-            usage: None,
-            tool_use_id: None,
-            tool_name: None,
+            ..Default::default()
         };
 
         let frames: Vec<_> = enc

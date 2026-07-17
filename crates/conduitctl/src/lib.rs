@@ -4,9 +4,7 @@ pub mod admin_client;
 pub mod dto;
 pub mod util;
 
-pub use admin_client::{
-    provider_create_request_body, route_admin_path, AdminClient, AdminError,
-};
+pub use admin_client::{provider_create_request_body, route_admin_path, AdminClient, AdminError};
 pub use dto::{
     CreateKeyBody, CreateProviderBody, CreateRouteBody, HealthResponse, KeyCreateResponse,
     TraceIndexRowDto, TraceListResponse,
