@@ -41,6 +41,7 @@ pub fn route_request(
         model_id: decision.model_id,
         upstream_key_id: decision.upstream_key_id,
         attempt_no: decision.attempt_no,
+        request_overrides: decision.request_overrides,
         attempt_loss: None,
     });
 
@@ -148,5 +149,37 @@ mod tests {
         let second = ctx.resolved.as_ref().unwrap().provider_id.clone();
         assert_eq!(second, "b");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn routing_event_records_selected_target_request_overrides() {
+        let table = Arc::new(RoutingTable::new([Route {
+            alias: "lb".into(),
+            strategy: RoutingStrategy::Fixed,
+            targets: vec![RouteTarget {
+                provider_id: "a".into(),
+                model_id: "m".into(),
+                upstream_key_id: "ka".into(),
+                provider_kind: "openai".into(),
+                base_url: None,
+                weight: 1,
+                request_overrides: serde_json::Map::from_iter([(
+                    "service_tier".into(),
+                    serde_json::json!("flex"),
+                )]),
+            }],
+            retry_policy: RetryPolicy::default(),
+        }]));
+        let mut ctx = PipelineContext::new(sample_req(), Some("dk".into()), table);
+
+        route_request(&mut ctx, None).unwrap();
+
+        match &ctx.events[0] {
+            conduit_ir::trace::TraceEventKind::RoutingDecided {
+                request_overrides,
+                ..
+            } => assert_eq!(request_overrides["service_tier"], "flex"),
+            _ => panic!("expected routing_decided event"),
+        }
     }
 }

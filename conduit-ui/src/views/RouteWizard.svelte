@@ -21,6 +21,7 @@
     upstream_key_id: string;
     base_url: string;
     weight: number;
+    request_overrides: string;
   }
 
   interface ExistingTarget {
@@ -30,6 +31,7 @@
     upstream_key_id?: string;
     base_url?: string;
     weight?: number;
+    request_overrides?: Record<string, unknown>;
   }
 
   let providers = $state<Provider[]>([]);
@@ -60,6 +62,9 @@
             upstream_key_id: t.upstream_key_id ?? "",
             base_url: t.base_url ?? "",
             weight: typeof t.weight === "number" && t.weight >= 0 ? t.weight : 1,
+            request_overrides: t.request_overrides
+              ? JSON.stringify(t.request_overrides)
+              : "",
           }));
         } catch {
           app.toast("Existing targets_json is not valid JSON — starting empty", "warn");
@@ -83,6 +88,7 @@
         upstream_key_id: "",
         base_url: "",
         weight: 1,
+        request_overrides: "",
       },
     ];
   }
@@ -114,6 +120,16 @@
       if (!t.provider_id) return `Target #${i}: provider is required`;
       if (!t.model_id.trim()) return `Target #${i}: model_id is required`;
       if (!t.upstream_key_id.trim()) return `Target #${i}: upstream_key_id is required`;
+      if (t.request_overrides.trim()) {
+        try {
+          const overrides = JSON.parse(t.request_overrides);
+          if (!overrides || Array.isArray(overrides) || typeof overrides !== "object") {
+            return `Target #${i}: request overrides must be a JSON object`;
+          }
+        } catch {
+          return `Target #${i}: request overrides must be valid JSON`;
+        }
+      }
     }
     if (retryJson.trim()) {
       try {
@@ -146,6 +162,9 @@
           upstream_key_id: t.upstream_key_id.trim(),
           weight: Math.max(0, Math.floor(Number(t.weight) || 0)),
           ...(t.base_url.trim() ? { base_url: t.base_url.trim() } : {}),
+          ...(t.request_overrides.trim()
+            ? { request_overrides: JSON.parse(t.request_overrides) }
+            : {}),
         })),
         retry_policy: retryJson.trim() ? JSON.parse(retryJson) : undefined,
       };
@@ -237,6 +256,14 @@
             <button class="btn-icon" title="Move down" disabled={i === targets.length - 1} onclick={() => move(i, 1)}>↓</button>
             <button class="btn-icon danger" title="Remove" onclick={() => removeTarget(i)}>✕</button>
           </div>
+          <label class="target-overrides">
+            Request overrides (JSON)
+            <input
+              bind:value={t.request_overrides}
+              placeholder={'{"service_tier":"priority"}'}
+              title="Static fields merged into this target's encoded upstream request"
+            />
+          </label>
         </div>
       {/each}
     </div>

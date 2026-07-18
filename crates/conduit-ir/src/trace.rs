@@ -106,6 +106,9 @@ pub enum TraceEventKind {
         /// Opaque upstream key identifier (not the secret itself).
         upstream_key_id: String,
         attempt_no: u32,
+        /// Static route-target fields merged into this attempt's upstream request.
+        #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+        request_overrides: serde_json::Map<String, Value>,
         /// LossReport from the codec encode step for this attempt.
         /// `None` until the attempt completes and the loss is attached.
         attempt_loss: Option<LossReport>,

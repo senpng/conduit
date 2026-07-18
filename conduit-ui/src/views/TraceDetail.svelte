@@ -56,6 +56,16 @@
     report: unknown;
   }
 
+  interface RequestOverrideFinding {
+    where: string;
+    overrides: Record<string, unknown>;
+  }
+
+  interface UpstreamRequestFinding {
+    where: string;
+    request: unknown;
+  }
+
   /** Fixed scan per design doc: attempt_loss on routing_decided + loss_report on final_usage. */
   const lossFindings = $derived.by((): LossFinding[] => {
     if (!bundle) return [];
@@ -70,6 +80,34 @@
       if (ev.kind?.type === "final_usage" && lossReportNonEmpty(ev.kind.loss_report)) {
         out.push({ where: "final_usage.loss_report", report: ev.kind.loss_report });
       }
+    }
+    return out;
+  });
+
+  const requestOverrideFindings = $derived.by((): RequestOverrideFinding[] => {
+    if (!bundle) return [];
+    const out: RequestOverrideFinding[] = [];
+    for (const ev of bundle.events ?? []) {
+      if (ev.kind?.type !== "routing_decided") continue;
+      const overrides = ev.kind.request_overrides;
+      if (!overrides || Object.keys(overrides).length === 0) continue;
+      out.push({
+        where: `${providerDisplayName(providers, ev.kind.provider_id)} / ${ev.kind.model_id} · attempt #${ev.kind.attempt_no ?? 0}`,
+        overrides,
+      });
+    }
+    return out;
+  });
+
+  const upstreamRequestFindings = $derived.by((): UpstreamRequestFinding[] => {
+    if (!bundle) return [];
+    const out: UpstreamRequestFinding[] = [];
+    for (const ev of bundle.events ?? []) {
+      if (ev.kind?.type !== "upstream_response" || ev.kind.upstream_request == null) continue;
+      out.push({
+        where: `HTTP ${ev.kind.status}${ev.kind.stream ? " · stream" : ""}`,
+        request: ev.kind.upstream_request,
+      });
     }
     return out;
   });
@@ -95,7 +133,7 @@
       case "request_received":
         return `alias=${k.alias}${k.stream ? " · stream" : ""}${k.wire_format ? ` · ${k.wire_format}` : ""}`;
       case "routing_decided":
-        return `${providerDisplayName(providers, k.provider_id)} / ${k.model_id} · attempt #${k.attempt_no ?? 0}`;
+        return `${providerDisplayName(providers, k.provider_id)} / ${k.model_id} · attempt #${k.attempt_no ?? 0}${k.request_overrides && Object.keys(k.request_overrides).length > 0 ? ` · ${Object.keys(k.request_overrides).length} overrides` : ""}`;
       case "stream_delta": {
         const t = k.text_delta?.trim();
         if (t) return `#${k.seq} “${t.length > 48 ? t.slice(0, 48) + "…" : t}”`;
@@ -241,6 +279,34 @@
     <pre class="mono small" style="white-space:pre-wrap; margin:0; padding:12px; background:var(--bg-elevated); border-radius:8px; max-height:70vh; overflow:auto">{(bundle.stream_frames ?? []).join("")}</pre>
   {:else}
     <div style="display:flex; flex-direction:column; gap:14px">
+      <div>
+        <span class="panel-title">Upstream request sent</span>
+        {#if upstreamRequestFindings.length === 0}
+          <p class="dim small" style="margin-top:6px">Not available for this trace.</p>
+        {:else}
+          {#each upstreamRequestFindings as finding, i (i)}
+            <div style="margin-top:8px">
+              <div class="small dim" style="margin-bottom:4px">{finding.where}</div>
+              <JsonView data={finding.request} />
+            </div>
+          {/each}
+        {/if}
+      </div>
+
+      <div>
+        <span class="panel-title">Request overrides</span>
+        {#if requestOverrideFindings.length === 0}
+          <p class="dim small" style="margin-top:6px">No route-target overrides recorded.</p>
+        {:else}
+          {#each requestOverrideFindings as finding, i (i)}
+            <div style="margin-top:8px">
+              <div class="small dim" style="margin-bottom:4px">{finding.where}</div>
+              <JsonView data={finding.overrides} />
+            </div>
+          {/each}
+        {/if}
+      </div>
+
       <div>
         <span class="panel-title">Codec loss</span>
         {#if lossFindings.length === 0}

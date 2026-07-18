@@ -50,6 +50,8 @@ export type TraceEventKind =
       model_id: string;
       upstream_key_id?: string;
       attempt_no?: number;
+      /** Static route-target fields merged into this upstream attempt. */
+      request_overrides?: Record<string, unknown>;
       attempt_loss?: LossReport | null;
     }
   | {
@@ -72,6 +74,9 @@ export type TraceEventKind =
       stream_frames?: string[] | null;
       /** Client-facing response headers set by the gateway. */
       response_headers?: Record<string, string | string[]> | null;
+      /** Exact JSON body sent upstream after codec and route transforms. */
+      upstream_request_headers?: Record<string, string | string[]> | null;
+      upstream_response_headers?: Record<string, string | string[]> | null;
     }
   | {
       type: "final_usage";
