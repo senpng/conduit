@@ -37,6 +37,18 @@ impl KeychainBackend {
     }
 }
 
+/// Detects the "item already exists" condition across keyring backends.
+///
+/// keyring v2 wraps the underlying OS status in `Error::PlatformFailure`
+/// (e.g. macOS `errSecDuplicateItem`, whose message is "The specified item
+/// already exists in the keychain"). There is no dedicated error variant for
+/// it, so we match on the rendered message, which is stable across the
+/// platform backends that surface a duplicate on add.
+fn is_duplicate_item(err: &keyring::Error) -> bool {
+    matches!(err, keyring::Error::PlatformFailure(_))
+        && err.to_string().to_ascii_lowercase().contains("already exists")
+}
+
 #[async_trait]
 impl SecretBackend for KeychainBackend {
     fn security_level(&self) -> SecurityLevel {
@@ -52,13 +64,32 @@ impl SecretBackend for KeychainBackend {
         tokio::task::spawn_blocking(move || {
             let entry = Entry::new(&svc, &id_owned)
                 .map_err(|e| SecretError::BackendUnavailable(e.to_string()))?;
-            entry
-                .set_password(&encoded)
-                .map_err(|e| SecretError::PermissionDenied {
+            match entry.set_password(&encoded) {
+                Ok(()) => Ok::<(), SecretError>(()),
+                // Some platforms (notably the macOS Keychain) implement
+                // `set_password` as an *add* and reject an existing item with
+                // `errSecDuplicateItem` instead of updating it. This is the
+                // common path for rotating secrets (e.g. OAuth token refresh),
+                // so treat it as an update: delete the stale item and re-add.
+                Err(e) if is_duplicate_item(&e) => {
+                    debug!(
+                        scope = %scope_owned,
+                        id = %id_owned,
+                        "keychain: item exists, replacing"
+                    );
+                    let _ = entry.delete_password();
+                    entry
+                        .set_password(&encoded)
+                        .map_err(|e| SecretError::PermissionDenied {
+                            key: format!("{scope_owned}/{id_owned}"),
+                            reason: e.to_string(),
+                        })
+                }
+                Err(e) => Err(SecretError::PermissionDenied {
                     key: format!("{scope_owned}/{id_owned}"),
                     reason: e.to_string(),
-                })?;
-            Ok::<(), SecretError>(())
+                }),
+            }
         })
         .await
         .map_err(|e| SecretError::BackendUnavailable(format!("join: {e}")))??;
