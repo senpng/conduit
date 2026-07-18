@@ -162,45 +162,61 @@ impl TraceIndex {
     /// Insert a single row and atomically record its log location as the
     /// recovery checkpoint. Duplicate IDs are ignored.
     pub async fn insert(&self, row: &TraceIndexRow) -> Result<(), TraceError> {
+        self.insert_batch(std::slice::from_ref(row)).await
+    }
+
+    /// Insert a batch of rows in **one transaction** and record the last row's
+    /// log location as the recovery checkpoint. Duplicate IDs are ignored.
+    ///
+    /// Rows must be in append order: the checkpoint is taken from the final
+    /// row, so a crash mid-flush replays from the last durably indexed frame.
+    /// An empty slice is a no-op.
+    pub async fn insert_batch(&self, rows: &[TraceIndexRow]) -> Result<(), TraceError> {
+        let Some(last) = rows.last() else {
+            return Ok(());
+        };
+
         let mut transaction = self
             .pool
             .begin()
             .await
             .map_err(|e| TraceError::Database(e.to_string()))?;
 
-        sqlx::query(
-            r#"
-            INSERT OR IGNORE INTO trace_index
-                (id, trace_id, kind, ts, downstream_key_id, alias, provider_id, model_id,
-                 status_code, latency_ms, prompt_tokens, completion_tokens,
-                 reasoning_tokens, cache_read_tokens, cache_write_tokens,
-                 cost_usd, error_kind, segment, offset)
-            VALUES
-                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(&row.id)
-        .bind(&row.trace_id)
-        .bind(&row.kind)
-        .bind(&row.ts)
-        .bind(&row.downstream_key_id)
-        .bind(&row.alias)
-        .bind(&row.provider_id)
-        .bind(&row.model_id)
-        .bind(row.status_code)
-        .bind(row.latency_ms)
-        .bind(row.prompt_tokens)
-        .bind(row.completion_tokens)
-        .bind(row.reasoning_tokens)
-        .bind(row.cache_read_tokens)
-        .bind(row.cache_write_tokens)
-        .bind(row.cost_usd)
-        .bind(&row.error_kind)
-        .bind(&row.segment)
-        .bind(row.offset)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|e| TraceError::Database(e.to_string()))?;
+        for row in rows {
+            sqlx::query(
+                r#"
+                INSERT OR IGNORE INTO trace_index
+                    (id, trace_id, kind, ts, downstream_key_id, alias, provider_id, model_id,
+                     status_code, latency_ms, prompt_tokens, completion_tokens,
+                     reasoning_tokens, cache_read_tokens, cache_write_tokens,
+                     cost_usd, error_kind, segment, offset)
+                VALUES
+                    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(&row.id)
+            .bind(&row.trace_id)
+            .bind(&row.kind)
+            .bind(&row.ts)
+            .bind(&row.downstream_key_id)
+            .bind(&row.alias)
+            .bind(&row.provider_id)
+            .bind(&row.model_id)
+            .bind(row.status_code)
+            .bind(row.latency_ms)
+            .bind(row.prompt_tokens)
+            .bind(row.completion_tokens)
+            .bind(row.reasoning_tokens)
+            .bind(row.cache_read_tokens)
+            .bind(row.cache_write_tokens)
+            .bind(row.cost_usd)
+            .bind(&row.error_kind)
+            .bind(&row.segment)
+            .bind(row.offset)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| TraceError::Database(e.to_string()))?;
+        }
 
         sqlx::query(
             r#"
@@ -211,8 +227,8 @@ impl TraceIndex {
                 offset = excluded.offset
             "#,
         )
-        .bind(&row.segment)
-        .bind(row.offset)
+        .bind(&last.segment)
+        .bind(last.offset)
         .execute(&mut *transaction)
         .await
         .map_err(|e| TraceError::Database(e.to_string()))?;
@@ -301,15 +317,15 @@ impl TraceIndex {
             FROM trace_index
             {where_clause}
             ORDER BY ts DESC
-            LIMIT {limit} OFFSET {}
-            "#,
-            filter.offset
+            LIMIT ? OFFSET ?
+            "#
         );
 
         let mut q = sqlx::query_as::<sqlx::Sqlite, TraceIndexRow>(&sql);
         for p in &params {
             q = q.bind(p.as_str());
         }
+        q = q.bind(limit as i64).bind(filter.offset as i64);
 
         let rows = q
             .fetch_all(&self.pool)

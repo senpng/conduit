@@ -81,16 +81,36 @@ impl TraceStore {
 
     /// Append a single [`TraceEvent`] to the log and index.
     pub async fn append(&self, event: &TraceEvent) -> Result<(), TraceError> {
-        // Write to the segment log and get back the offset.
-        let offsets = self.log.append(std::slice::from_ref(event)).await?;
-        let offset = offsets
-            .into_iter()
-            .next()
-            .ok_or_else(|| TraceError::Serialization("log.append returned no offsets".into()))?;
+        self.append_batch(std::slice::from_ref(event)).await
+    }
 
-        // Index the metadata row.
-        let row = event_to_index_row(event, offset.segment.clone(), offset.offset);
-        self.index.insert(&row).await?;
+    /// Append a batch of [`TraceEvent`]s to the log and index.
+    ///
+    /// The whole batch is written to the segment log first (a single write-path
+    /// `sync_data` under `Fsync`), then indexed in one SQLite transaction. This
+    /// keeps the expensive fsync + transaction commit amortized over the batch
+    /// instead of paid per event. An empty slice is a no-op.
+    pub async fn append_batch(&self, events: &[TraceEvent]) -> Result<(), TraceError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        // Write the whole batch to the segment log (one fsync under Fsync mode).
+        let offsets = self.log.append(events).await?;
+        if offsets.len() != events.len() {
+            return Err(TraceError::Serialization(
+                "log.append returned a mismatched offset count".into(),
+            ));
+        }
+
+        // Build index rows and insert them in a single transaction. The last
+        // row's offset becomes the recovery checkpoint.
+        let rows: Vec<TraceIndexRow> = events
+            .iter()
+            .zip(offsets)
+            .map(|(event, offset)| event_to_index_row(event, offset.segment, offset.offset))
+            .collect();
+        self.index.insert_batch(&rows).await?;
 
         Ok(())
     }

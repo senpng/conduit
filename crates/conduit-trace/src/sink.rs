@@ -6,7 +6,7 @@ use std::sync::{
 use async_trait::async_trait;
 use conduit_ir::trace::TraceEvent;
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, Notify},
     task::JoinHandle,
     time::{interval, Duration},
 };
@@ -48,6 +48,14 @@ pub struct TraceSink {
     tx: mpsc::Sender<TraceEvent>,
     subscribers: Arc<RwLock<Vec<Arc<dyn TraceSubscriber>>>>,
     enabled: Arc<AtomicBool>,
+    /// Signals the background loop to flush and exit during graceful shutdown.
+    shutdown: Arc<Notify>,
+    /// Notified by the background loop once it has flushed and exited.
+    drained: Arc<Notify>,
+    /// Set once the first [`drain`](Self::drain) has completed the shutdown
+    /// handshake, so repeat calls return immediately instead of hanging on a
+    /// loop that has already exited.
+    drain_done: Arc<AtomicBool>,
 }
 
 impl TraceSink {
@@ -55,16 +63,31 @@ impl TraceSink {
     ///
     /// Tracing starts **enabled**. Call [`set_enabled`] after construction to
     /// honor operator config.
+    ///
+    /// [`drain`](Self::drain) coordinates a clean flush-and-exit with the task
+    /// via internal signals, so the returned [`JoinHandle`] is only for callers
+    /// that want to observe or abort the task; awaiting it is not required.
     pub async fn start(store: Arc<TraceStore>) -> (Self, JoinHandle<()>) {
         let subscribers: Arc<RwLock<Vec<Arc<dyn TraceSubscriber>>>> =
             Arc::new(RwLock::new(Vec::new()));
         let (tx, rx) = mpsc::channel::<TraceEvent>(8096);
-        let handle = tokio::spawn(sink_loop(store, rx, subscribers.clone()));
+        let shutdown = Arc::new(Notify::new());
+        let drained = Arc::new(Notify::new());
+        let handle = tokio::spawn(sink_loop(
+            store,
+            rx,
+            subscribers.clone(),
+            shutdown.clone(),
+            drained.clone(),
+        ));
         (
             Self {
                 tx,
                 subscribers,
                 enabled: Arc::new(AtomicBool::new(true)),
+                shutdown,
+                drained,
+                drain_done: Arc::new(AtomicBool::new(false)),
             },
             handle,
         )
@@ -103,26 +126,34 @@ impl TraceSink {
         self.tx.try_send(event).map_err(|_| TraceError::ChannelFull)
     }
 
-    /// Wait for the in-flight channel to drain and the last batch to flush.
+    /// Flush all in-flight events and wait for the background task to exit.
     ///
-    /// Called during graceful shutdown: drop the sender side (done externally
-    /// by dropping the `TraceSink`) then await this method so the background
-    /// task exits cleanly.  Here we give the background loop a chance to
-    /// process its final tick.
+    /// Called during graceful shutdown. Signals the background loop to drain
+    /// its channel, flush the final batch, and exit; then awaits confirmation.
+    /// Unlike a fixed sleep, this returns exactly when the last event is
+    /// durably appended.
+    ///
+    /// Idempotent: the shutdown handshake runs only once. After it has
+    /// completed, further calls return immediately (the loop has already
+    /// flushed and exited, so there is nothing left to wait for). Calling it
+    /// concurrently from two tasks is not supported — production drains once.
     pub async fn drain(&self) {
-        // Give the background loop enough time to process remaining events.
-        // The loop exits when the channel is closed (sender dropped), but
-        // since we still hold a reference, we just wait for the queue to empty.
-        let mut attempts = 0u32;
-        loop {
-            if self.tx.capacity() == self.tx.max_capacity() || attempts >= 100 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            attempts += 1;
+        // A prior drain already flushed-and-exited the loop: nothing to wait on,
+        // and signalling `shutdown` again would park a permit no one consumes
+        // while we block forever on `drained`. Return immediately instead.
+        if self.drain_done.load(Ordering::Acquire) {
+            return;
         }
-        // Final sleep to let the background flush tick fire.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Register interest in the drained signal *before* asking the loop to
+        // shut down, so a fast loop cannot fire `notify_waiters` between our
+        // `notify_one` and the point where we start awaiting (lost wakeup).
+        let drained = self.drained.notified();
+        self.shutdown.notify_one();
+        drained.await;
+
+        // Publish completion so repeat callers take the fast path above.
+        self.drain_done.store(true, Ordering::Release);
     }
 }
 
@@ -134,12 +165,26 @@ async fn sink_loop(
     store: Arc<TraceStore>,
     mut rx: mpsc::Receiver<TraceEvent>,
     subscribers: Arc<RwLock<Vec<Arc<dyn TraceSubscriber>>>>,
+    shutdown: Arc<Notify>,
+    drained: Arc<Notify>,
 ) {
     let mut batch: Vec<TraceEvent> = Vec::with_capacity(128);
     let mut flush_ticker = interval(Duration::from_millis(50));
 
     loop {
         tokio::select! {
+            _ = shutdown.notified() => {
+                // Graceful shutdown: drain everything already queued, flush, exit.
+                // `try_recv` never blocks — senders may still be alive.
+                while let Ok(event) = rx.try_recv() {
+                    batch.push(event);
+                }
+                if !batch.is_empty() {
+                    flush(&store, &mut batch, &subscribers).await;
+                }
+                drained.notify_waiters();
+                return;
+            }
             msg = rx.recv() => {
                 match msg {
                     Some(event) => {
@@ -158,6 +203,7 @@ async fn sink_loop(
                         if !batch.is_empty() {
                             flush(&store, &mut batch, &subscribers).await;
                         }
+                        drained.notify_waiters();
                         return;
                     }
                 }
@@ -177,29 +223,68 @@ async fn flush(
     subscribers: &Arc<RwLock<Vec<Arc<dyn TraceSubscriber>>>>,
 ) {
     let items: Vec<TraceEvent> = std::mem::take(batch);
-    for event in items {
-        match store.append(&event).await {
-            Ok(()) => {
-                // Clone the subscriber list before awaiting to avoid holding the
-                // sync lock across an async boundary.
-                let subs: Vec<Arc<dyn TraceSubscriber>> = subscribers
-                    .read()
-                    .expect("subscribers lock poisoned")
-                    .clone();
-                for sub in &subs {
-                    sub.on_event(&event).await;
-                }
-            }
-            Err(e) => {
-                // We NEVER silently drop — log the error so operators can act.
-                // Subscribers are NOT called: the event was not written.
-                error!(
-                    event_id = %event.id,
-                    error = %e,
-                    "TraceSink: failed to append event to store"
-                );
+    if items.is_empty() {
+        return;
+    }
+
+    // Two steps, so we can broadcast events that are DURABLE even if the index
+    // write later fails. The log is the source of truth; the SQLite index is a
+    // rebuildable derived view (recovered on next open via checkpoint replay).
+    //
+    // Step 1 — append the whole batch to the segment log (single fsync under
+    // Fsync mode). If this fails nothing is durable: skip subscribers entirely.
+    let offsets = match store.log.append(&items).await {
+        Ok(offsets) if offsets.len() == items.len() => offsets,
+        Ok(offsets) => {
+            error!(
+                batch_len = items.len(),
+                offset_len = offsets.len(),
+                "TraceSink: log.append returned a mismatched offset count; dropping batch"
+            );
+            return;
+        }
+        Err(e) => {
+            // Nothing reached durable storage — never silently drop, log it.
+            error!(
+                batch_len = items.len(),
+                error = %e,
+                "TraceSink: failed to append batch to log"
+            );
+            return;
+        }
+    };
+
+    // The events are now durably on disk. Notify subscribers regardless of the
+    // index outcome: the live SSE tail must not miss events that ARE recorded.
+    let subs: Vec<Arc<dyn TraceSubscriber>> = subscribers
+        .read()
+        .expect("subscribers lock poisoned")
+        .clone();
+    if !subs.is_empty() {
+        for event in &items {
+            for sub in &subs {
+                sub.on_event(event).await;
             }
         }
+    }
+
+    // Step 2 — index the batch in one transaction. On failure the events remain
+    // in the durable log and are re-indexed on the next open; we only lose fast
+    // metadata queries for them until then, so log and continue.
+    let rows: Vec<crate::TraceIndexRow> = items
+        .iter()
+        .zip(offsets)
+        .map(|(event, offset)| {
+            crate::event_to_index_row(event, offset.segment, offset.offset)
+        })
+        .collect();
+    if let Err(e) = store.index.insert_batch(&rows).await {
+        error!(
+            batch_len = rows.len(),
+            error = %e,
+            "TraceSink: batch is durable in the log but index insert failed; \
+             it will be recovered on next open"
+        );
     }
 }
 
@@ -215,6 +300,70 @@ mod tests {
 
     use super::*;
     use crate::TraceFilter;
+
+    /// `drain` must return only after every queued event is durably persisted —
+    /// deterministically, without relying on a fixed sleep. Enqueue a burst,
+    /// drain, then assert all rows are present with no post-drain sleep.
+    #[tokio::test]
+    async fn drain_flushes_all_queued_events_deterministically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(TraceStore::open(tmp.path().to_path_buf()).await.unwrap());
+        let (sink, _handle) = TraceSink::start(store.clone()).await;
+
+        const N: usize = 250; // spans multiple 100-event flush batches
+        for i in 0..N {
+            sink.send(TraceEvent::new(TraceEventKind::RequestReceived {
+                downstream_key_id: Some(format!("dk-{i}")),
+                alias: "m".into(),
+                stream: false,
+                request: serde_json::json!({}),
+                request_ir: None,
+                wire_format: None,
+                request_headers: None,
+            }))
+            .unwrap();
+        }
+
+        // No sleep: drain returns exactly when the last batch is persisted.
+        sink.drain().await;
+
+        let rows = store
+            .query(&TraceFilter {
+                limit: 1000,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), N, "drain must persist every queued event");
+    }
+
+    /// A second `drain()` must return immediately, not hang. Before the
+    /// idempotency guard, the repeat call parked a `shutdown` permit no one
+    /// consumed and blocked forever on `drained`.
+    #[tokio::test]
+    async fn drain_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(TraceStore::open(tmp.path().to_path_buf()).await.unwrap());
+        let (sink, _handle) = TraceSink::start(store.clone()).await;
+
+        sink.send(TraceEvent::new(TraceEventKind::RequestReceived {
+            downstream_key_id: Some("dk".into()),
+            alias: "m".into(),
+            stream: false,
+            request: serde_json::json!({}),
+            request_ir: None,
+            wire_format: None,
+            request_headers: None,
+        }))
+        .unwrap();
+
+        sink.drain().await;
+        // Would hang forever without the guard; a timeout turns a hang into a
+        // test failure instead of a stuck suite.
+        tokio::time::timeout(Duration::from_secs(5), sink.drain())
+            .await
+            .expect("second drain must return immediately, not hang");
+    }
 
     #[tokio::test]
     async fn send_and_flush() {

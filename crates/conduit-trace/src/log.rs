@@ -260,7 +260,13 @@ impl LogWriter {
 
         let seg_dir = self.dir.join(SEGMENTS_DIR);
         let next_seq = if seg.date == today { seg.seq + 1 } else { 0 };
-        let new_filename = format!("{}.{}.{}", today, next_seq, SEGMENT_EXT);
+        let new_filename = format!(
+            "{}.{:0width$}.{}",
+            today,
+            next_seq,
+            SEGMENT_EXT,
+            width = SEQ_PAD_WIDTH
+        );
         let new_path = seg_dir.join(&new_filename);
 
         debug!(path = %new_path.display(), "rotating log segment");
@@ -330,7 +336,8 @@ impl LogReader {
                     entries.push(p);
                 }
             }
-            entries.sort();
+            // Numeric-aware ordering: `.10` must sort after `.9`, not before.
+            entries.sort_by(|a, b| segment_path_key(a).cmp(&segment_path_key(b)));
 
             for seg_path in entries {
                 let mut file = fs::File::open(&seg_path).await.map_err(TraceError::Io)?;
@@ -396,7 +403,8 @@ impl LogReader {
                     entries.push(path);
                 }
             }
-            entries.sort();
+            // Numeric-aware ordering: `.10` must sort after `.9`, not before.
+            entries.sort_by(|a, b| segment_path_key(a).cmp(&segment_path_key(b)));
 
             for seg_path in entries {
                 let segment = seg_path
@@ -405,7 +413,8 @@ impl LogReader {
                     .ok_or_else(|| TraceError::Serialization("invalid segment filename".into()))?
                     .to_string();
                 if let Some(checkpoint) = checkpoint.as_ref() {
-                    if segment < checkpoint.segment {
+                    // Compare by numeric (date, seq) key, not raw filename.
+                    if segment_sort_key(&segment) < segment_sort_key(&checkpoint.segment) {
                         continue;
                     }
                 }
@@ -434,8 +443,11 @@ impl LogReader {
                                 .map_err(|e| TraceError::Serialization(e.to_string()))?;
                             let event_offset = LogOffset { segment: segment.clone(), offset };
                             let after_checkpoint = checkpoint.as_ref().is_none_or(|checkpoint| {
-                                event_offset.segment > checkpoint.segment
-                                    || (event_offset.segment == checkpoint.segment
+                                // Order by numeric (date, seq) key, then byte offset.
+                                let event_key = segment_sort_key(&event_offset.segment);
+                                let cp_key = segment_sort_key(&checkpoint.segment);
+                                event_key > cp_key
+                                    || (event_key == cp_key
                                         && event_offset.offset > checkpoint.offset)
                             });
                             if after_checkpoint {
@@ -462,6 +474,35 @@ fn today_string() -> String {
     chrono::Utc::now().format("%Y-%m-%d").to_string()
 }
 
+/// Width the segment sequence number is zero-padded to in new filenames.
+///
+/// Padding keeps lexicographic filename order aligned with chronological order
+/// for external tooling (`ls`, globbing). Correctness inside this crate does not
+/// rely on the padding — [`segment_sort_key`] compares the *numeric* sequence —
+/// but padding avoids surprising anyone reading the directory directly.
+const SEQ_PAD_WIDTH: usize = 6;
+
+/// Ordering key for a segment filename: `(date, numeric_seq)`.
+///
+/// Segment files are named `YYYY-MM-DD.<seq>.cdlog`. Sorting or comparing by
+/// raw filename string is WRONG once `seq` reaches 10, because `"…​.10.cdlog"`
+/// sorts before `"…​.9.cdlog"` lexicographically. All ordering decisions (which
+/// segment is newest, whether a segment precedes a recovery checkpoint) must go
+/// through this key so they stay correct regardless of seq width and tolerate
+/// legacy unpadded filenames written by older builds.
+fn segment_sort_key(name: &str) -> (String, u32) {
+    let mut parts = name.split('.');
+    let date = parts.next().unwrap_or("").to_string();
+    let seq = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    (date, seq)
+}
+
+/// Ordering key for a segment path's filename (see [`segment_sort_key`]).
+fn segment_path_key(path: &Path) -> (String, u32) {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    segment_sort_key(name)
+}
+
 async fn find_or_create_segment(seg_dir: &Path) -> Result<SegmentFile, TraceError> {
     let today = today_string();
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -473,7 +514,8 @@ async fn find_or_create_segment(seg_dir: &Path) -> Result<SegmentFile, TraceErro
             candidates.push(p);
         }
     }
-    candidates.sort();
+    // Numeric-aware ordering: `.10` must sort after `.9`, not before.
+    candidates.sort_by(|a, b| segment_path_key(a).cmp(&segment_path_key(b)));
 
     // Use the newest existing segment if it belongs to today, otherwise create
     // a new one.
@@ -485,7 +527,7 @@ async fn find_or_create_segment(seg_dir: &Path) -> Result<SegmentFile, TraceErro
         }
     }
 
-    let filename = format!("{}.0.{}", today, SEGMENT_EXT);
+    let filename = format!("{}.{:0width$}.{}", today, 0, SEGMENT_EXT, width = SEQ_PAD_WIDTH);
     let path = seg_dir.join(filename);
     let (seg, _) = SegmentFile::open(path).await?;
     Ok(seg)
@@ -688,5 +730,76 @@ mod tests {
         let reader = LogReader::new(tmp.path().to_path_buf());
         assert_eq!(reader.read_at(offsets[0].clone()).await.unwrap().id, e1_id);
         assert_eq!(reader.read_at(offsets[1].clone()).await.unwrap().id, e2_id);
+    }
+
+    #[test]
+    fn segment_sort_key_orders_seq_numerically_past_ten() {
+        // The whole bug: raw string order puts ".10" before ".9". The numeric
+        // key must not.
+        let mut names = vec![
+            "2026-07-18.9.cdlog",
+            "2026-07-18.10.cdlog",
+            "2026-07-18.2.cdlog",
+            "2026-07-19.0.cdlog",
+        ];
+        names.sort_by_key(|n| segment_sort_key(n));
+        assert_eq!(
+            names,
+            vec![
+                "2026-07-18.2.cdlog",
+                "2026-07-18.9.cdlog",
+                "2026-07-18.10.cdlog",
+                "2026-07-19.0.cdlog",
+            ]
+        );
+
+        // Padded and unpadded forms of the same seq compare equal (legacy compat).
+        assert_eq!(
+            segment_sort_key("2026-07-18.7.cdlog"),
+            segment_sort_key("2026-07-18.000007.cdlog")
+        );
+        // Padded ".000010" still sorts after ".000009".
+        assert!(
+            segment_sort_key("2026-07-18.000010.cdlog")
+                > segment_sort_key("2026-07-18.000009.cdlog")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_after_offset_recovers_across_double_digit_segments() {
+        // Force a rotation on every event so we blow past seq 9 within one batch.
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = LogWriter::with_max_segment_bytes(tmp.path().to_path_buf(), 1)
+            .await
+            .unwrap();
+
+        // 12 events → segments .000000 through .000011 (crosses the .10 boundary).
+        let events: Vec<TraceEvent> = (0..12).map(|_| sample_event()).collect();
+        let offsets = writer.append(&events).await.unwrap();
+        // Sanity: we really produced a double-digit segment.
+        assert!(
+            offsets.iter().any(|o| o.segment.contains(".000011.")),
+            "expected a seq-11 segment, got {:?}",
+            offsets.iter().map(|o| &o.segment).collect::<Vec<_>>()
+        );
+
+        // Checkpoint at the 6th event; recovery must yield exactly events 7..12,
+        // in order, with no earlier segment wrongly skipped or re-emitted.
+        let checkpoint = offsets[5].clone();
+        let reader = LogReader::new(tmp.path().to_path_buf());
+        let recovered: Vec<(TraceEvent, LogOffset)> = reader
+            .stream_after_offset(Some(checkpoint))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        let recovered_ids: Vec<&str> = recovered.iter().map(|(e, _)| e.id.as_str()).collect();
+        let expected_ids: Vec<&str> = events[6..].iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            recovered_ids, expected_ids,
+            "recovery must return events strictly after the checkpoint, in append order"
+        );
     }
 }
