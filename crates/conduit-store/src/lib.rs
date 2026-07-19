@@ -20,7 +20,8 @@ pub use provider_repo::ProviderRepo;
 pub use response_continuation_repo::{ResponseContinuationRepo, RESPONSE_CONTINUATION_TTL};
 pub use route_repo::RouteRepo;
 pub use schema::{
-    AppEventRow, DownstreamKeyRow, PricingRow, ProviderRow, RouteRow, UsageRecordRow,
+    secret_key_id_from_ref, AppEventRow, DownstreamKeyRow, PricingRow, ProviderRow, RouteRow,
+    UsageRecordRow,
 };
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},

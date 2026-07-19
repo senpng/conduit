@@ -41,7 +41,6 @@ pub enum RouterError {
 pub struct RoutingDecision {
     pub provider_id: String,
     pub model_id: String,
-    pub upstream_key_id: String,
     pub provider_kind: String,
     pub base_url: Option<String>,
     pub request_overrides: serde_json::Map<String, serde_json::Value>,
@@ -197,7 +196,6 @@ fn decision_from(
     RoutingDecision {
         provider_id: target.provider_id.clone(),
         model_id: target.model_id.clone(),
-        upstream_key_id: target.upstream_key_id.clone(),
         provider_kind: target.provider_kind.clone(),
         base_url: target.base_url.clone(),
         request_overrides: target.request_overrides.clone(),
@@ -401,7 +399,6 @@ mod tests {
         RouteTarget {
             provider_id: provider.into(),
             model_id: model.into(),
-            upstream_key_id: format!("key_{provider}"),
             provider_kind: provider.into(),
             base_url: None,
             weight,
@@ -778,7 +775,6 @@ mod tests {
             id: id.into(),
             kind: kind.into(),
             base_url: Some(format!("https://{id}.example")),
-            upstream_key_id: id.into(),
             weight: 1,
         }
     }
@@ -796,7 +792,6 @@ mod tests {
             targets: vec![RouteTarget {
                 provider_id: String::new(),
                 model_id: "claude-sonnet".into(),
-                upstream_key_id: String::new(),
                 provider_kind: "claude-oauth".into(),
                 base_url: None,
                 weight: 1,
@@ -816,7 +811,6 @@ mod tests {
         assert!(d.provider_id == "c1" || d.provider_id == "c2");
         assert_eq!(d.model_id, "claude-sonnet");
         assert_eq!(d.provider_kind, "claude-oauth");
-        assert_eq!(d.upstream_key_id, d.provider_id);
     }
 
     #[test]
@@ -859,7 +853,6 @@ mod tests {
             targets: vec![RouteTarget {
                 provider_id: String::new(),
                 model_id: "m".into(),
-                upstream_key_id: String::new(),
                 provider_kind: "claude-oauth".into(),
                 base_url: None,
                 weight: 1,
@@ -887,7 +880,6 @@ mod tests {
             targets: vec![RouteTarget {
                 provider_id: String::new(),
                 model_id: "m".into(),
-                upstream_key_id: String::new(),
                 provider_kind: "claude-oauth".into(),
                 base_url: None,
                 weight: 1,
@@ -922,7 +914,6 @@ mod tests {
         let d = route_with_seed("fast", &table, 1, None, 0).unwrap();
         assert_eq!(d.provider_id, "openai");
         assert_eq!(d.model_id, "gpt-4o");
-        assert_eq!(d.upstream_key_id, "key_openai");
         assert_eq!(d.provider_kind, "openai");
         assert_eq!(d.attempt_no, 1);
         assert_eq!(d.retry_policy.max_retries, 2);

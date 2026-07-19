@@ -502,6 +502,24 @@ fn draw_master_detail_providers(frame: &mut Frame, area: Rect, app: &App) {
     body.extend(provider_secret_detail_lines(theme, app, p));
     body.push(Line::from(""));
 
+    // Kind-pool membership: same-kind providers share a route pool target.
+    let kind_n = app
+        .providers
+        .iter()
+        .filter(|x| x.kind.eq_ignore_ascii_case(&p.kind))
+        .count();
+    body.push(Line::from(Span::styled("  Kind pool", theme.accent_bold())));
+    body.push(Line::from(Span::styled(
+        format!(
+            "  {kind_n} account{} of kind «{}» — route wizard Ctrl-k → pool · {}",
+            if kind_n == 1 { "" } else { "s" },
+            p.kind,
+            p.kind,
+        ),
+        theme.subtle(),
+    )));
+    body.push(Line::from(""));
+
     let oauth = super::forms::ProviderForm::is_oauth_kind_label(&p.kind);
     if oauth {
         body.push(Line::from(Span::styled(
@@ -618,7 +636,7 @@ fn provider_quota_detail_lines(
         }
     } else if super::forms::ProviderForm::is_oauth_kind_label(&p.kind) {
         out.push(Line::from(Span::styled(
-            "  press u to probe Claude/Codex remaining (5h · 7d)",
+            "  press u to probe OAuth remaining (Claude/Codex 5h·7d, Grok mo)",
             theme.subtle(),
         )));
     } else {
@@ -648,20 +666,13 @@ fn provider_secret_detail_lines(
     let mut out = Vec::new();
     out.push(Line::from(Span::styled("  Secret", theme.accent_bold())));
 
-    let Some(sec) = app.provider_secret.as_ref() else {
+    let Some(sec) = app.secret_for(&p.id) else {
         out.push(Line::from(Span::styled(
             "  press v to decrypt & show API key / OAuth tokens",
             theme.subtle(),
         )));
         return out;
     };
-    if sec.provider_id != p.id {
-        out.push(Line::from(Span::styled(
-            "  press v to decrypt this provider's secret",
-            theme.subtle(),
-        )));
-        return out;
-    }
 
     out.push(Line::from(vec![
         Span::styled(format!("  {:<16}", "kind"), theme.muted()),
@@ -777,7 +788,7 @@ fn draw_master_detail_routes(frame: &mut Frame, area: Rect, app: &App) {
             theme,
             "Routes",
             if app.filter.is_empty() {
-                "press a to open the multi-target wizard"
+                "press a — multi-target wizard (single provider or kind pool)"
             } else {
                 "no matches"
             },
@@ -793,11 +804,13 @@ fn draw_master_detail_routes(frame: &mut Frame, area: Rect, app: &App) {
         .map(|(view_i, &data_i)| {
             let r = &app.routes[data_i];
             let en = if r.enabled { "●" } else { "○" };
+            let summary =
+                super::forms::summarize_route_targets(&r.targets_json, &app.providers);
             let row = Row::new(vec![
                 en.into(),
-                truncate(&r.match_alias, 24),
-                truncate(&r.strategy, 10),
-                truncate(&r.id, 12),
+                truncate(&r.match_alias, 18),
+                truncate(&r.strategy, 9),
+                truncate(&summary, 28),
             ]);
             if view_i == sel {
                 row.style(theme.selection())
@@ -811,13 +824,13 @@ fn draw_master_detail_routes(frame: &mut Frame, area: Rect, app: &App) {
         rows,
         [
             Constraint::Length(2),
-            Constraint::Percentage(45),
-            Constraint::Length(10),
-            Constraint::Min(10),
+            Constraint::Percentage(28),
+            Constraint::Length(9),
+            Constraint::Min(18),
         ],
     )
     .header(
-        Row::new(vec!["", "ALIAS", "STRATEGY", "ID"]).style(theme.header_cell()),
+        Row::new(vec!["", "ALIAS", "STRAT", "TARGETS"]).style(theme.header_cell()),
     )
     .block(panel_block(
         theme,
@@ -830,6 +843,7 @@ fn draw_master_detail_routes(frame: &mut Frame, area: Rect, app: &App) {
     let targets_pretty = serde_json::from_str::<serde_json::Value>(&r.targets_json)
         .map(|v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| r.targets_json.clone()))
         .unwrap_or_else(|_| r.targets_json.clone());
+    let summary = super::forms::summarize_route_targets(&r.targets_json, &app.providers);
 
     let mut lines = detail_kv(
         theme,
@@ -838,16 +852,25 @@ fn draw_master_detail_routes(frame: &mut Frame, area: Rect, app: &App) {
             ("alias", r.match_alias.clone()),
             ("strategy", r.strategy.clone()),
             ("enabled", r.enabled.to_string()),
+            ("summary", summary),
         ],
     );
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("  targets", theme.muted())));
+    lines.push(Line::from(Span::styled(
+        "  targets  (pool_* expands to all accounts of that kind)",
+        theme.muted(),
+    )));
     for tl in targets_pretty.lines().take(12) {
         lines.push(Line::from(Span::styled(
             format!("  {tl}"),
             Style::default().fg(theme.fg),
         )));
     }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  e edit · a add · d delete  ·  pool = multi-account of same kind",
+        theme.subtle(),
+    )));
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -2180,7 +2203,13 @@ Secret reveal modal
   a             Copy primary (api_key / access_token)
   Enter/Esc     Dismiss
 
-Routes / Keys
+Routes
+  a add · e edit · d delete
+  Wizard: Ctrl-k cycle single provider ↔ kind pool
+          Ctrl-y strategy fixed / fallback / weighted
+          pool target = multi-account of same kind
+
+Keys
   a add · e edit · d delete
 
 Usage
@@ -2399,22 +2428,35 @@ fn draw_route_wizard(frame: &mut Frame, theme: &Theme, w: &super::forms::RouteWi
                 theme.accent_bold(),
             )));
             lines.push(Line::from(Span::styled(
-                format!("    strategy: {}  (Ctrl-y cycle)", w.strategy()),
+                format!(
+                    "    strategy: {}  — {}  (Ctrl-y / Ctrl-k cycle)",
+                    w.strategy(),
+                    w.strategy_hint()
+                ),
                 theme.muted(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "    fixed | fallback | weighted",
+                theme.subtle(),
             )));
         }
         1 => {
             lines.push(Line::from(Span::styled(
-                "  ↑↓ target · Tab field · Ctrl-k provider · Ctrl-t/w add/remove",
+                "  ↑↓ target · Tab field · Ctrl-k single/pool · Ctrl-t/w add/remove",
+                theme.subtle(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  pool = all accounts of a provider kind (multi-OAuth ready)",
                 theme.subtle(),
             )));
             lines.push(Line::from(""));
             for (i, t) in w.targets.iter().enumerate() {
-                let p = w.provider_label(&t.provider_id);
+                let label = w.binding_label(&t.binding);
                 let mark = if i == w.target_focus { "▸" } else { " " };
+                let pool_mark = if t.binding.is_pool() { "◇" } else { "·" };
                 lines.push(Line::from(Span::styled(
                     format!(
-                        " {mark} [{i}] {p}\n     model={}  overrides={}",
+                        " {mark} [{i}] {pool_mark} {label}\n     model={}  overrides={}",
                         t.model_id.display(),
                         truncate(&t.overrides.display(), 40)
                     ),
@@ -2441,9 +2483,20 @@ fn draw_route_wizard(frame: &mut Frame, theme: &Theme, w: &super::forms::RouteWi
             Ok(body) => {
                 lines.push(Line::from(format!("  alias:    {}", body.match_alias)));
                 lines.push(Line::from(format!("  strategy: {}", body.strategy)));
-                lines.push(Line::from(Span::styled("  targets:", theme.muted())));
+                lines.push(Line::from(Span::styled(
+                    "  bindings:",
+                    theme.muted(),
+                )));
+                for (i, t) in w.targets.iter().enumerate() {
+                    lines.push(Line::from(format!(
+                        "  [{i}] {} → {}",
+                        w.binding_label(&t.binding),
+                        t.model_id.value.trim()
+                    )));
+                }
+                lines.push(Line::from(Span::styled("  targets JSON:", theme.muted())));
                 if let Ok(pretty) = serde_json::to_string_pretty(&body.targets) {
-                    for l in pretty.lines().take(14) {
+                    for l in pretty.lines().take(12) {
                         lines.push(Line::from(format!("  {l}")));
                     }
                 }

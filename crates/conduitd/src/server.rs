@@ -144,7 +144,7 @@ pub async fn run(
                 Ok(Err(e)) => {
                     tracing::warn!(key_id = %key_id, error = %e, "credential resolve failed");
                     Err(GatewayError::Internal(format!(
-                        "no secret found for upstream_key_id '{key_id}': {e}"
+                        "no secret found for provider '{key_id}': {e}"
                     )))
                 }
                 Err(_) => {
@@ -154,7 +154,7 @@ pub async fn run(
                          (re-run: conduitctl oauth start <provider>)"
                     );
                     Err(GatewayError::Internal(format!(
-                        "credential resolve timed out for upstream_key_id '{key_id}'"
+                        "credential resolve timed out for provider '{key_id}'"
                     )))
                 }
             }
@@ -485,7 +485,9 @@ pub async fn build_provider_map(
 }
 
 /// Convert enabled RouteRows from the DB into the in-memory Route format.
-/// Injects `base_url` from the provider map into each RouteTarget.
+///
+/// Injects `base_url` from the provider (when unset on the target).
+/// Secrets are resolved by `provider_id` at call time — not stored on the route.
 pub fn rows_to_routes(
     rows: Vec<conduit_store::RouteRow>,
     provider_map: &std::collections::HashMap<String, String>,
@@ -497,7 +499,6 @@ pub fn rows_to_routes(
                 serde_json::from_str(&row.targets_json).map_err(|e| {
                     anyhow::anyhow!("invalid targets_json for route {}: {}", row.id, e)
                 })?;
-            // Inject base_url from provider map (without overriding if already set in JSON)
             for t in &mut targets {
                 if t.base_url.is_none() && !t.provider_id.is_empty() {
                     t.base_url = provider_map.get(&t.provider_id).cloned();
@@ -532,21 +533,11 @@ pub async fn build_provider_catalog(
     let rows = repo.list().await.map_err(|e| anyhow::anyhow!("{}", e))?;
     let providers: Vec<conduit_router::ProviderCatalogEntry> = rows
         .into_iter()
-        .map(|r| {
-            // upstream_key_ref is secret://upstream_key/{id}; key id is provider id.
-            let key_id = r
-                .upstream_key_ref
-                .rsplit('/')
-                .next()
-                .unwrap_or(&r.id)
-                .to_string();
-            conduit_router::ProviderCatalogEntry {
-                id: r.id,
-                kind: r.kind,
-                base_url: Some(r.base_url),
-                upstream_key_id: key_id,
-                weight: 1,
-            }
+        .map(|r| conduit_router::ProviderCatalogEntry {
+            id: r.id,
+            kind: r.kind,
+            base_url: Some(r.base_url),
+            weight: 1,
         })
         .collect();
     let pools = conduit_router::auto_kind_pools(&providers);
@@ -659,7 +650,6 @@ mod hotpath_tests {
             targets: vec![RouteTarget {
                 provider_id: "openai".into(),
                 model_id: model.into(),
-                upstream_key_id: "k1".into(),
                 provider_kind: "openai".into(),
                 base_url: Some("https://api.openai.com".into()),
                 weight: 1,
@@ -697,7 +687,7 @@ mod hotpath_tests {
             id: "route-1".into(),
             match_alias: "terra".into(),
             strategy: "fixed".into(),
-            targets_json: r#"[{"provider_id":"codex","model_id":"gpt-5.6-terra","upstream_key_id":"key-1","provider_kind":"codex-oauth","request_overrides":{"service_tier":"priority"}}]"#.into(),
+            targets_json: r#"[{"provider_id":"codex","model_id":"gpt-5.6-terra","provider_kind":"codex-oauth","request_overrides":{"service_tier":"priority"}}]"#.into(),
             retry_policy_json: "{}".into(),
             enabled: true,
             created_at: "now".into(),
@@ -716,6 +706,28 @@ mod hotpath_tests {
             Some("https://chatgpt.com/backend-api/codex")
         );
         assert_eq!(target.request_overrides["service_tier"], "priority");
+    }
+
+    #[test]
+    fn rows_to_routes_injects_base_url_from_provider() {
+        let row = conduit_store::RouteRow {
+            id: "r".into(),
+            match_alias: "m".into(),
+            strategy: "fixed".into(),
+            targets_json: r#"[{"provider_id":"p1","model_id":"gpt","provider_kind":"openai"}]"#
+                .into(),
+            retry_policy_json: "{}".into(),
+            enabled: true,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        };
+        let provider_map =
+            std::collections::HashMap::from([("p1".into(), "https://api.example".into())]);
+        let routes = rows_to_routes(vec![row], &provider_map).unwrap();
+        assert_eq!(
+            routes[0].targets[0].base_url.as_deref(),
+            Some("https://api.example")
+        );
     }
 
     /// Structural proof: process-shared CredentialResolver is constructed once

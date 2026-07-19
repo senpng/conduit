@@ -99,7 +99,15 @@ Credentials (access + refresh + expiry + account metadata) are stored as JSON in
 
 **Proxy**: configured proxy URL must apply; construction fails instead of falling back to direct connect.
 
-**Quota snapshots**: best-effort last-seen rate-limit headers / 429 bodies per provider — `GET /console/quota-snapshots`, `POST .../{id}/refresh` (optional `clear_cooldown`), `POST .../refresh` (probe all OAuth). For **Claude/Codex OAuth**, refresh proactively calls the subscription usage APIs (`/api/oauth/usage`, `wham/usage`) and stores **session (5h) / weekly (7d) remaining %**. Successful and error upstream responses also record `anthropic-ratelimit-*` / `x-ratelimit-*` / `retry-after`. TUI Providers tab shows a **REMAINING** column and detail meters (`u` re-probes).
+**Quota snapshots**: best-effort last-seen rate-limit headers / 429 bodies per provider — `GET /console/quota-snapshots`, `POST .../{id}/refresh` (optional `clear_cooldown`), `POST .../refresh` (probe all OAuth). All OAuth kinds proactively probe remaining capacity (CodexBar-style, reusing stored access tokens):
+
+| Kind | Probe | Remaining fields |
+|------|-------|------------------|
+| `claude-oauth` | `GET /api/oauth/usage` | session 5h + weekly 7d % |
+| `codex-oauth` | `GET …/wham/usage` | session 5h + weekly 7d % |
+| `grok-oauth` | `POST grok.com …/GetGrokCreditsConfig` (gRPC-web) | monthly credits % (`mo`) |
+
+Successful and error upstream responses also record `anthropic-ratelimit-*` / `x-ratelimit-*` / `retry-after`. TUI Providers tab shows a **REMAINING** column and detail meters (`u` re-probes).
 
 Console API: `POST /console/oauth/{kind}/start`, `GET /console/oauth/sessions/{id}`, `POST .../cancel`, `POST /console/oauth/{provider_id}/refresh`. CLI: `conduitctl oauth start <claude|codex|grok>`.
 

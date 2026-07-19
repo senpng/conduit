@@ -1,12 +1,14 @@
 //! Application state machine for the interactive console.
 
+use std::collections::HashMap;
+
 use crossterm::event::KeyEvent;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::console_client::ConsoleClient;
 use crate::dto::{
-    HealthResponse, KeyView, PricingView, ProviderView, RouteView, UsageRecordView,
-    UsageSummaryView,
+    HealthResponse, KeyView, PricingView, ProviderSecretView, ProviderView, RouteView,
+    UsageRecordView, UsageSummaryView,
 };
 
 use super::action::Action;
@@ -174,8 +176,8 @@ pub struct App {
     pub quota_snapshots: Vec<crate::dto::QuotaSnapshotView>,
     /// Providers currently cooling after 429 / usage_limit.
     pub cooldowns: Vec<crate::dto::CooldownView>,
-    /// Decrypted secret for the last `v` view (shown in Providers detail).
-    pub provider_secret: Option<crate::dto::ProviderSecretView>,
+    /// Decrypted secrets keyed by provider id (multi-`v`; each toggles independently).
+    pub provider_secrets: HashMap<String, ProviderSecretView>,
     pub usage_summary: Option<UsageSummaryView>,
     pub usage_recent: Vec<UsageRecordView>,
     pub usage_period: String,
@@ -212,7 +214,7 @@ impl App {
             keys: Vec::new(),
             quota_snapshots: Vec::new(),
             cooldowns: Vec::new(),
-            provider_secret: None,
+            provider_secrets: HashMap::new(),
             usage_summary: None,
             usage_recent: Vec::new(),
             usage_period: current_period(),
@@ -376,16 +378,12 @@ impl App {
             }
             Action::ViewSecret => {
                 if self.tab == Tab::Providers {
-                    // Toggle: if already showing this provider's secret, clear it.
-                    if let Some(sec) = &self.provider_secret {
-                        if self.selected_provider_id().as_deref() == Some(sec.provider_id.as_str())
-                        {
-                            self.provider_secret = None;
+                    // Toggle per-provider: hide if already decrypted for the selection.
+                    if let Some(id) = self.selected_provider_id() {
+                        if self.provider_secrets.remove(&id).is_some() {
                             self.status = "Secret hidden".into();
                             return;
                         }
-                    }
-                    if let Some(id) = self.selected_provider_id() {
                         self.status = "Decrypting secret…".into();
                         self.loading = true;
                         net::spawn_provider_secret(self.client.clone(), id, self.tx.clone());
@@ -712,6 +710,7 @@ impl App {
         self.mode = Mode::Browse;
         match action {
             ConfirmAction::DeleteProvider { id, .. } => {
+                self.provider_secrets.remove(&id);
                 self.status = format!("Deleting provider {id}…");
                 net::spawn_delete_provider(self.client.clone(), id, self.tx.clone());
             }
@@ -1133,6 +1132,8 @@ impl App {
                 ProviderFormKind::SetSecret { id, .. } => match f.to_secret_body() {
                     Ok(body) => {
                         let id = id.clone();
+                        // Cached plaintext is stale after overwrite.
+                        self.provider_secrets.remove(&id);
                         self.status = "Storing secret…".into();
                         self.mode = Mode::Browse;
                         net::spawn_set_secret(self.client.clone(), id, body, self.tx.clone());
@@ -1297,20 +1298,31 @@ impl App {
             .find(|c| c.provider_id == provider_id)
     }
 
+    pub fn secret_for(&self, provider_id: &str) -> Option<&ProviderSecretView> {
+        self.provider_secrets.get(provider_id)
+    }
+
     /// Copy decrypted secret to the system clipboard.
     ///
     /// - `primary_only`: API key or OAuth `access_token`
     /// - full: multi-line dump (or the modal body for one-shot key reveals)
     fn copy_secret(&mut self, primary_only: bool) {
-        let text = if let Some(view) = self.provider_secret.as_ref() {
-            // Prefer structured decrypt when available.
-            if primary_only {
-                secret_primary_value(view)
+        let selected = self.selected_provider_id();
+        let text = if let Some(id) = selected.as_deref() {
+            if let Some(view) = self.secret_for(id) {
+                if primary_only {
+                    secret_primary_value(view)
+                } else {
+                    format_provider_secret_modal(view)
+                }
+            } else if let Mode::SecretReveal { secret, .. } = &self.mode {
+                // Downstream key create / one-shot reveal modal.
+                secret.clone()
             } else {
-                format_provider_secret_modal(view)
+                self.status = "No secret loaded — press v to decrypt first".into();
+                return;
             }
         } else if let Mode::SecretReveal { secret, .. } = &self.mode {
-            // Downstream key create / one-shot reveal modal.
             secret.clone()
         } else {
             self.status = "No secret loaded — press v to decrypt first".into();
@@ -1369,6 +1381,9 @@ impl App {
             Msg::Providers(r) => match r {
                 Ok(v) => {
                     self.providers = v;
+                    // Drop decrypted secrets for providers that no longer exist.
+                    self.provider_secrets
+                        .retain(|id, _| self.providers.iter().any(|p| p.id == *id));
                     self.clamp_sel(Tab::Providers);
                     if let Mode::RouteWizard(w) = &mut self.mode {
                         w.set_providers(self.providers.clone());
@@ -1428,12 +1443,15 @@ impl App {
                         view.secret_kind
                     );
                     let body = format_provider_secret_modal(&view);
-                    self.provider_secret = Some(view);
+                    let id = view.provider_id.clone();
+                    self.provider_secrets.insert(id, view);
                     self.mode = Mode::SecretReveal {
                         title,
                         secret: body,
                     };
-                    self.status = "Secret decrypted — shown in detail & modal (v to hide)".into();
+                    self.status =
+                        "Secret decrypted — shown in detail & modal (v to hide; others keep)"
+                            .into();
                 }
                 Err(e) => {
                     self.error = Some(e);

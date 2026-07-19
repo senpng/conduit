@@ -207,7 +207,7 @@ pub async fn get_provider_secret(
         Err(e) => return internal(e).into_response(),
     };
 
-    let key_id = secret_key_id_from_ref(&row.upstream_key_ref, &id);
+    let key_id = conduit_store::secret_key_id_from_ref(&row.upstream_key_ref, &id);
     let raw = match state.secret_backend.get("upstream_key", &key_id).await {
         Ok(Some(s)) => s,
         Ok(None) => {
@@ -279,31 +279,6 @@ pub async fn get_provider_secret(
         .into_response()
 }
 
-/// Resolve secret backend id from `upstream_key_ref` (`secret://upstream_key/{id}` or raw id).
-fn secret_key_id_from_ref(upstream_key_ref: &str, provider_id: &str) -> String {
-    let r = upstream_key_ref.trim();
-    if r.is_empty() {
-        return provider_id.to_string();
-    }
-    if let Some(rest) = r.strip_prefix("secret://upstream_key/") {
-        let id = rest.trim_matches('/');
-        if !id.is_empty() {
-            return id.to_string();
-        }
-    }
-    if let Some(rest) = r.strip_prefix("upstream_key/") {
-        let id = rest.trim_matches('/');
-        if !id.is_empty() {
-            return id.to_string();
-        }
-    }
-    // Bare id or other forms: use as-is if it doesn't look like a URI.
-    if !r.contains("://") {
-        return r.to_string();
-    }
-    provider_id.to_string()
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Routes
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -311,7 +286,7 @@ fn secret_key_id_from_ref(upstream_key_ref: &str, provider_id: &str) -> String {
 #[derive(Debug, Deserialize)]
 pub struct CreateRouteBody {
     pub match_alias: String,
-    /// "fixed" or "fallback"
+    /// "fixed", "fallback", or "weighted"
     pub strategy: String,
     /// JSON array of RouteTarget objects
     pub targets: Value,
@@ -709,9 +684,9 @@ pub async fn get_quota_snapshot(
 
 /// POST /console/quota-snapshots/{provider_id}/refresh
 ///
-/// For OAuth providers (`claude-oauth` / `codex-oauth`), probes the upstream
-/// usage API and updates the snapshot. For others, re-reads last-seen headers.
-/// Optional `?clear_cooldown=true` clears the provider cooldown.
+/// For OAuth providers (`claude-oauth` / `codex-oauth` / `grok-oauth`), probes the
+/// upstream usage/billing API and updates the snapshot. For others, re-reads
+/// last-seen headers. Optional `?clear_cooldown=true` clears the provider cooldown.
 pub async fn refresh_quota_snapshot(
     State(state): State<Arc<DaemonState>>,
     Path(provider_id): Path<String>,
@@ -822,7 +797,7 @@ fn is_oauth_provider_kind(kind: &str) -> bool {
     )
 }
 
-/// Probe Claude/Codex OAuth remaining via usage API; store snapshot.
+/// Probe Claude / Codex / Grok OAuth remaining via usage (or billing) API; store snapshot.
 ///
 /// Returns `Ok(Some(note))` when probed, `Ok(None)` when not an OAuth kind that
 /// supports probing, `Err` on probe failure.
@@ -841,15 +816,8 @@ async fn probe_oauth_quota(
         Ok(k) => k,
         Err(_) => return Ok(None),
     };
-    if matches!(kind, conduit_oauth::OAuthProviderKind::Xai) {
-        return Ok(None);
-    }
 
-    let key_id = if row.upstream_key_ref.trim().is_empty() {
-        provider_id.to_string()
-    } else {
-        row.upstream_key_ref.clone()
-    };
+    let key_id = conduit_store::secret_key_id_from_ref(&row.upstream_key_ref, provider_id);
 
     let store = Arc::new(crate::oauth::BackendSecretStore::new(
         state.secret_backend.clone(),

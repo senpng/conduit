@@ -48,7 +48,7 @@ pub fn spawn_providers(client: ConsoleClient, tx: UnboundedSender<Msg>) {
     tokio::spawn(async move {
         let r = client.list_providers_typed().await.map_err(|e| e.to_string());
         let _ = tx.send(Msg::Providers(r));
-        // Probe OAuth remaining (Claude/Codex usage APIs), then load snapshots + cooldowns.
+        // Probe OAuth remaining (Claude/Codex usage + Grok billing), then load snapshots + cooldowns.
         let _ = client.refresh_all_quotas().await;
         spawn_quota_state(client, tx).await;
     });

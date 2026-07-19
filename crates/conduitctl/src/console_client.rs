@@ -352,7 +352,7 @@ impl ConsoleClient {
         self.get_json(&url).await
     }
 
-    /// Probe all OAuth providers' subscription remaining (Claude/Codex usage APIs).
+    /// Probe all OAuth providers' subscription remaining (Claude/Codex usage + Grok billing).
     pub async fn refresh_all_quotas(&self) -> Result<Value, ConsoleError> {
         let url = format!("{}/console/quota-snapshots/refresh", self.base);
         self.post_empty_json(&url).await

@@ -176,7 +176,7 @@ mod tests {
             id: id.to_string(),
             match_alias: alias.to_string(),
             strategy: "fixed".into(),
-            targets_json: r#"[{"provider_id":"openai","model_id":"gpt-4o","upstream_key_id":"k1","provider_kind":"openai"}]"#.into(),
+            targets_json: r#"[{"provider_id":"openai","model_id":"gpt-4o","provider_kind":"openai"}]"#.into(),
             retry_policy_json: r#"{"max_retries":2,"base_delay_ms":500,"retryable_statuses":[429,500]}"#.into(),
             enabled: true,
             created_at: now.clone(),

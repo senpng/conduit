@@ -7,6 +7,8 @@
 //! - Proxy: credential `proxy_url` → `CONDUIT_PROXY_URL` → daemon config →
 //!   `HTTP(S)_PROXY` / `ALL_PROXY` (SOCKS supported); bypass `NO_PROXY`
 //! - Grok `using_api`: official API vs cli-chat-proxy (CLIProxyAPI parity)
+//! - Remaining usage probe ([`fetch_oauth_usage`]): Claude `/api/oauth/usage`,
+//!   Codex `wham/usage`, Grok grok.com billing gRPC-web (CodexBar parity)
 //!
 //! Credentials are stored as JSON [`OAuthCredential`] blobs (typically in
 //! `conduit-secret` under scope `upstream_key`).
@@ -43,8 +45,8 @@ pub use refresh::RefreshCoordinator;
 pub use resolver::{CredentialResolver, SecretStore};
 pub use session::{OAuthSession, SessionStatus, SessionStore, SessionView, SESSION_TTL};
 pub use usage::{
-    fetch_oauth_usage, format_remaining_short, parse_claude_usage, parse_codex_usage, OauthUsage,
-    UsageWindow,
+    fetch_oauth_usage, format_remaining_short, is_billing_source, parse_claude_usage,
+    parse_codex_usage, parse_grok_billing_protobuf, OauthUsage, UsageWindow,
 };
 
 /// Metadata for console UI listing.

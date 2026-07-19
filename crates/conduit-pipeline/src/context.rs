@@ -15,12 +15,14 @@ use conduit_router::table::RoutingTable;
 use serde_json::Value;
 use ulid::Ulid;
 
-/// Holds the resolved key material for a single upstream call.
+/// Holds the resolved target for a single upstream call.
+///
+/// Credentials are looked up by [`provider_id`](Self::provider_id) (secret is
+/// bound on the provider, not the route).
 #[derive(Clone)]
 pub struct ResolvedProvider {
     pub provider_id: String,
     pub model_id: String,
-    pub upstream_key_id: String,
     pub provider_kind: String,
     pub base_url: Option<String>,
     pub request_overrides: serde_json::Map<String, Value>,

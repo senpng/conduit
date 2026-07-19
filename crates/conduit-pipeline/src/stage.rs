@@ -37,7 +37,6 @@ pub fn route_request_with_skip(
     ctx.resolved = Some(ResolvedProvider {
         provider_id: decision.provider_id.clone(),
         model_id: decision.model_id.clone(),
-        upstream_key_id: decision.upstream_key_id.clone(),
         provider_kind: decision.provider_kind.clone(),
         base_url: decision.base_url.clone(),
         request_overrides: decision.request_overrides.clone(),
@@ -95,7 +94,6 @@ mod tests {
                 RouteTarget {
                     provider_id: "a".into(),
                     model_id: "m".into(),
-                    upstream_key_id: "ka".into(),
                     provider_kind: "openai".into(),
                     base_url: None,
                     weight: 1,
@@ -106,7 +104,6 @@ mod tests {
                 RouteTarget {
                     provider_id: "b".into(),
                     model_id: "m".into(),
-                    upstream_key_id: "kb".into(),
                     provider_kind: "openai".into(),
                     base_url: None,
                     weight: 1,

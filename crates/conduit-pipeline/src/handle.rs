@@ -94,7 +94,7 @@ impl PipelineHandle {
         }
 
         let resolved = ctx.resolved.as_ref().unwrap().clone();
-        let mut auth = match self.resolve_auth(&resolved.upstream_key_id).await {
+        let mut auth = match self.resolve_auth(&resolved.provider_id).await {
             Ok(a) => a,
             Err(e) => return Err(e),
         };
@@ -195,7 +195,7 @@ impl PipelineHandle {
                         }
                         let new_resolved = ctx.resolved.as_ref().unwrap().clone();
                         let client_headers = auth.client_headers.clone();
-                        auth = match self.resolve_auth(&new_resolved.upstream_key_id).await {
+                        auth = match self.resolve_auth(&new_resolved.provider_id).await {
                             Ok(mut s) => {
                                 s.client_headers = client_headers;
                                 s
@@ -263,7 +263,7 @@ impl PipelineHandle {
                         }
                         let new_resolved = ctx.resolved.as_ref().unwrap().clone();
                         let client_headers = auth.client_headers.clone();
-                        auth = match self.resolve_auth(&new_resolved.upstream_key_id).await {
+                        auth = match self.resolve_auth(&new_resolved.provider_id).await {
                             Ok(mut s) => {
                                 s.client_headers = client_headers;
                                 s
@@ -416,7 +416,6 @@ mod hotpath_tests {
             targets: vec![RouteTarget {
                 provider_id: "openai".into(),
                 model_id: model.into(),
-                upstream_key_id: "k1".into(),
                 provider_kind: "openai".into(),
                 base_url: Some("https://api.openai.com".into()),
                 weight: 1,
@@ -442,7 +441,6 @@ mod hotpath_tests {
         let resolved = ResolvedProvider {
             provider_id: "p1".into(),
             model_id: "gpt-5.1".into(),
-            upstream_key_id: "k1".into(),
             provider_kind: "codex-oauth".into(),
             base_url: None,
             request_overrides: Default::default(),

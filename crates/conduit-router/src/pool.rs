@@ -15,8 +15,6 @@ pub struct ProviderCatalogEntry {
     pub kind: String,
     #[serde(default)]
     pub base_url: Option<String>,
-    /// Secret key id (typically same as provider id for OAuth).
-    pub upstream_key_id: String,
     #[serde(default = "default_weight")]
     pub weight: u32,
 }
@@ -93,7 +91,6 @@ pub fn expand_route_target(
         .map(|m| RouteTarget {
             provider_id: m.id.clone(),
             model_id: template.model_id.clone(),
-            upstream_key_id: m.upstream_key_id.clone(),
             provider_kind: m.kind.clone(),
             base_url: m.base_url.clone().or_else(|| template.base_url.clone()),
             weight: if m.weight > 0 {
@@ -253,7 +250,6 @@ mod tests {
             id: id.into(),
             kind: kind.into(),
             base_url: Some(format!("https://{id}.example")),
-            upstream_key_id: id.into(),
             weight: 1,
         }
     }
@@ -262,7 +258,6 @@ mod tests {
         RouteTarget {
             provider_id: String::new(),
             model_id: model.into(),
-            upstream_key_id: String::new(),
             provider_kind: kind.into(),
             base_url: None,
             weight: 1,
@@ -285,7 +280,6 @@ mod tests {
         assert_eq!(exp.len(), 2);
         assert_eq!(exp[0].provider_id, "c1");
         assert_eq!(exp[0].model_id, "claude-sonnet");
-        assert_eq!(exp[0].upstream_key_id, "c1");
         assert_eq!(exp[1].provider_id, "c2");
     }
 
@@ -323,7 +317,6 @@ mod tests {
             RouteTarget {
                 provider_id: "a".into(),
                 model_id: "m".into(),
-                upstream_key_id: "a".into(),
                 provider_kind: "claude-oauth".into(),
                 base_url: None,
                 weight: 1,
@@ -334,7 +327,6 @@ mod tests {
             RouteTarget {
                 provider_id: "b".into(),
                 model_id: "m".into(),
-                upstream_key_id: "b".into(),
                 provider_kind: "claude-oauth".into(),
                 base_url: None,
                 weight: 1,
@@ -353,7 +345,6 @@ mod tests {
             RouteTarget {
                 provider_id: "a".into(),
                 model_id: "m".into(),
-                upstream_key_id: "a".into(),
                 provider_kind: "k".into(),
                 base_url: None,
                 weight: 1,
@@ -364,7 +355,6 @@ mod tests {
             RouteTarget {
                 provider_id: "b".into(),
                 model_id: "m".into(),
-                upstream_key_id: "b".into(),
                 provider_kind: "k".into(),
                 base_url: None,
                 weight: 1,
@@ -386,7 +376,6 @@ mod tests {
         let t = RouteTarget {
             provider_id: "p1".into(),
             model_id: "gpt".into(),
-            upstream_key_id: "p1".into(),
             provider_kind: "openai".into(),
             base_url: None,
             weight: 1,

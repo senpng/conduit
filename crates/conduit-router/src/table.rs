@@ -37,11 +37,14 @@ fn default_weight() -> u32 {
     1
 }
 
-/// A single upstream target (provider + model + key binding).
+/// A single upstream target (provider + model).
 ///
 /// **Pool targets** (scheme B): set `pool_id` and/or `pool_kind` and leave
 /// `provider_id` empty (or ignored). Membership expands from the routing table
 /// provider catalog at decision time.
+///
+/// Secrets are bound on the **provider** (`upstream_key_ref` / provider id),
+/// not on the route.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteTarget {
     /// Logical provider identifier. Empty when this is a pool reference.
@@ -49,10 +52,6 @@ pub struct RouteTarget {
     pub provider_id: String,
     /// The provider's model identifier (e.g. `"gpt-4o"`, `"claude-3-5-sonnet-20241022"`).
     pub model_id: String,
-    /// Opaque key binding identifier (resolved to an actual secret at call time).
-    /// For pool targets, filled per member at expansion.
-    #[serde(default)]
-    pub upstream_key_id: String,
     /// Provider kind used to select the correct codec/adapter (e.g. `"openai"`, `"anthropic"`).
     #[serde(default)]
     pub provider_kind: String,
@@ -181,7 +180,6 @@ mod tests {
         RouteTarget {
             provider_id: provider.into(),
             model_id: model.into(),
-            upstream_key_id: format!("key_{provider}"),
             provider_kind: provider.into(),
             base_url: None,
             weight: 1,
@@ -272,7 +270,6 @@ mod tests {
         let v = serde_json::json!({
             "provider_id": "p",
             "model_id": "m",
-            "upstream_key_id": "k",
             "provider_kind": "openai"
         });
         let t: RouteTarget = serde_json::from_value(v).unwrap();

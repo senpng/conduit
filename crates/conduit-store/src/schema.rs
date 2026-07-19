@@ -12,9 +12,64 @@ pub struct ProviderRow {
     pub kind: String,
     pub base_url: String,
     /// Secret reference — NOT the actual API key.  Resolved via conduit-secret.
+    ///
+    /// Canonical form: `secret://upstream_key/{provider_id}`. The secret binding
+    /// lives on the provider; routes do not choose a separate key id.
     pub upstream_key_ref: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Resolve the secret-backend id from a provider's `upstream_key_ref`.
+///
+/// Accepts `secret://upstream_key/{id}`, bare `upstream_key/{id}`, a raw id, or
+/// empty (falls back to `provider_id`).
+pub fn secret_key_id_from_ref(upstream_key_ref: &str, provider_id: &str) -> String {
+    let r = upstream_key_ref.trim();
+    if r.is_empty() {
+        return provider_id.to_string();
+    }
+    if let Some(rest) = r.strip_prefix("secret://upstream_key/") {
+        let id = rest.trim_matches('/');
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
+    if let Some(rest) = r.strip_prefix("upstream_key/") {
+        let id = rest.trim_matches('/');
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
+    // Bare id or other forms: use as-is if it doesn't look like a URI.
+    if !r.contains("://") {
+        return r.to_string();
+    }
+    provider_id.to_string()
+}
+
+#[cfg(test)]
+mod secret_key_id_tests {
+    use super::secret_key_id_from_ref;
+
+    #[test]
+    fn parses_canonical_ref() {
+        assert_eq!(
+            secret_key_id_from_ref("secret://upstream_key/abc", "fallback"),
+            "abc"
+        );
+    }
+
+    #[test]
+    fn empty_ref_uses_provider_id() {
+        assert_eq!(secret_key_id_from_ref("", "p1"), "p1");
+        assert_eq!(secret_key_id_from_ref("   ", "p1"), "p1");
+    }
+
+    #[test]
+    fn bare_id_passthrough() {
+        assert_eq!(secret_key_id_from_ref("my-key", "p1"), "my-key");
+    }
 }
 
 // ── Route ─────────────────────────────────────────────────────────────────────

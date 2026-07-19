@@ -239,14 +239,24 @@ impl UpstreamQuotaStore {
         });
     }
 
-    /// Compact remaining label for list UIs: `5h 95% · 7d 66%` or header fallbacks.
+    /// Compact remaining label for list UIs: `5h 95% · 7d 66%`, Grok `mo 72%`, or header fallbacks.
     pub fn remaining_label(snap: &QuotaSnapshot) -> Option<String> {
+        let billing = snap.source.to_ascii_lowercase().contains("billing")
+            || snap.source.to_ascii_lowercase().contains("grok");
         let mut parts = Vec::new();
         if let Some(p) = snap.session_remaining_pct {
-            parts.push(format!("5h {p:.0}%"));
+            if billing {
+                parts.push(format!("credits {p:.0}%"));
+            } else {
+                parts.push(format!("5h {p:.0}%"));
+            }
         }
         if let Some(p) = snap.weekly_remaining_pct {
-            parts.push(format!("7d {p:.0}%"));
+            if billing {
+                parts.push(format!("mo {p:.0}%"));
+            } else {
+                parts.push(format!("7d {p:.0}%"));
+            }
         }
         if !parts.is_empty() {
             return Some(parts.join(" · "));

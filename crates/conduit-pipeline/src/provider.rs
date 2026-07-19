@@ -511,7 +511,6 @@ mod tests {
         ResolvedProvider {
             provider_id: "p1".into(),
             model_id: "m1".into(),
-            upstream_key_id: "k1".into(),
             provider_kind: kind.into(),
             base_url: Some("http://127.0.0.1:9".into()),
             request_overrides: Default::default(),

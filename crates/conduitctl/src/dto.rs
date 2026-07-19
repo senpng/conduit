@@ -68,13 +68,14 @@ pub struct CreateKeyBody {
 /// Pool targets (multi-account): set `pool_kind` and/or `pool_id`, leave
 /// `provider_id` empty. Example:
 /// `{"pool_kind":"claude-oauth","model_id":"claude-sonnet-4","provider_kind":"claude-oauth"}`
+///
+/// Secrets are bound on the **provider** (`provider_id`), not on the route.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RouteTargetSpec {
-    #[serde(default)]
+    /// Empty for pool targets (`pool_kind` / `pool_id`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider_id: String,
     pub model_id: String,
-    #[serde(default)]
-    pub upstream_key_id: String,
     #[serde(default)]
     pub provider_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -471,14 +472,24 @@ pub struct QuotaSnapshotView {
 }
 
 impl QuotaSnapshotView {
-    /// Compact remaining label: `5h 95% · 7d 66%` or header fallbacks.
+    /// Compact remaining label: `5h 95% · 7d 66%`, Grok `mo 72%`, or header fallbacks.
     pub fn remaining_label(&self) -> Option<String> {
+        let billing = self.source.to_ascii_lowercase().contains("billing")
+            || self.source.to_ascii_lowercase().contains("grok");
         let mut parts = Vec::new();
         if let Some(p) = self.session_remaining_pct {
-            parts.push(format!("5h {p:.0}%"));
+            if billing {
+                parts.push(format!("credits {p:.0}%"));
+            } else {
+                parts.push(format!("5h {p:.0}%"));
+            }
         }
         if let Some(p) = self.weekly_remaining_pct {
-            parts.push(format!("7d {p:.0}%"));
+            if billing {
+                parts.push(format!("mo {p:.0}%"));
+            } else {
+                parts.push(format!("7d {p:.0}%"));
+            }
         }
         if !parts.is_empty() {
             return Some(parts.join(" · "));
@@ -606,7 +617,6 @@ mod tests {
         let t = RouteTargetSpec {
             provider_id: "p".into(),
             model_id: "m".into(),
-            upstream_key_id: "p".into(),
             provider_kind: "openai".into(),
             base_url: None,
             request_overrides: Default::default(),
