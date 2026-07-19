@@ -2,6 +2,7 @@
 
 pub mod console_client;
 pub mod dto;
+pub mod tui;
 pub mod util;
 
 pub use console_client::{
@@ -9,4 +10,5 @@ pub use console_client::{
 };
 pub use dto::{
     CreateKeyBody, CreateProviderBody, CreateRouteBody, HealthResponse, KeyCreateResponse,
+    KeyView, PricingView, ProviderView, RouteView, UpsertPricingOverrideBody, UsageSummaryView,
 };

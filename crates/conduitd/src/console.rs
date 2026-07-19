@@ -190,6 +190,120 @@ pub async fn set_provider_secret(
     }
 }
 
+/// GET /console/providers/{id}/secret — decrypt and return the upstream secret.
+///
+/// Loopback console only. Returns either a plaintext API key or a full OAuth
+/// credential bundle (tokens + account metadata).
+pub async fn get_provider_secret(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    use secrecy::ExposeSecret;
+
+    let repo = ProviderRepo::new(&state.pool);
+    let row = match repo.get(&id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "provider not found").into_response(),
+        Err(e) => return internal(e).into_response(),
+    };
+
+    let key_id = secret_key_id_from_ref(&row.upstream_key_ref, &id);
+    let raw = match state.secret_backend.get("upstream_key", &key_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return err(
+                StatusCode::NOT_FOUND,
+                format!("no secret stored for provider '{id}' (key_id={key_id})"),
+            )
+            .into_response();
+        }
+        Err(e) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to decrypt secret: {e}"),
+            )
+            .into_response();
+        }
+    };
+
+    let bytes = raw.expose_secret();
+    let plaintext = String::from_utf8_lossy(bytes).to_string();
+
+    if let Some(cred) = conduit_oauth::OAuthCredential::try_parse_secret(bytes) {
+        let expired_local = cred.expired.clone();
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "provider_id": id,
+                "provider_name": row.name,
+                "provider_kind": row.kind,
+                "secret_kind": "oauth",
+                "key_id": key_id,
+                "oauth": {
+                    "type": cred.provider_type,
+                    "auth_kind": cred.auth_kind,
+                    "access_token": cred.access_token,
+                    "refresh_token": cred.refresh_token,
+                    "id_token": cred.id_token,
+                    "token_type": cred.token_type,
+                    "expired": expired_local,
+                    "last_refresh": cred.last_refresh,
+                    "email": cred.email,
+                    "account_id": cred.account_id,
+                    "plan_type": cred.plan_type,
+                    "organization_id": cred.organization_id,
+                    "organization_name": cred.organization_name,
+                    "sub": cred.sub,
+                    "base_url": cred.base_url,
+                    "token_endpoint": cred.token_endpoint,
+                    "proxy_url": cred.proxy_url,
+                    "using_api": cred.using_api,
+                    "extra": cred.extra,
+                },
+            })),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "provider_id": id,
+            "provider_name": row.name,
+            "provider_kind": row.kind,
+            "secret_kind": "api_key",
+            "key_id": key_id,
+            "api_key": plaintext,
+        })),
+    )
+        .into_response()
+}
+
+/// Resolve secret backend id from `upstream_key_ref` (`secret://upstream_key/{id}` or raw id).
+fn secret_key_id_from_ref(upstream_key_ref: &str, provider_id: &str) -> String {
+    let r = upstream_key_ref.trim();
+    if r.is_empty() {
+        return provider_id.to_string();
+    }
+    if let Some(rest) = r.strip_prefix("secret://upstream_key/") {
+        let id = rest.trim_matches('/');
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
+    if let Some(rest) = r.strip_prefix("upstream_key/") {
+        let id = rest.trim_matches('/');
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
+    // Bare id or other forms: use as-is if it doesn't look like a URI.
+    if !r.contains("://") {
+        return r.to_string();
+    }
+    provider_id.to_string()
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Routes
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -531,10 +645,252 @@ pub struct ListUsageQuery {
     #[serde(default = "default_usage_limit")]
     pub limit: usize,
     pub key_id: Option<String>,
+    /// Optional calendar month (`YYYY-MM`); scopes rows via `ts LIKE 'YYYY-MM%'`.
+    pub period: Option<String>,
 }
 
 fn default_usage_limit() -> usize {
     50
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Upstream provider cooldowns (429 / usage_limit)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// GET /console/cooldowns — list providers currently skipped due to upstream quota/rate limit.
+pub async fn list_cooldowns(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    let entries = state.cooldown.list();
+    (StatusCode::OK, Json(json!({ "entries": entries }))).into_response()
+}
+
+/// DELETE /console/cooldowns/{provider_id} — clear one provider cooldown (CLIProxyAPI reset-quota).
+pub async fn clear_provider_cooldown(
+    State(state): State<Arc<DaemonState>>,
+    Path(provider_id): Path<String>,
+) -> impl IntoResponse {
+    let cleared = state.cooldown.clear(&provider_id);
+    (
+        StatusCode::OK,
+        Json(json!({ "provider_id": provider_id, "cleared": cleared })),
+    )
+        .into_response()
+}
+
+/// DELETE /console/cooldowns — clear all cooldowns.
+pub async fn clear_all_cooldowns(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    state.cooldown.clear_all();
+    (StatusCode::OK, Json(json!({ "cleared": true }))).into_response()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Upstream quota snapshots (headers / 429 body — best-effort remaining)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// GET /console/quota-snapshots — last-seen rate-limit signals for all providers.
+pub async fn list_quota_snapshots(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    let entries = state.quota_snapshots.list();
+    (StatusCode::OK, Json(json!({ "entries": entries }))).into_response()
+}
+
+/// GET /console/quota-snapshots/{provider_id}
+pub async fn get_quota_snapshot(
+    State(state): State<Arc<DaemonState>>,
+    Path(provider_id): Path<String>,
+) -> impl IntoResponse {
+    match state.quota_snapshots.get(&provider_id) {
+        Some(s) => (StatusCode::OK, Json(json!(s))).into_response(),
+        None => err(
+            StatusCode::NOT_FOUND,
+            format!("no quota snapshot for provider '{provider_id}' (call upstream first)"),
+        )
+        .into_response(),
+    }
+}
+
+/// POST /console/quota-snapshots/{provider_id}/refresh
+///
+/// For OAuth providers (`claude-oauth` / `codex-oauth`), probes the upstream
+/// usage API and updates the snapshot. For others, re-reads last-seen headers.
+/// Optional `?clear_cooldown=true` clears the provider cooldown.
+pub async fn refresh_quota_snapshot(
+    State(state): State<Arc<DaemonState>>,
+    Path(provider_id): Path<String>,
+    Query(q): Query<RefreshQuotaQuery>,
+) -> impl IntoResponse {
+    if q.clear_cooldown.unwrap_or(false) {
+        let _ = state.cooldown.clear(&provider_id);
+    }
+    let probe = probe_oauth_quota(&state, &provider_id).await;
+    let snap = state.quota_snapshots.get(&provider_id);
+    let cooling = state.cooldown.remaining(&provider_id).map(|d| d.as_secs());
+    match probe {
+        Ok(Some(note)) => (
+            StatusCode::OK,
+            Json(json!({
+                "provider_id": provider_id,
+                "snapshot": snap,
+                "cooldown_remaining_secs": cooling,
+                "probed": true,
+                "note": note,
+            })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(json!({
+                "provider_id": provider_id,
+                "snapshot": snap,
+                "cooldown_remaining_secs": cooling,
+                "probed": false,
+                "note": "No OAuth usage probe for this provider; snapshot is last-seen headers/error body.",
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            // Still return last snapshot so the UI can show stale data + error.
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "provider_id": provider_id,
+                    "snapshot": snap,
+                    "cooldown_remaining_secs": cooling,
+                    "probed": false,
+                    "error": e,
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// POST /console/quota-snapshots/refresh — probe all OAuth providers.
+pub async fn refresh_all_quota_snapshots(
+    State(state): State<Arc<DaemonState>>,
+) -> impl IntoResponse {
+    let repo = ProviderRepo::new(&state.pool);
+    let providers = match repo.list().await {
+        Ok(p) => p,
+        Err(e) => return internal(e).into_response(),
+    };
+    let mut results = Vec::new();
+    for p in providers {
+        if !is_oauth_provider_kind(&p.kind) {
+            continue;
+        }
+        match probe_oauth_quota(&state, &p.id).await {
+            Ok(Some(note)) => results.push(json!({
+                "provider_id": p.id,
+                "kind": p.kind,
+                "ok": true,
+                "note": note,
+                "snapshot": state.quota_snapshots.get(&p.id),
+            })),
+            Ok(None) => results.push(json!({
+                "provider_id": p.id,
+                "kind": p.kind,
+                "ok": true,
+                "note": "skipped",
+            })),
+            Err(e) => results.push(json!({
+                "provider_id": p.id,
+                "kind": p.kind,
+                "ok": false,
+                "error": e,
+                "snapshot": state.quota_snapshots.get(&p.id),
+            })),
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "entries": state.quota_snapshots.list(),
+            "results": results,
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RefreshQuotaQuery {
+    pub clear_cooldown: Option<bool>,
+}
+
+fn is_oauth_provider_kind(kind: &str) -> bool {
+    matches!(
+        kind.trim().to_ascii_lowercase().as_str(),
+        "claude-oauth" | "codex-oauth" | "grok-oauth" | "anthropic-oauth"
+    )
+}
+
+/// Probe Claude/Codex OAuth remaining via usage API; store snapshot.
+///
+/// Returns `Ok(Some(note))` when probed, `Ok(None)` when not an OAuth kind that
+/// supports probing, `Err` on probe failure.
+async fn probe_oauth_quota(
+    state: &DaemonState,
+    provider_id: &str,
+) -> Result<Option<String>, String> {
+    let repo = ProviderRepo::new(&state.pool);
+    let row = repo
+        .get(provider_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("provider '{provider_id}' not found"))?;
+
+    let kind = match conduit_oauth::OAuthProviderKind::parse(&row.kind) {
+        Ok(k) => k,
+        Err(_) => return Ok(None),
+    };
+    if matches!(kind, conduit_oauth::OAuthProviderKind::Xai) {
+        return Ok(None);
+    }
+
+    let key_id = if row.upstream_key_ref.trim().is_empty() {
+        provider_id.to_string()
+    } else {
+        row.upstream_key_ref.clone()
+    };
+
+    let store = Arc::new(crate::oauth::BackendSecretStore::new(
+        state.secret_backend.clone(),
+    ));
+    let resolver =
+        conduit_oauth::CredentialResolver::new(store).with_default_proxy(state.proxy_url.clone());
+    let resolved = resolver
+        .resolve(&key_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let proxy = conduit_oauth::resolve_effective_proxy(None, state.proxy_url.as_deref());
+
+    let usage = conduit_oauth::fetch_oauth_usage(kind, &resolved, proxy.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut details = std::collections::HashMap::new();
+    details.insert("raw_excerpt".into(), usage.raw_excerpt.clone());
+    if let Some(l) = &resolved.label {
+        details.insert("account".into(), l.clone());
+    }
+    details.insert("kind".into(), kind.as_str().into());
+
+    let session_pct = usage.session.as_ref().map(|w| w.remaining_pct);
+    let session_reset = usage.session.as_ref().and_then(|w| w.resets_at.clone());
+    let weekly_pct = usage.weekly.as_ref().map(|w| w.remaining_pct);
+    let weekly_reset = usage.weekly.as_ref().and_then(|w| w.resets_at.clone());
+
+    state.quota_snapshots.record_oauth_usage(
+        provider_id,
+        usage.source,
+        session_pct,
+        session_reset,
+        weekly_pct,
+        weekly_reset,
+        details,
+    );
+
+    let label = conduit_oauth::format_remaining_short(&usage);
+    Ok(Some(format!("oauth remaining: {label}")))
 }
 
 /// GET /console/usage — recent per-request consumption rows.
@@ -543,7 +899,10 @@ pub async fn list_usage(
     Query(q): Query<ListUsageQuery>,
 ) -> impl IntoResponse {
     let repo = UsageRepo::new(&state.pool);
-    match repo.list(q.limit, q.key_id.as_deref()).await {
+    match repo
+        .list(q.limit, q.key_id.as_deref(), q.period.as_deref())
+        .await
+    {
         Ok(rows) => (StatusCode::OK, Json(json!({ "entries": rows }))).into_response(),
         Err(e) => internal(e).into_response(),
     }
@@ -579,6 +938,15 @@ pub async fn usage_summary(
         Err(e) => return internal(e).into_response(),
     };
     let by_model = match repo.summary_by_model(&period, key_id).await {
+        Ok(m) => m,
+        Err(e) => return internal(e).into_response(),
+    };
+    // Nested model breakdowns for Usage UI detail panes (by key / by day).
+    let by_key_model = match repo.summary_by_key_model(&period).await {
+        Ok(m) => m,
+        Err(e) => return internal(e).into_response(),
+    };
+    let by_day_model = match repo.summary_by_day_model(&period).await {
         Ok(m) => m,
         Err(e) => return internal(e).into_response(),
     };
@@ -623,6 +991,22 @@ pub async fn usage_summary(
                 "total_usd": m.total_usd,
                 "total_tokens": m.total_tokens,
             })).collect::<Vec<_>>(),
+            "by_key_model": by_key_model.iter().map(|m| json!({
+                "downstream_key_id": m.downstream_key_id,
+                "label": m.label,
+                "provider_kind": m.provider_kind,
+                "request_count": m.request_count,
+                "total_usd": m.total_usd,
+                "total_tokens": m.total_tokens,
+            })).collect::<Vec<_>>(),
+            "by_day_model": by_day_model.iter().map(|m| json!({
+                "day": m.day,
+                "label": m.label,
+                "provider_kind": m.provider_kind,
+                "request_count": m.request_count,
+                "total_usd": m.total_usd,
+                "total_tokens": m.total_tokens,
+            })).collect::<Vec<_>>(),
         })),
     )
         .into_response()
@@ -635,6 +1019,121 @@ pub async fn usage_summary(
 pub async fn list_pricing(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let rows = state.pricing_repo.all().await;
     (StatusCode::OK, Json(json!(rows))).into_response()
+}
+
+/// GET /console/pricing/overrides — operator `pricing.json` only (not merged layers).
+pub async fn list_pricing_overrides(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    match conduit_store::PricingRepo::list_overrides(&state.data_dir).await {
+        Ok(rows) => (StatusCode::OK, Json(json!(rows))).into_response(),
+        Err(e) => internal(e).into_response(),
+    }
+}
+
+/// Body for upserting an operator pricing override (USD per million tokens).
+#[derive(Debug, Deserialize)]
+pub struct UpsertPricingOverrideBody {
+    pub provider_kind: String,
+    pub model_id: String,
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
+    pub cache_read_per_mtok: Option<f64>,
+    pub cache_write_per_mtok: Option<f64>,
+    pub reasoning_per_mtok: Option<f64>,
+    /// Optional ISO date; defaults to today UTC.
+    pub effective_from: Option<String>,
+}
+
+/// PUT /console/pricing/overrides — upsert one row into `pricing.json` and reload.
+pub async fn upsert_pricing_override(
+    State(state): State<Arc<DaemonState>>,
+    Json(body): Json<UpsertPricingOverrideBody>,
+) -> impl IntoResponse {
+    let effective_from = body
+        .effective_from
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
+    let row = conduit_store::schema::PricingRow {
+        provider_kind: body.provider_kind.trim().to_string(),
+        model_id: body.model_id.trim().to_string(),
+        input_per_mtok: body.input_per_mtok,
+        output_per_mtok: body.output_per_mtok,
+        cache_read_per_mtok: body.cache_read_per_mtok,
+        cache_write_per_mtok: body.cache_write_per_mtok,
+        reasoning_per_mtok: body.reasoning_per_mtok,
+        effective_from,
+    };
+    match state
+        .pricing_repo
+        .upsert_override(&state.data_dir, row)
+        .await
+    {
+        Ok(rows) => {
+            let map = crate::state::pricing_map_from_repo(&state.pricing_repo).await;
+            state.pricing_table.store(std::sync::Arc::new(map));
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "upserted",
+                    "overrides": rows,
+                    "count": rows.len(),
+                })),
+            )
+                .into_response()
+        }
+        Err(conduit_store::StoreError::Serialization(msg)) => {
+            err(StatusCode::BAD_REQUEST, msg).into_response()
+        }
+        Err(e) => internal(e).into_response(),
+    }
+}
+
+/// Query for `DELETE /console/pricing/overrides?provider_kind=…&model_id=…`.
+///
+/// Model ids often contain `/` (e.g. LiteLLM-style paths), so path segments are
+/// unreliable; query params avoid 404s from extra path components.
+#[derive(Debug, Deserialize)]
+pub struct DeletePricingOverrideQuery {
+    pub provider_kind: String,
+    pub model_id: String,
+}
+
+/// DELETE /console/pricing/overrides?provider_kind=…&model_id=…
+pub async fn delete_pricing_override(
+    State(state): State<Arc<DaemonState>>,
+    Query(q): Query<DeletePricingOverrideQuery>,
+) -> impl IntoResponse {
+    let provider_kind = q.provider_kind.trim();
+    let model_id = q.model_id.trim();
+    if provider_kind.is_empty() || model_id.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "provider_kind and model_id query params are required",
+        )
+            .into_response();
+    }
+    match state
+        .pricing_repo
+        .delete_override(&state.data_dir, provider_kind, model_id)
+        .await
+    {
+        Ok(rows) => {
+            let map = crate::state::pricing_map_from_repo(&state.pricing_repo).await;
+            state.pricing_table.store(std::sync::Arc::new(map));
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "deleted",
+                    "overrides": rows,
+                    "count": rows.len(),
+                })),
+            )
+                .into_response()
+        }
+        Err(conduit_store::StoreError::NotFound(msg)) => {
+            err(StatusCode::NOT_FOUND, msg).into_response()
+        }
+        Err(e) => internal(e).into_response(),
+    }
 }
 
 pub async fn reload_pricing(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {

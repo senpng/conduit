@@ -3,7 +3,10 @@ use std::{collections::HashMap, sync::Arc};
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
 
-use crate::policy::RetryPolicy;
+use crate::{
+    policy::RetryPolicy,
+    pool::{NamedPool, ProviderCatalogEntry},
+};
 
 // ---------------------------------------------------------------------------
 // Routing strategy
@@ -35,15 +38,23 @@ fn default_weight() -> u32 {
 }
 
 /// A single upstream target (provider + model + key binding).
+///
+/// **Pool targets** (scheme B): set `pool_id` and/or `pool_kind` and leave
+/// `provider_id` empty (or ignored). Membership expands from the routing table
+/// provider catalog at decision time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteTarget {
-    /// Logical provider identifier (e.g. `"openai"`, `"anthropic"`).
+    /// Logical provider identifier. Empty when this is a pool reference.
+    #[serde(default)]
     pub provider_id: String,
     /// The provider's model identifier (e.g. `"gpt-4o"`, `"claude-3-5-sonnet-20241022"`).
     pub model_id: String,
     /// Opaque key binding identifier (resolved to an actual secret at call time).
+    /// For pool targets, filled per member at expansion.
+    #[serde(default)]
     pub upstream_key_id: String,
     /// Provider kind used to select the correct codec/adapter (e.g. `"openai"`, `"anthropic"`).
+    #[serde(default)]
     pub provider_kind: String,
     /// Base URL for the upstream provider API (e.g. `"https://api.openai.com"`).
     /// Populated from ProviderRow at route load time. Defaults to None (codec fills in the default).
@@ -56,6 +67,12 @@ pub struct RouteTarget {
     /// Gateway-controlled fields such as `model` and `stream` cannot be overridden.
     #[serde(default)]
     pub request_overrides: Map<String, serde_json::Value>,
+    /// Named pool id (catalog named pool, or auto kind-pool id = kind string).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_id: Option<String>,
+    /// Expand to all catalog providers of this kind (e.g. `"claude-oauth"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_kind: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -89,10 +106,16 @@ pub struct Route {
 pub struct RoutingTable {
     /// Map from alias → Route. Keys are lowercase-normalised.
     routes: HashMap<String, Route>,
+    /// All configured providers (for pool expansion by kind / named pool).
+    #[serde(default)]
+    pub providers: Vec<ProviderCatalogEntry>,
+    /// Named pools (including auto kind-pools keyed by kind string).
+    #[serde(default)]
+    pub pools: HashMap<String, NamedPool>,
 }
 
 impl RoutingTable {
-    /// Build a new table from a list of routes.
+    /// Build a new table from a list of routes (empty provider catalog).
     ///
     /// Aliases are normalised to lowercase. Duplicate aliases are overwritten
     /// (last wins — callers are expected to validate uniqueness beforehand).
@@ -101,7 +124,22 @@ impl RoutingTable {
             .into_iter()
             .map(|r| (r.alias.to_lowercase(), r))
             .collect();
-        Self { routes: map }
+        Self {
+            routes: map,
+            providers: Vec::new(),
+            pools: HashMap::new(),
+        }
+    }
+
+    /// Attach provider catalog + named pools for multi-account pool targets.
+    pub fn with_provider_catalog(
+        mut self,
+        providers: Vec<ProviderCatalogEntry>,
+        pools: HashMap<String, NamedPool>,
+    ) -> Self {
+        self.providers = providers;
+        self.pools = pools;
+        self
     }
 
     /// Retrieve a route by alias (case-insensitive).
@@ -148,6 +186,8 @@ mod tests {
             base_url: None,
             weight: 1,
             request_overrides: Map::new(),
+            pool_id: None,
+            pool_kind: None,
         }
     }
 

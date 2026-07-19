@@ -10,9 +10,9 @@ use axum::{
 };
 use chrono::Utc;
 use conduit_oauth::{
-    generate_pkce, generate_state, supported_providers, ClaudeOAuth, CodexOAuth,
-    CredentialResolver, GrokOAuth, OAuthCredential, OAuthError, OAuthProviderKind, OAuthSession,
-    SecretStore, SessionStatus, SessionStore, SessionView,
+    generate_pkce, generate_state, resolve_effective_proxy, supported_providers, ClaudeOAuth,
+    CodexOAuth, CredentialResolver, GrokOAuth, OAuthCredential, OAuthError, OAuthProviderKind,
+    OAuthSession, SecretStore, SessionStatus, SessionStore, SessionView,
 };
 use conduit_store::{schema::ProviderRow, ProviderRepo};
 use parking_lot::Mutex;
@@ -58,6 +58,8 @@ impl SecretStore for BackendSecretStore {
 
 struct CallbackHandle {
     shutdown: oneshot::Sender<()>,
+    /// Optional second shutdown for fixed-port TCP forwarder.
+    forwarder_shutdown: Option<oneshot::Sender<()>>,
 }
 
 /// Process-wide OAuth runtime: sessions + active callback servers.
@@ -73,6 +75,113 @@ impl OAuthRuntime {
             callbacks: Mutex::new(HashMap::new()),
         }
     }
+}
+
+/// IdP-registered redirect ports (54545 / 1455) cannot change without
+/// `redirect_uri_mismatch`. Strategy:
+/// 1. Stop our own previous OAuth callback servers (they often hold the port).
+/// 2. Bind preferred; if still busy, bind ephemeral + TCP-forward preferred→ephemeral
+///    when preferred becomes free after a short retry; otherwise `PortInUse`.
+fn resolve_callback_listen_port(
+    state: &DaemonState,
+    preferred: u16,
+) -> Result<(u16 /*listen*/, bool /*needs_forwarder*/), OAuthError> {
+    // Free ports held by prior Conduit OAuth sessions.
+    stop_all_callbacks(state);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    if try_bind_probe(preferred) {
+        return Ok((preferred, false));
+    }
+
+    // Another process may still hold preferred. Try ephemeral server + forwarder
+    // only if we can claim preferred for the forwarder after one more stop+retry.
+    stop_all_callbacks(state);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    if try_bind_probe(preferred) {
+        return Ok((preferred, false));
+    }
+
+    // Preferred still taken by a non-Conduit process — cannot rewrite IdP redirect_uri.
+    Err(OAuthError::PortInUse(preferred))
+}
+
+fn try_bind_probe(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port))
+        .map(|l| {
+            drop(l);
+            true
+        })
+        .unwrap_or(false)
+}
+
+fn stop_all_callbacks(state: &DaemonState) {
+    let handles: Vec<_> = state.oauth.callbacks.lock().drain().map(|(_, h)| h).collect();
+    for h in handles {
+        let _ = h.shutdown.send(());
+        if let Some(fwd) = h.forwarder_shutdown {
+            let _ = fwd.send(());
+        }
+    }
+}
+
+/// TCP byte-forwarder: accept on `from_port`, connect to `127.0.0.1:to_port`.
+fn spawn_tcp_forwarder(
+    from_port: u16,
+    to_port: u16,
+    mut shutdown: oneshot::Receiver<()>,
+) -> Result<(), OAuthError> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", from_port))
+        .map_err(|_| OAuthError::PortInUse(from_port))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| OAuthError::Network(format!("forwarder nonblocking: {e}")))?;
+    tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::from_std(listener) {
+            Ok(l) => l,
+            Err(e) => {
+                error!("oauth forwarder from_std: {e}");
+                return;
+            }
+        };
+        info!(
+            from = from_port,
+            to = to_port,
+            "oauth callback TCP forwarder listening (IdP fixed port → local server)"
+        );
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => {
+                    info!(from = from_port, "oauth forwarder stopped");
+                    break;
+                }
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((mut inbound, _)) => {
+                            tokio::spawn(async move {
+                                match tokio::net::TcpStream::connect(("127.0.0.1", to_port)).await {
+                                    Ok(mut outbound) => {
+                                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                                    }
+                                    Err(e) => {
+                                        warn!("oauth forwarder connect {to_port}: {e}");
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            // WouldBlock / interrupted under load — continue until shutdown.
+                            if e.kind() != std::io::ErrorKind::WouldBlock {
+                                warn!("oauth forwarder accept: {e}");
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    Ok(())
 }
 
 impl Default for OAuthRuntime {
@@ -152,7 +261,8 @@ pub async fn refresh_provider_oauth(
     Path(provider_id): Path<String>,
 ) -> impl IntoResponse {
     let store = Arc::new(BackendSecretStore::new(state.secret_backend.clone()));
-    let resolver = CredentialResolver::new(store);
+    let resolver =
+        CredentialResolver::new(store).with_default_proxy(state.proxy_url.clone());
     match resolver.force_refresh(&provider_id).await {
         Ok(cred) => (
             StatusCode::OK,
@@ -179,30 +289,32 @@ async fn start_pkce_flow(
     let pkce = generate_pkce()?;
     let oauth_state = generate_state();
 
-    let (auth_url, port, callback_path) = match kind {
+    let proxy = resolve_effective_proxy(None, state.proxy_url.as_deref());
+    // IdP-registered callback ports cannot change; if busy, forward fixed → ephemeral.
+    let (preferred_port, callback_path) = match kind {
+        OAuthProviderKind::Claude => (
+            conduit_oauth::providers::claude::CALLBACK_PORT,
+            "/callback",
+        ),
+        OAuthProviderKind::Codex => (
+            conduit_oauth::providers::codex::CALLBACK_PORT,
+            "/auth/callback",
+        ),
+        OAuthProviderKind::Xai => unreachable!(),
+    };
+    let (listen_port, needs_forwarder) = resolve_callback_listen_port(state, preferred_port)?;
+
+    let auth_url = match kind {
         OAuthProviderKind::Claude => {
-            let oauth = ClaudeOAuth::new();
-            (
-                oauth.generate_auth_url(&oauth_state, &pkce),
-                conduit_oauth::providers::claude::CALLBACK_PORT,
-                "/callback",
-            )
+            ClaudeOAuth::with_proxy_url(proxy.clone())?
+                .generate_auth_url(&oauth_state, &pkce)
         }
         OAuthProviderKind::Codex => {
-            let oauth = CodexOAuth::new();
-            (
-                oauth.generate_auth_url(&oauth_state, &pkce),
-                conduit_oauth::providers::codex::CALLBACK_PORT,
-                "/auth/callback",
-            )
+            CodexOAuth::with_proxy_url(proxy)?
+                .generate_auth_url(&oauth_state, &pkce)
         }
         OAuthProviderKind::Xai => unreachable!(),
     };
-
-    // Check port availability
-    if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
-        return Err(OAuthError::PortInUse(port));
-    }
 
     let session = OAuthSession {
         id: session_id.clone(),
@@ -228,7 +340,15 @@ async fn start_pkce_flow(
     let view = session.view();
     state.oauth.sessions.insert(session);
 
-    spawn_callback_server(state.clone(), session_id, kind, port, callback_path)?;
+    spawn_callback_server(
+        state.clone(),
+        session_id,
+        kind,
+        listen_port,
+        preferred_port,
+        needs_forwarder,
+        callback_path,
+    )?;
     Ok(view)
 }
 
@@ -236,18 +356,30 @@ fn spawn_callback_server(
     state: Arc<DaemonState>,
     session_id: String,
     kind: OAuthProviderKind,
-    port: u16,
+    listen_port: u16,
+    preferred_port: u16,
+    needs_forwarder: bool,
     callback_path: &'static str,
 ) -> Result<(), OAuthError> {
     let (tx, rx) = oneshot::channel::<()>();
-    state
-        .oauth
-        .callbacks
-        .lock()
-        .insert(session_id.clone(), CallbackHandle { shutdown: tx });
+    let forwarder_shutdown = if needs_forwarder {
+        let (ftx, frx) = oneshot::channel::<()>();
+        spawn_tcp_forwarder(preferred_port, listen_port, frx)?;
+        Some(ftx)
+    } else {
+        None
+    };
+    state.oauth.callbacks.lock().insert(
+        session_id.clone(),
+        CallbackHandle {
+            shutdown: tx,
+            forwarder_shutdown,
+        },
+    );
 
     let state_cb = state.clone();
     let sid = session_id.clone();
+    let port = listen_port;
 
     tokio::spawn(async move {
         // Bind the provider-specific path. Codex uses `/auth/callback` and also
@@ -365,13 +497,20 @@ async fn handle_callback(
         }
     };
 
+    let proxy = resolve_effective_proxy(None, state.proxy_url.as_deref());
     let exchange = match kind {
-        OAuthProviderKind::Claude => {
-            ClaudeOAuth::new()
-                .exchange_code(&code, session.state.as_deref().unwrap_or(""), &pkce)
-                .await
-        }
-        OAuthProviderKind::Codex => CodexOAuth::new().exchange_code(&code, &pkce).await,
+        OAuthProviderKind::Claude => match ClaudeOAuth::with_proxy_url(proxy) {
+            Ok(oauth) => {
+                oauth
+                    .exchange_code(&code, session.state.as_deref().unwrap_or(""), &pkce)
+                    .await
+            }
+            Err(e) => Err(e),
+        },
+        OAuthProviderKind::Codex => match CodexOAuth::with_proxy_url(proxy) {
+            Ok(oauth) => oauth.exchange_code(&code, &pkce).await,
+            Err(e) => Err(e),
+        },
         OAuthProviderKind::Xai => unreachable!(),
     };
 
@@ -418,7 +557,8 @@ async fn start_device_flow(
     session_id: String,
     body: StartOAuthBody,
 ) -> Result<SessionView, OAuthError> {
-    let oauth = GrokOAuth::new();
+    let proxy = resolve_effective_proxy(None, state.proxy_url.as_deref());
+    let oauth = GrokOAuth::with_proxy_url(proxy)?;
     let device = oauth.start_device_flow().await?;
 
     let session = OAuthSession {
@@ -448,12 +588,32 @@ async fn start_device_flow(
     let view = session.view();
     state.oauth.sessions.insert(session);
 
-    // Background poll
+    // Background poll — cancel when session status leaves Pending.
     let state_bg = state.clone();
     let sid = session_id.clone();
+    let proxy_bg = resolve_effective_proxy(None, state.proxy_url.as_deref());
     tokio::spawn(async move {
-        let oauth = GrokOAuth::new();
-        match oauth.wait_for_authorization(&device).await {
+        let oauth = match GrokOAuth::with_proxy_url(proxy_bg) {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = state_bg.oauth.sessions.update(&sid, |s| {
+                    s.status = SessionStatus::Error;
+                    s.error = Some(e.to_string());
+                });
+                return;
+            }
+        };
+        let sessions = state_bg.oauth.sessions.clone();
+        let sid_check = sid.clone();
+        let result = oauth
+            .wait_for_authorization_cancellable(&device, || {
+                sessions
+                    .get(&sid_check)
+                    .map(|s| s.status != SessionStatus::Pending)
+                    .unwrap_or(true)
+            })
+            .await;
+        match result {
             Ok(cred) => {
                 let sess = state_bg.oauth.sessions.get(&sid);
                 if let Some(sess) = sess {
@@ -475,6 +635,9 @@ async fn start_device_flow(
                         }
                     }
                 }
+            }
+            Err(OAuthError::SessionCancelled) => {
+                // User cancelled — status already Cancelled.
             }
             Err(e) => {
                 let _ = state_bg.oauth.sessions.update(&sid, |s| {
@@ -499,13 +662,33 @@ async fn persist_credential(
 ) -> Result<String, OAuthError> {
     let email = cred.email.clone();
     let kind = session.kind;
-    let id = session
-        .provider_id
-        .clone()
-        .unwrap_or_else(|| Ulid::new().to_string());
-    let name = session.name.clone().unwrap_or_else(|| match &email {
-        Some(e) if !e.is_empty() => format!("{} ({e})", kind.as_str()),
-        _ => format!("{}-oauth", kind.as_str()),
+    // Codex: CLIProxyAPI multi-auth stable id from email + plan + account (team).
+    let stable_codex_id = if kind == OAuthProviderKind::Codex {
+        conduit_oauth::providers::codex::stable_provider_id(
+            cred.email.as_deref(),
+            cred.plan_type_str(),
+            cred.account_id.as_deref(),
+        )
+    } else {
+        None
+    };
+    let id = if let Some(ref pid) = session.provider_id {
+        pid.clone()
+    } else if let Some(ref sid) = stable_codex_id {
+        // Reuse existing provider row with same stable id if present.
+        sid.clone()
+    } else {
+        Ulid::new().to_string()
+    };
+    let name = session.name.clone().unwrap_or_else(|| match kind {
+        OAuthProviderKind::Codex => conduit_oauth::providers::codex::display_provider_name(
+            cred.email.as_deref(),
+            cred.plan_type_str(),
+        ),
+        _ => match &email {
+            Some(e) if !e.is_empty() => format!("{} ({e})", kind.as_str()),
+            _ => format!("{}-oauth", kind.as_str()),
+        },
     });
     let base_url = cred
         .base_url
@@ -567,6 +750,9 @@ async fn persist_credential(
 fn stop_callback(state: &DaemonState, session_id: &str) {
     if let Some(h) = state.oauth.callbacks.lock().remove(session_id) {
         let _ = h.shutdown.send(());
+        if let Some(fwd) = h.forwarder_shutdown {
+            let _ = fwd.send(());
+        }
     }
 }
 

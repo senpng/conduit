@@ -9,7 +9,7 @@ use std::{
 use arc_swap::ArcSwap;
 use conduit_ir::pricing::pricing_kind_aliases;
 use conduit_pipeline::{egress::ModelPricing, handle::PipelineHandle};
-use conduit_router::table::RoutingTable;
+use conduit_router::{table::RoutingTable, ProviderCooldownStore, UpstreamQuotaStore};
 use conduit_secret::SecretBackend;
 use conduit_store::{PricingRepo, StorePool};
 
@@ -47,6 +47,15 @@ pub struct DaemonState {
 
     /// OAuth login sessions + callback servers.
     pub oauth: Arc<OAuthRuntime>,
+
+    /// Daemon config proxy (CLIProxyAPI `cfg.ProxyURL`); env / per-cred override.
+    pub proxy_url: Option<String>,
+
+    /// Upstream provider cooldown after 429 / usage_limit.
+    pub cooldown: Arc<ProviderCooldownStore>,
+
+    /// Last-seen upstream rate-limit / quota headers & error signals.
+    pub quota_snapshots: Arc<UpstreamQuotaStore>,
 
     /// Daemon version string.
     pub version: &'static str,

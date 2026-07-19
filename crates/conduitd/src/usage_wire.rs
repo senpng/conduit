@@ -81,7 +81,7 @@ mod tests {
         .await
         .unwrap();
 
-        let rows = UsageRepo::new(&pool).list(10, None).await.unwrap();
+        let rows = UsageRepo::new(&pool).list(10, None, None).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].request_id, "tr-1");
         assert_eq!(rows[0].downstream_key_id.as_deref(), Some("dk_abc"));
@@ -112,7 +112,7 @@ mod tests {
         .await
         .unwrap();
 
-        let rows = UsageRepo::new(&pool).list(10, None).await.unwrap();
+        let rows = UsageRepo::new(&pool).list(10, None, None).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].downstream_key_id.is_none());
         assert!(rows[0].stream);

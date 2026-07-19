@@ -7,7 +7,10 @@ use conduit_ir::{
     error::{GatewayError, ProviderError},
     wire_format::WireFormat,
 };
-use conduit_router::{table::RoutingTable, AffinityStore};
+use conduit_router::{
+    is_usage_limit_body, parse_cooldown_duration, table::RoutingTable, AffinityStore,
+    ProviderCooldownStore, UpstreamQuotaStore,
+};
 use futures::stream::BoxStream;
 use tracing::warn;
 
@@ -16,7 +19,7 @@ use super::{
     egress,
     ingress::{self, KeyPolicy},
     provider::{dispatch_non_stream, dispatch_stream, UpstreamAuth},
-    stage::{route_request, should_retry},
+    stage::{route_request_with_skip, should_retry},
     stream_probe::UsageTrackingStream,
 };
 
@@ -38,6 +41,10 @@ pub struct PipelineDeps {
     pub quota: Arc<dyn conduit_quota::engine::QuotaEngine>,
     pub key_policy_fn: KeyPolicyFn,
     pub affinity: Arc<AffinityStore>,
+    /// Upstream provider cooldown after 429 / usage_limit (CLIProxyAPI parity).
+    pub cooldown: Arc<ProviderCooldownStore>,
+    /// Last-seen rate-limit / quota signals from upstream responses.
+    pub quota_snapshots: Arc<UpstreamQuotaStore>,
 }
 
 pub enum PipelineResult {
@@ -81,7 +88,8 @@ impl PipelineHandle {
             .downstream_key_id
             .as_deref()
             .and_then(|k| self.deps.affinity.preferred(k, &ctx.request.alias));
-        if let Err(e) = route_request(&mut ctx, preferred.as_deref()) {
+        let skip = self.deps.cooldown.cooling_ids();
+        if let Err(e) = route_request_with_skip(&mut ctx, preferred.as_deref(), Some(&skip)) {
             return Err(e);
         }
 
@@ -147,7 +155,13 @@ impl PipelineHandle {
     ) -> Result<PipelineResult, GatewayError> {
         loop {
             let upstream_req = request_for_upstream(&ctx.request, &resolved);
-            let result = dispatch_non_stream(&resolved, &upstream_req, &auth).await;
+            let result = dispatch_non_stream(
+                &resolved,
+                &upstream_req,
+                &auth,
+                Some(self.rate_limit_sink()),
+            )
+            .await;
 
             match result {
                 Ok((resp, loss)) => {
@@ -166,13 +180,17 @@ impl PipelineHandle {
                 }
 
                 Err(e) => {
+                    self.note_upstream_error(&resolved, &e);
                     let table = ctx.routing_table.clone();
                     if should_retry(&mut ctx, &table, &e) {
                         let preferred = ctx
                             .downstream_key_id
                             .as_deref()
                             .and_then(|k| self.deps.affinity.preferred(k, &ctx.request.alias));
-                        if let Err(routing_err) = route_request(&mut ctx, preferred.as_deref()) {
+                        let skip = self.deps.cooldown.cooling_ids();
+                        if let Err(routing_err) =
+                            route_request_with_skip(&mut ctx, preferred.as_deref(), Some(&skip))
+                        {
                             return Err(routing_err);
                         }
                         let new_resolved = ctx.resolved.as_ref().unwrap().clone();
@@ -201,7 +219,13 @@ impl PipelineHandle {
     ) -> Result<PipelineResult, GatewayError> {
         loop {
             let upstream_req = request_for_upstream(&ctx.request, &resolved);
-            let result = dispatch_stream(&resolved, &upstream_req, &auth).await;
+            let result = dispatch_stream(
+                &resolved,
+                &upstream_req,
+                &auth,
+                Some(self.rate_limit_sink()),
+            )
+            .await;
 
             match result {
                 Ok((stream, loss)) => {
@@ -224,13 +248,17 @@ impl PipelineHandle {
                 }
 
                 Err(e) => {
+                    self.note_upstream_error(&resolved, &e);
                     let table = ctx.routing_table.clone();
                     if should_retry(&mut ctx, &table, &e) {
                         let preferred = ctx
                             .downstream_key_id
                             .as_deref()
                             .and_then(|k| self.deps.affinity.preferred(k, &ctx.request.alias));
-                        if let Err(routing_err) = route_request(&mut ctx, preferred.as_deref()) {
+                        let skip = self.deps.cooldown.cooling_ids();
+                        if let Err(routing_err) =
+                            route_request_with_skip(&mut ctx, preferred.as_deref(), Some(&skip))
+                        {
                             return Err(routing_err);
                         }
                         let new_resolved = ctx.resolved.as_ref().unwrap().clone();
@@ -249,6 +277,39 @@ impl PipelineHandle {
                 }
             }
         }
+    }
+
+    /// Sink for successful/error response rate-limit headers → quota snapshot store.
+    fn rate_limit_sink(&self) -> conduit_upstream::RateLimitHeaderSink {
+        let store = self.deps.quota_snapshots.clone();
+        std::sync::Arc::new(move |provider_id: &str, headers: Vec<(String, String)>| {
+            store.record_headers(provider_id, headers);
+        })
+    }
+
+    /// Mark provider cooling on 429 / usage_limit so multi-target routes skip it.
+    fn note_upstream_error(&self, resolved: &ResolvedProvider, err: &ProviderError) {
+        let ProviderError::RateLimited(body) = err else {
+            return;
+        };
+        let duration = parse_cooldown_duration(body);
+        let reason = if is_usage_limit_body(body) {
+            "usage_limit"
+        } else {
+            "rate_limited"
+        };
+        tracing::warn!(
+            provider_id = %resolved.provider_id,
+            secs = duration.as_secs(),
+            reason,
+            "upstream cooldown: marking provider"
+        );
+        self.deps
+            .cooldown
+            .mark(&resolved.provider_id, duration, reason, 429);
+        self.deps
+            .quota_snapshots
+            .record_error_body(&resolved.provider_id, body);
     }
 
     async fn resolve_auth(&self, key_id: &str) -> Result<UpstreamAuth, GatewayError> {
@@ -360,6 +421,8 @@ mod hotpath_tests {
                 base_url: Some("https://api.openai.com".into()),
                 weight: 1,
                 request_overrides: Default::default(),
+                pool_id: None,
+                pool_kind: None,
             }],
             retry_policy: RetryPolicy::default(),
         }])
@@ -431,6 +494,8 @@ mod hotpath_tests {
                 })
             }),
             affinity: Arc::new(AffinityStore::new()),
+            cooldown: Arc::new(ProviderCooldownStore::new()),
+            quota_snapshots: Arc::new(UpstreamQuotaStore::new()),
         }));
 
         match handle
@@ -486,6 +551,7 @@ mod hotpath_tests {
                         token: SecretString::new("upstream-token".into()),
                         extra_headers: vec![],
                         client_headers: vec![],
+                        using_api: false,
                     })
                 })
             }),
@@ -493,6 +559,8 @@ mod hotpath_tests {
             quota: Arc::new(CapturingQuota { ids: checked_ids2 }),
             key_policy_fn: policy_for(raw_bearer, stable_id),
             affinity: Arc::new(AffinityStore::new()),
+            cooldown: Arc::new(ProviderCooldownStore::new()),
+            quota_snapshots: Arc::new(UpstreamQuotaStore::new()),
         }));
 
         let _ = handle

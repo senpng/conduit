@@ -187,6 +187,104 @@ impl PricingRepo {
         self.snapshot.all().await
     }
 
+    /// Read operator overrides only (`{app_dir}/pricing.json`), not merged layers.
+    pub async fn list_overrides(app_dir: &Path) -> Result<Vec<PricingRow>, StoreError> {
+        let path = app_dir.join("pricing.json");
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = tokio::fs::read_to_string(&path).await.map_err(|e| {
+            StoreError::Serialization(format!("read pricing.json: {e}"))
+        })?;
+        // Accept either a bare array or tokscale-like `{ "models": { ... } }` is not used —
+        // Conduit format is always a JSON array of PricingRow.
+        serde_json::from_str(&content).map_err(|e| {
+            StoreError::Serialization(format!("parse pricing.json: {e}"))
+        })
+    }
+
+    /// Upsert one operator override into `pricing.json`, then hot-reload layers.
+    pub async fn upsert_override(
+        &self,
+        app_dir: &Path,
+        row: PricingRow,
+    ) -> Result<Vec<PricingRow>, StoreError> {
+        if row.provider_kind.trim().is_empty() || row.model_id.trim().is_empty() {
+            return Err(StoreError::Serialization(
+                "provider_kind and model_id are required".into(),
+            ));
+        }
+        if !row.input_per_mtok.is_finite()
+            || !row.output_per_mtok.is_finite()
+            || row.input_per_mtok < 0.0
+            || row.output_per_mtok < 0.0
+        {
+            return Err(StoreError::Serialization(
+                "input_per_mtok and output_per_mtok must be finite and non-negative".into(),
+            ));
+        }
+        if row.input_per_mtok == 0.0 && row.output_per_mtok == 0.0 {
+            return Err(StoreError::Serialization(
+                "at least one of input_per_mtok or output_per_mtok must be positive".into(),
+            ));
+        }
+
+        let mut rows = Self::list_overrides(app_dir).await?;
+        if let Some(existing) = rows.iter_mut().find(|r| {
+            r.provider_kind == row.provider_kind && r.model_id == row.model_id
+        }) {
+            *existing = row;
+        } else {
+            rows.push(row);
+        }
+        rows.sort_by(|a, b| {
+            a.provider_kind
+                .cmp(&b.provider_kind)
+                .then_with(|| a.model_id.cmp(&b.model_id))
+        });
+        Self::write_overrides_file(app_dir, &rows).await?;
+        self.reload(app_dir).await?;
+        Ok(rows)
+    }
+
+    /// Delete one operator override from `pricing.json`, then hot-reload layers.
+    pub async fn delete_override(
+        &self,
+        app_dir: &Path,
+        provider_kind: &str,
+        model_id: &str,
+    ) -> Result<Vec<PricingRow>, StoreError> {
+        let mut rows = Self::list_overrides(app_dir).await?;
+        let before = rows.len();
+        rows.retain(|r| !(r.provider_kind == provider_kind && r.model_id == model_id));
+        if rows.len() == before {
+            return Err(StoreError::NotFound(format!(
+                "override {provider_kind}/{model_id} not found"
+            )));
+        }
+        Self::write_overrides_file(app_dir, &rows).await?;
+        self.reload(app_dir).await?;
+        Ok(rows)
+    }
+
+    async fn write_overrides_file(app_dir: &Path, rows: &[PricingRow]) -> Result<(), StoreError> {
+        if let Some(parent) = app_dir.parent() {
+            // app_dir itself should exist; still ensure
+            let _ = parent;
+        }
+        tokio::fs::create_dir_all(app_dir).await.map_err(|e| {
+            StoreError::Serialization(format!("create data dir: {e}"))
+        })?;
+        let path = app_dir.join("pricing.json");
+        let text = serde_json::to_string_pretty(rows)
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        tokio::fs::write(&path, text)
+            .await
+            .map_err(|e| StoreError::Serialization(format!("write pricing.json: {e}")))?;
+        info!(path = %path.display(), rows = rows.len(), "pricing overrides written");
+        Ok(())
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     async fn load_from_file_or_default(app_dir: &Path) -> Vec<PricingRow> {
@@ -320,6 +418,37 @@ mod tests {
         let row = repo.get_price("openai", "gpt-4o").await.unwrap();
         assert_eq!(row.input_per_mtok, 2.50);
         assert_eq!(row.output_per_mtok, 10.00);
+    }
+
+    #[tokio::test]
+    async fn upsert_and_delete_override_roundtrip() {
+        let pool = open_db("sqlite::memory:").await.unwrap();
+        let dir = tempdir().unwrap();
+        let repo = PricingRepo::new(pool, dir.path()).await.unwrap();
+
+        let row = PricingRow {
+            provider_kind: "openai".into(),
+            model_id: "custom-model".into(),
+            input_per_mtok: 1.5,
+            output_per_mtok: 6.0,
+            cache_read_per_mtok: Some(0.75),
+            cache_write_per_mtok: None,
+            reasoning_per_mtok: None,
+            effective_from: "2026-01-01".into(),
+        };
+        let listed = repo.upsert_override(dir.path(), row).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].model_id, "custom-model");
+
+        let got = repo.get_price("openai", "custom-model").await.unwrap();
+        assert!((got.input_per_mtok - 1.5).abs() < f64::EPSILON);
+
+        let after = repo
+            .delete_override(dir.path(), "openai", "custom-model")
+            .await
+            .unwrap();
+        assert!(after.is_empty());
+        assert!(repo.get_price("openai", "custom-model").await.is_none());
     }
 
     #[tokio::test]

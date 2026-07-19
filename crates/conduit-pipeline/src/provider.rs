@@ -13,6 +13,7 @@ use conduit_ir::{
     loss::LossReport,
 };
 use conduit_upstream::provider::{ProviderClient, ProviderClientConfig};
+use conduit_upstream::RateLimitHeaderSink;
 use futures::stream::{BoxStream, StreamExt};
 use secrecy::SecretString;
 
@@ -77,6 +78,19 @@ pub struct UpstreamAuth {
     /// Downstream client headers (User-Agent, Stainless, Anthropic-Beta, …)
     /// for Claude OAuth device-profile / cloak parity with CLIProxyAPI.
     pub client_headers: Vec<(String, String)>,
+    /// xAI OAuth: use official API instead of cli-chat-proxy (CLIProxyAPI `using_api`).
+    pub using_api: bool,
+}
+
+impl Default for UpstreamAuth {
+    fn default() -> Self {
+        Self {
+            token: SecretString::new(String::new()),
+            extra_headers: vec![],
+            client_headers: vec![],
+            using_api: false,
+        }
+    }
 }
 
 pub fn resolve_kind(provider_kind: &str) -> Result<ProviderKind, ProviderError> {
@@ -88,13 +102,22 @@ pub async fn dispatch_non_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
+    rate_limit_sink: Option<RateLimitHeaderSink>,
 ) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
     match resolve_kind(&resolved.provider_kind)? {
-        ProviderKind::OpenAi => openai_non_stream(resolved, request, auth).await,
-        ProviderKind::Anthropic => anthropic_non_stream(resolved, request, auth).await,
-        ProviderKind::ClaudeOAuth => claude_oauth_non_stream(resolved, request, auth).await,
-        ProviderKind::CodexOAuth => codex_oauth_non_stream(resolved, request, auth).await,
-        ProviderKind::GrokOAuth => grok_oauth_non_stream(resolved, request, auth).await,
+        ProviderKind::OpenAi => openai_non_stream(resolved, request, auth, rate_limit_sink).await,
+        ProviderKind::Anthropic => {
+            anthropic_non_stream(resolved, request, auth, rate_limit_sink).await
+        }
+        ProviderKind::ClaudeOAuth => {
+            claude_oauth_non_stream(resolved, request, auth, rate_limit_sink).await
+        }
+        ProviderKind::CodexOAuth => {
+            codex_oauth_non_stream(resolved, request, auth, rate_limit_sink).await
+        }
+        ProviderKind::GrokOAuth => {
+            grok_oauth_non_stream(resolved, request, auth, rate_limit_sink).await
+        }
     }
 }
 
@@ -103,6 +126,7 @@ pub async fn dispatch_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
+    rate_limit_sink: Option<RateLimitHeaderSink>,
 ) -> Result<
     (
         BoxStream<'static, Result<CanonicalChunk, ProviderError>>,
@@ -111,11 +135,22 @@ pub async fn dispatch_stream(
     ProviderError,
 > {
     match resolve_kind(&resolved.provider_kind)? {
-        ProviderKind::OpenAi => openai_stream(resolved, request, auth).await,
-        ProviderKind::Anthropic => anthropic_stream(resolved, request, auth).await,
-        ProviderKind::ClaudeOAuth => claude_oauth_stream(resolved, request, auth).await,
-        ProviderKind::CodexOAuth => codex_oauth_stream(resolved, request, auth).await,
-        ProviderKind::GrokOAuth => grok_oauth_stream(resolved, request, auth).await,
+        ProviderKind::OpenAi => openai_stream(resolved, request, auth, rate_limit_sink).await,
+        ProviderKind::Anthropic => anthropic_stream(resolved, request, auth, rate_limit_sink).await,
+        ProviderKind::ClaudeOAuth => {
+            claude_oauth_stream(resolved, request, auth, rate_limit_sink).await
+        }
+        ProviderKind::CodexOAuth => {
+            codex_oauth_stream(resolved, request, auth, rate_limit_sink).await
+        }
+        ProviderKind::GrokOAuth => grok_oauth_stream(resolved, request, auth, rate_limit_sink).await,
+    }
+}
+
+fn apply_sink(cfg: ProviderClientConfig, sink: Option<RateLimitHeaderSink>) -> ProviderClientConfig {
+    match sink {
+        Some(s) => cfg.with_rate_limit_sink(s),
+        None => cfg,
     }
 }
 
@@ -123,6 +158,7 @@ async fn openai_non_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
+    rate_limit_sink: Option<RateLimitHeaderSink>,
 ) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
     use conduit_codec::openai::OpenAiCodec;
     let base_url = resolved
@@ -133,7 +169,7 @@ async fn openai_non_stream(
     if !auth.extra_headers.is_empty() {
         cfg = cfg.with_extra_headers(auth.extra_headers.clone());
     }
-    cfg = cfg.with_request_overrides(resolved.request_overrides.clone());
+    cfg = apply_sink(cfg.with_request_overrides(resolved.request_overrides.clone()), rate_limit_sink);
     ProviderClient::<OpenAiCodec>::new(cfg)
         .chat(request, &auth.token)
         .await
@@ -143,6 +179,7 @@ async fn anthropic_non_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
+    rate_limit_sink: Option<RateLimitHeaderSink>,
 ) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
     use conduit_codec::anthropic::AnthropicCodec;
     let mut cfg = ProviderClientConfig::anthropic(&resolved.provider_id);
@@ -152,7 +189,7 @@ async fn anthropic_non_stream(
     if !auth.extra_headers.is_empty() {
         cfg = cfg.with_extra_headers(auth.extra_headers.clone());
     }
-    cfg = cfg.with_request_overrides(resolved.request_overrides.clone());
+    cfg = apply_sink(cfg.with_request_overrides(resolved.request_overrides.clone()), rate_limit_sink);
     ProviderClient::<AnthropicCodec>::new(cfg)
         .chat(request, &auth.token)
         .await
@@ -186,6 +223,7 @@ async fn claude_oauth_non_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
+    rate_limit_sink: Option<RateLimitHeaderSink>,
 ) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
     use conduit_codec::anthropic::AnthropicCodec;
     use conduit_upstream::claude_oauth;
@@ -203,6 +241,8 @@ async fn claude_oauth_non_stream(
         &opts,
         &resolved.request_overrides,
         120_000,
+        rate_limit_sink,
+        &resolved.provider_id,
     )
     .await
 }
@@ -224,10 +264,11 @@ async fn codex_oauth_non_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
+    rate_limit_sink: Option<RateLimitHeaderSink>,
 ) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
     // CLIProxyAPI non-stream path: upstream SSE → aggregate text + usage → one response.
     let req = sanitize_codex_request(request);
-    let (mut stream, loss) = codex_oauth_stream(resolved, &req, auth).await?;
+    let (mut stream, loss) = codex_oauth_stream(resolved, &req, auth, rate_limit_sink).await?;
     let mut text = String::new();
     let mut finish = FinishReason::Stop;
     let mut usage = Usage::default();
@@ -270,24 +311,43 @@ async fn codex_oauth_non_stream(
     Ok((response, loss))
 }
 
+fn grok_using_api(resolved: &ResolvedProvider, auth: &UpstreamAuth) -> bool {
+    if auth.using_api {
+        return true;
+    }
+    // Optional route-level override (request_overrides.using_api).
+    match resolved.request_overrides.get("using_api") {
+        Some(v) if v.as_bool() == Some(true) => true,
+        Some(v) if v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("true") || s == "1") => true,
+        _ => false,
+    }
+}
+
 async fn grok_oauth_non_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
+    rate_limit_sink: Option<RateLimitHeaderSink>,
 ) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
-    // CLIProxyAPI parity: OAuth chat → cli-chat-proxy + Responses API + CLI headers.
+    // CLIProxyAPI parity: OAuth chat → cli-chat-proxy (unless using_api) + Responses API.
     use conduit_codec::OpenAiResponsesCodec;
-    use conduit_oauth::{cli_proxy_headers, resolve_oauth_chat_base};
-    let base = resolve_oauth_chat_base(resolved.base_url.as_deref());
+    use conduit_oauth::{cli_proxy_headers, is_cli_chat_proxy_base, resolve_oauth_chat_base};
+    let using_api = grok_using_api(resolved, auth);
+    let base = resolve_oauth_chat_base(resolved.base_url.as_deref(), using_api);
     let mut headers = auth.extra_headers.clone();
-    // Ensure CLI identity headers even if credential was stored without them.
-    for (k, v) in cli_proxy_headers() {
-        if !headers.iter().any(|(hk, _)| hk.eq_ignore_ascii_case(&k)) {
-            headers.push((k, v));
+    // CLI identity headers only on chat-proxy path (CLIProxyAPI applyXAIChatHeaders).
+    if !using_api && is_cli_chat_proxy_base(&base) {
+        for (k, v) in cli_proxy_headers() {
+            if !headers.iter().any(|(hk, _)| hk.eq_ignore_ascii_case(&k)) {
+                headers.push((k, v));
+            }
         }
     }
-    let cfg = ProviderClientConfig::grok_oauth(&resolved.provider_id, base, headers)
-        .with_request_overrides(resolved.request_overrides.clone());
+    let cfg = apply_sink(
+        ProviderClientConfig::grok_oauth(&resolved.provider_id, base, headers)
+            .with_request_overrides(resolved.request_overrides.clone()),
+        rate_limit_sink,
+    );
     ProviderClient::<OpenAiResponsesCodec>::new(cfg)
         .chat(request, &auth.token)
         .await
@@ -297,6 +357,7 @@ async fn openai_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
+    rate_limit_sink: Option<RateLimitHeaderSink>,
 ) -> Result<
     (
         BoxStream<'static, Result<CanonicalChunk, ProviderError>>,
@@ -313,7 +374,7 @@ async fn openai_stream(
     if !auth.extra_headers.is_empty() {
         cfg = cfg.with_extra_headers(auth.extra_headers.clone());
     }
-    cfg = cfg.with_request_overrides(resolved.request_overrides.clone());
+    cfg = apply_sink(cfg.with_request_overrides(resolved.request_overrides.clone()), rate_limit_sink);
     ProviderClient::<OpenAiCodec>::new(cfg)
         .chat_stream(request, &auth.token)
         .await
@@ -323,6 +384,7 @@ async fn anthropic_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
+    rate_limit_sink: Option<RateLimitHeaderSink>,
 ) -> Result<
     (
         BoxStream<'static, Result<CanonicalChunk, ProviderError>>,
@@ -338,7 +400,7 @@ async fn anthropic_stream(
     if !auth.extra_headers.is_empty() {
         cfg = cfg.with_extra_headers(auth.extra_headers.clone());
     }
-    cfg = cfg.with_request_overrides(resolved.request_overrides.clone());
+    cfg = apply_sink(cfg.with_request_overrides(resolved.request_overrides.clone()), rate_limit_sink);
     ProviderClient::<AnthropicCodec>::new(cfg)
         .chat_stream(request, &auth.token)
         .await
@@ -348,6 +410,7 @@ async fn claude_oauth_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
+    rate_limit_sink: Option<RateLimitHeaderSink>,
 ) -> Result<
     (
         BoxStream<'static, Result<CanonicalChunk, ProviderError>>,
@@ -370,6 +433,8 @@ async fn claude_oauth_stream(
         &auth.token,
         &opts,
         &resolved.request_overrides,
+        rate_limit_sink,
+        &resolved.provider_id,
     )
     .await
 }
@@ -378,6 +443,7 @@ async fn codex_oauth_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
+    rate_limit_sink: Option<RateLimitHeaderSink>,
 ) -> Result<
     (
         BoxStream<'static, Result<CanonicalChunk, ProviderError>>,
@@ -391,9 +457,11 @@ async fn codex_oauth_stream(
         .base_url
         .as_deref()
         .unwrap_or("https://chatgpt.com/backend-api/codex");
-    let cfg =
+    let cfg = apply_sink(
         ProviderClientConfig::codex_oauth(&resolved.provider_id, base, auth.extra_headers.clone())
-            .with_request_overrides(resolved.request_overrides.clone());
+            .with_request_overrides(resolved.request_overrides.clone()),
+        rate_limit_sink,
+    );
     ProviderClient::<OpenAiResponsesCodec>::new(cfg)
         .chat_stream(&req, &auth.token)
         .await
@@ -403,6 +471,7 @@ async fn grok_oauth_stream(
     resolved: &ResolvedProvider,
     request: &CanonicalChatRequest,
     auth: &UpstreamAuth,
+    rate_limit_sink: Option<RateLimitHeaderSink>,
 ) -> Result<
     (
         BoxStream<'static, Result<CanonicalChunk, ProviderError>>,
@@ -411,16 +480,22 @@ async fn grok_oauth_stream(
     ProviderError,
 > {
     use conduit_codec::OpenAiResponsesCodec;
-    use conduit_oauth::{cli_proxy_headers, resolve_oauth_chat_base};
-    let base = resolve_oauth_chat_base(resolved.base_url.as_deref());
+    use conduit_oauth::{cli_proxy_headers, is_cli_chat_proxy_base, resolve_oauth_chat_base};
+    let using_api = grok_using_api(resolved, auth);
+    let base = resolve_oauth_chat_base(resolved.base_url.as_deref(), using_api);
     let mut headers = auth.extra_headers.clone();
-    for (k, v) in cli_proxy_headers() {
-        if !headers.iter().any(|(hk, _)| hk.eq_ignore_ascii_case(&k)) {
-            headers.push((k, v));
+    if !using_api && is_cli_chat_proxy_base(&base) {
+        for (k, v) in cli_proxy_headers() {
+            if !headers.iter().any(|(hk, _)| hk.eq_ignore_ascii_case(&k)) {
+                headers.push((k, v));
+            }
         }
     }
-    let cfg = ProviderClientConfig::grok_oauth(&resolved.provider_id, base, headers)
-        .with_request_overrides(resolved.request_overrides.clone());
+    let cfg = apply_sink(
+        ProviderClientConfig::grok_oauth(&resolved.provider_id, base, headers)
+            .with_request_overrides(resolved.request_overrides.clone()),
+        rate_limit_sink,
+    );
     ProviderClient::<OpenAiResponsesCodec>::new(cfg)
         .chat_stream(request, &auth.token)
         .await
@@ -449,6 +524,7 @@ mod tests {
             token: SecretString::new("sk-test".into()),
             extra_headers: vec![],
             client_headers: vec![],
+            using_api: false,
         }
     }
 
@@ -485,7 +561,7 @@ mod tests {
         let req = CanonicalChatRequest::new("alias", vec![CanonicalMessage::user("hi")]);
         let auth = sample_auth();
 
-        let err = dispatch_non_stream(&resolved, &req, &auth)
+        let err = dispatch_non_stream(&resolved, &req, &auth, None)
             .await
             .unwrap_err();
         match err {
@@ -508,7 +584,7 @@ mod tests {
             "anthropic",
         ] {
             let resolved = sample_resolved(kind);
-            let err = match dispatch_non_stream(&resolved, &req, &auth).await {
+            let err = match dispatch_non_stream(&resolved, &req, &auth, None).await {
                 Ok(_) => panic!("closed port must fail for {kind}"),
                 Err(e) => e,
             };

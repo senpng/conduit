@@ -21,7 +21,7 @@ use conduit_pipeline::{
 use conduit_quota::engine::InMemoryQuotaEngine;
 use conduit_router::{
     table::{Route, RoutingStrategy, RoutingTable},
-    AffinityStore,
+    AffinityStore, ProviderCooldownStore, UpstreamQuotaStore,
 };
 use conduit_store::{KeyRepo, PricingRepo, RouteRepo};
 use secrecy::SecretVec;
@@ -67,7 +67,10 @@ pub async fn run(
         let rows = route_repo.list().await?;
         let provider_map = build_provider_map(&pool).await?;
         let routes = rows_to_routes(rows, &provider_map)?;
-        Arc::new(ArcSwap::from_pointee(RoutingTable::new(routes)))
+        let (providers, pools) = build_provider_catalog(&pool).await?;
+        Arc::new(ArcSwap::from_pointee(
+            RoutingTable::new(routes).with_provider_catalog(providers, pools),
+        ))
     };
 
     // ── Quota engine: RPM + usage ledger ─────────────────────────────────────
@@ -111,10 +114,14 @@ pub async fn run(
 
     // ── Process-shared CredentialResolver (singleflight refresh) ─────────────
     // One resolver for the daemon lifetime so concurrent near-expiry refreshes
-    // share the same RefreshCoordinator.
-    let credential_resolver = Arc::new(conduit_oauth::CredentialResolver::new(Arc::new(
-        SecretBackendStore(secret_backend.clone()),
-    )));
+    // share the same RefreshCoordinator. Daemon config proxy_url is the
+    // CLIProxyAPI cfg.ProxyURL equivalent (env / per-cred still override).
+    let credential_resolver = Arc::new(
+        conduit_oauth::CredentialResolver::new(Arc::new(SecretBackendStore(
+            secret_backend.clone(),
+        )))
+        .with_default_proxy(cfg.proxy_url.clone()),
+    );
 
     let resolver_for_secret = credential_resolver.clone();
     let secret_fn: AuthFn = Arc::new(move |key_id: String| {
@@ -122,11 +129,16 @@ pub async fn run(
         Box::pin(async move {
             match tokio::time::timeout(Duration::from_secs(25), resolver.resolve(&key_id)).await {
                 Ok(Ok(resolved)) => {
-                    tracing::debug!(key_id = %key_id, "credential resolve ok");
+                    tracing::debug!(
+                        key_id = %key_id,
+                        using_api = resolved.using_api,
+                        "credential resolve ok"
+                    );
                     Ok(UpstreamAuth {
                         token: resolved.access_token,
                         extra_headers: resolved.extra_headers,
                         client_headers: vec![],
+                        using_api: resolved.using_api,
                     })
                 }
                 Ok(Err(e)) => {
@@ -160,6 +172,8 @@ pub async fn run(
     });
 
     // Shared pipeline — constructed once; routing_table is ArcSwap-backed.
+    let cooldown = Arc::new(ProviderCooldownStore::new());
+    let quota_snapshots = Arc::new(UpstreamQuotaStore::new());
     let pipeline = Arc::new(PipelineHandle::new(Arc::new(PipelineDeps {
         routing_table: routing_table.clone(),
         secret_fn,
@@ -167,6 +181,8 @@ pub async fn run(
         quota: quota.clone(),
         key_policy_fn,
         affinity: Arc::new(AffinityStore::new()),
+        cooldown: cooldown.clone(),
+        quota_snapshots: quota_snapshots.clone(),
     })));
 
     // ── Assemble DaemonState ──────────────────────────────────────────────────
@@ -179,6 +195,9 @@ pub async fn run(
         pricing_table,
         data_dir: data_dir.clone(),
         oauth: Arc::new(crate::oauth::OAuthRuntime::new()),
+        proxy_url: cfg.proxy_url.clone(),
+        cooldown,
+        quota_snapshots,
         version: env!("CARGO_PKG_VERSION"),
     });
 
@@ -370,7 +389,7 @@ pub fn build_console_router(state: Arc<crate::state::DaemonState>) -> Router {
         )
         .route(
             "/console/providers/{id}/secret",
-            put(crate::console::set_provider_secret),
+            put(crate::console::set_provider_secret).get(crate::console::get_provider_secret),
         )
         // Routes
         .route("/console/routes", get(crate::console::list_routes))
@@ -388,6 +407,12 @@ pub fn build_console_router(state: Arc<crate::state::DaemonState>) -> Router {
         .route("/console/usage", get(crate::console::list_usage))
         .route("/console/usage/summary", get(crate::console::usage_summary))
         .route("/console/pricing", get(crate::console::list_pricing))
+        .route(
+            "/console/pricing/overrides",
+            get(crate::console::list_pricing_overrides)
+                .put(crate::console::upsert_pricing_override)
+                .delete(crate::console::delete_pricing_override),
+        )
         .route(
             "/console/pricing/reload",
             post(crate::console::reload_pricing),
@@ -413,6 +438,35 @@ pub fn build_console_router(state: Arc<crate::state::DaemonState>) -> Router {
         .route(
             "/console/oauth/{provider_id}/refresh",
             post(crate::oauth::refresh_provider_oauth),
+        )
+        // Upstream provider cooldown (429 / usage_limit)
+        .route(
+            "/console/cooldowns",
+            get(crate::console::list_cooldowns),
+        )
+        .route(
+            "/console/cooldowns",
+            delete(crate::console::clear_all_cooldowns),
+        )
+        .route(
+            "/console/cooldowns/{provider_id}",
+            delete(crate::console::clear_provider_cooldown),
+        )
+        .route(
+            "/console/quota-snapshots",
+            get(crate::console::list_quota_snapshots),
+        )
+        .route(
+            "/console/quota-snapshots/refresh",
+            post(crate::console::refresh_all_quota_snapshots),
+        )
+        .route(
+            "/console/quota-snapshots/{provider_id}",
+            get(crate::console::get_quota_snapshot),
+        )
+        .route(
+            "/console/quota-snapshots/{provider_id}/refresh",
+            post(crate::console::refresh_quota_snapshot),
         )
         // Innermost → outermost: OPTIONS short-circuit, then CorsLayer.
         .layer(middleware::from_fn(options_preflight_ok))
@@ -445,7 +499,7 @@ pub fn rows_to_routes(
                 })?;
             // Inject base_url from provider map (without overriding if already set in JSON)
             for t in &mut targets {
-                if t.base_url.is_none() {
+                if t.base_url.is_none() && !t.provider_id.is_empty() {
                     t.base_url = provider_map.get(&t.provider_id).cloned();
                 }
             }
@@ -466,6 +520,39 @@ pub fn rows_to_routes(
         .collect()
 }
 
+/// Build provider catalog + auto kind-pools for multi-account pool targets.
+pub async fn build_provider_catalog(
+    pool: &conduit_store::StorePool,
+) -> Result<(
+    Vec<conduit_router::ProviderCatalogEntry>,
+    std::collections::HashMap<String, conduit_router::NamedPool>,
+)> {
+    use conduit_store::ProviderRepo;
+    let repo = ProviderRepo::new(pool);
+    let rows = repo.list().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let providers: Vec<conduit_router::ProviderCatalogEntry> = rows
+        .into_iter()
+        .map(|r| {
+            // upstream_key_ref is secret://upstream_key/{id}; key id is provider id.
+            let key_id = r
+                .upstream_key_ref
+                .rsplit('/')
+                .next()
+                .unwrap_or(&r.id)
+                .to_string();
+            conduit_router::ProviderCatalogEntry {
+                id: r.id,
+                kind: r.kind,
+                base_url: Some(r.base_url),
+                upstream_key_id: key_id,
+                weight: 1,
+            }
+        })
+        .collect();
+    let pools = conduit_router::auto_kind_pools(&providers);
+    Ok((providers, pools))
+}
+
 /// Reload the in-memory routing table from the current DB state.
 ///
 /// Publishes a new [`Arc`] via [`ArcSwap::store`] so in-flight requests keep
@@ -478,9 +565,12 @@ pub async fn reload_routing_table(state: &DaemonState) -> Result<(), conduit_sto
         .map_err(|e| conduit_store::StoreError::Serialization(e.to_string()))?;
     let routes = rows_to_routes(rows, &provider_map)
         .map_err(|e| conduit_store::StoreError::Serialization(e.to_string()))?;
-    state
-        .routing_table
-        .store(Arc::new(RoutingTable::new(routes)));
+    let (providers, pools) = build_provider_catalog(&state.pool)
+        .await
+        .map_err(|e| conduit_store::StoreError::Serialization(e.to_string()))?;
+    state.routing_table.store(Arc::new(
+        RoutingTable::new(routes).with_provider_catalog(providers, pools),
+    ));
     Ok(())
 }
 
@@ -574,6 +664,8 @@ mod hotpath_tests {
                 base_url: Some("https://api.openai.com".into()),
                 weight: 1,
                 request_overrides: Default::default(),
+                pool_id: None,
+                pool_kind: None,
             }],
             retry_policy: RetryPolicy::default(),
         }])

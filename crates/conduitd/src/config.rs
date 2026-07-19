@@ -5,6 +5,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub gateway: GatewayConfig,
+    /// Upstream OAuth / token HTTP client proxy (HTTP or SOCKS URL).
+    ///
+    /// Priority (highest first): credential `proxy_url` → `CONDUIT_PROXY_URL` →
+    /// this field → `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`.
+    /// Bypass: `NO_PROXY` / `no_proxy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +27,7 @@ impl Default for Config {
                 port: 4000,
                 console_port: 4001,
             },
+            proxy_url: None,
         }
     }
 }
@@ -67,5 +75,17 @@ backend = "keychain"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.gateway.port, 4000);
+    }
+
+    #[test]
+    fn loads_proxy_url() {
+        let toml = r#"
+proxy_url = "socks5://127.0.0.1:7890"
+[gateway]
+port = 4000
+console_port = 4001
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.proxy_url.as_deref(), Some("socks5://127.0.0.1:7890"));
     }
 }

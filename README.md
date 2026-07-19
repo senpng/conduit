@@ -2,7 +2,7 @@
 
 Local-first LLM gateway with routing, protocol translation, and usage accounting.
 
-Conduit exposes OpenAI-compatible (Chat Completions and Responses) and Anthropic Messages endpoints, forwards requests to configured providers, and keeps operational data on your machine. It consists of a Rust daemon (`conduitd`), a scriptable CLI (`conduitctl`), and an optional Tauri + Svelte desktop console (`conduit-ui`).
+Conduit exposes OpenAI-compatible (Chat Completions and Responses) and Anthropic Messages endpoints, forwards requests to configured providers, and keeps operational data on your machine. It consists of a Rust daemon (`conduitd`), an operator CLI with interactive TUI (`conduitctl`), and an optional Tauri + Svelte desktop console (`conduit-ui`).
 
 > [!WARNING]
 > Conduit is pre-release software under active development. Configuration and storage formats may change without migration support. There are no official binary releases yet; build from source for development and evaluation.
@@ -14,7 +14,7 @@ Conduit exposes OpenAI-compatible (Chat Completions and Responses) and Anthropic
 - **Multi-provider routing**: fixed, weighted, and ordered fallback strategies with retry handling.
 - **Faithful protocol translation**: codec losses are explicit (`LossReport`) instead of being silently discarded.
 - **Usage ledger**: per-request tokens and cost for operator spend queries.
-- **Operator tooling**: inspect and configure the gateway through a desktop console or automate common operations with `conduitctl`.
+- **Operator tooling**: inspect and configure the gateway through the `conduitctl` TUI, one-shot CLI subcommands, or the optional desktop console.
 - **OAuth provider support**: includes Claude, Codex, and Grok subscription-account flows in addition to API-key providers.
 
 ## Project Status
@@ -124,17 +124,25 @@ Confirm that the daemon is available:
 cargo run -p conduitctl -- status
 ```
 
-### 3. Start the operator console
+### 3. Configure with the interactive TUI
 
 In a second terminal:
+
+```bash
+cargo run -p conduitctl -- tui
+# or, with a TTY and no subcommand:
+cargo run -p conduitctl
+```
+
+Use the **Providers** tab to add an API-key provider or the **OAuth** tab to start a login. Then use **Routes** to map the model name sent by clients, such as `gpt-4o`, to an upstream provider and model. Press `?` inside the TUI for the full key map.
+
+Optional desktop console (`conduit-ui`):
 
 ```bash
 cd conduit-ui
 pnpm install --frozen-lockfile
 pnpm tauri dev
 ```
-
-Use **Providers** to add an API-key provider or start an OAuth login. Then use **Routes** to map the model name sent by clients, such as `gpt-4o`, to an upstream provider and model.
 
 Each route target can also define **Request overrides** as a JSON object. These
 static fields are applied only when that target is selected, after Conduit has
@@ -183,12 +191,25 @@ curl http://127.0.0.1:4000/v1/responses \
 
 With `"store": true`, subsequent turns may pass `previous_response_id` and Conduit will expand the continuation from local state when needed.
 
-Inspect usage and spend in the desktop console or with the CLI:
+Inspect usage and spend in the TUI **Usage** tab (metric cards, daily bars, by-model /
+by-key share bars — inspired by [tokscale](https://github.com/junhoyeo/tokscale)), or with
+one-shot CLI commands:
 
 ```bash
 cargo run -p conduitctl -- usage summary
 cargo run -p conduitctl -- usage list
 ```
+
+Manage **operator pricing overrides** (`pricing.json`, USD per MTok) like tokscale
+custom-pricing:
+
+```bash
+cargo run -p conduitctl -- pricing overrides
+cargo run -p conduitctl -- pricing set --provider openai --model my-model --input 1.0 --output 4.0
+cargo run -p conduitctl -- pricing unset --provider openai --model my-model
+```
+
+In the TUI Pricing tab: `o` toggles merged table ↔ overrides, `a`/`e`/`d` edit overrides.
 
 Run `cargo run -p conduitctl -- --help` or append `--help` to any subcommand for the complete CLI reference.
 

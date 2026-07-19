@@ -19,7 +19,10 @@ use super::{
     options::ClaudeOAuthRelayOptions,
     tools::{reverse_remap_response, reverse_remap_stream_payload},
 };
-use crate::provider::{apply_request_overrides, ChatResult, StreamResult};
+use crate::{
+    provider::{apply_request_overrides, ChatResult, StreamResult},
+    rate_limit::{self, RateLimitHeaderSink},
+};
 
 fn map_status(status: u16, body: &str) -> ProviderError {
     match status {
@@ -89,6 +92,8 @@ pub async fn chat_oauth<C: WireCodec + 'static>(
     opts: &ClaudeOAuthRelayOptions,
     request_overrides: &Map<String, Value>,
     overall_ms: u64,
+    rate_limit_sink: Option<RateLimitHeaderSink>,
+    provider_id: &str,
 ) -> Result<ChatResult, ProviderError> {
     debug_assert!(is_claude_oauth_kind(kind));
     let url = messages_url(base_url);
@@ -118,6 +123,13 @@ pub async fn chat_oauth<C: WireCodec + 'static>(
         }
     })?;
 
+    // Success and error responses may carry anthropic-ratelimit-* headers.
+    rate_limit::emit(
+        &rate_limit_sink,
+        provider_id,
+        rate_limit::collect_from_http(resp.headers()),
+    );
+
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
         let text = resp.text().await.unwrap_or_default();
@@ -146,6 +158,8 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
     secret: &SecretString,
     opts: &ClaudeOAuthRelayOptions,
     request_overrides: &Map<String, Value>,
+    rate_limit_sink: Option<RateLimitHeaderSink>,
+    provider_id: &str,
 ) -> Result<StreamResult, ProviderError> {
     debug_assert!(is_claude_oauth_kind(kind));
     let url = messages_url(base_url);
@@ -172,6 +186,12 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
             ProviderError::Network(e.to_string())
         }
     })?;
+
+    rate_limit::emit(
+        &rate_limit_sink,
+        provider_id,
+        rate_limit::collect_from_http(resp.headers()),
+    );
 
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {

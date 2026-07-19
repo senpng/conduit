@@ -10,6 +10,7 @@ use crate::{
     credential::{OAuthCredential, OAuthProviderKind},
     error::OAuthError,
     providers::{ClaudeOAuth, CodexOAuth, GrokOAuth},
+    proxy::resolve_effective_proxy,
 };
 
 /// Default lead time before expiry to refresh proactively.
@@ -24,6 +25,8 @@ type InflightMap = HashMap<String, Arc<AsyncMutex<Option<Result<OAuthCredential,
 pub struct RefreshCoordinator {
     inflight: Arc<Mutex<InflightMap>>,
     lead: Duration,
+    /// Daemon-level proxy URL (config). Credential `proxy_url` and env still win.
+    default_proxy: Option<String>,
 }
 
 impl RefreshCoordinator {
@@ -31,6 +34,7 @@ impl RefreshCoordinator {
         Self {
             inflight: Arc::new(Mutex::new(HashMap::new())),
             lead: default_refresh_lead(),
+            default_proxy: None,
         }
     }
 
@@ -39,8 +43,20 @@ impl RefreshCoordinator {
         self
     }
 
+    /// Set daemon config proxy (CLIProxyAPI `cfg.ProxyURL`).
+    pub fn with_default_proxy(mut self, proxy: Option<String>) -> Self {
+        self.default_proxy = proxy
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self
+    }
+
     pub fn lead(&self) -> Duration {
         self.lead
+    }
+
+    fn proxy_for(&self, cred: &OAuthCredential) -> Option<String> {
+        resolve_effective_proxy(cred.proxy_url_override(), self.default_proxy.as_deref())
     }
 
     /// Refresh if needed; returns the (possibly updated) credential.
@@ -89,18 +105,36 @@ impl RefreshCoordinator {
 
     async fn do_refresh(&self, cred: &OAuthCredential) -> Result<OAuthCredential, OAuthError> {
         let kind = cred.kind()?;
+        let proxy = self.proxy_for(cred);
         let mut fresh = match kind {
-            OAuthProviderKind::Claude => ClaudeOAuth::new().refresh(&cred.refresh_token).await?,
-            OAuthProviderKind::Codex => CodexOAuth::new().refresh(&cred.refresh_token).await?,
+            OAuthProviderKind::Claude => {
+                ClaudeOAuth::with_proxy_url(proxy)?
+                    .refresh_with_retry(
+                        &cred.refresh_token,
+                        crate::providers::claude::DEFAULT_REFRESH_MAX_RETRIES,
+                    )
+                    .await?
+            }
+            OAuthProviderKind::Codex => {
+                CodexOAuth::with_proxy_url(proxy)?
+                    .refresh_with_retry(
+                        &cred.refresh_token,
+                        crate::providers::codex::DEFAULT_REFRESH_MAX_RETRIES,
+                    )
+                    .await?
+            }
             OAuthProviderKind::Xai => {
-                GrokOAuth::new()
+                GrokOAuth::with_proxy_url(proxy)?
                     .refresh(&cred.refresh_token, cred.token_endpoint.as_deref())
                     .await?
             }
         };
-        // Preserve base_url / email if refresh response omitted them
-        if fresh.base_url.is_none() {
-            fresh.base_url = cred.base_url.clone();
+        // Prefer previously stored metadata: refresh endpoints often omit email /
+        // account / custom base_url (CLIProxyAPI keeps file fields across refresh).
+        if let Some(ref b) = cred.base_url {
+            if !b.is_empty() {
+                fresh.base_url = Some(b.clone());
+            }
         }
         if fresh.email.is_none() {
             fresh.email = cred.email.clone();
@@ -108,8 +142,33 @@ impl RefreshCoordinator {
         if fresh.account_id.is_none() {
             fresh.account_id = cred.account_id.clone();
         }
-        if fresh.token_endpoint.is_none() {
-            fresh.token_endpoint = cred.token_endpoint.clone();
+        if fresh.plan_type.is_none() {
+            fresh.plan_type = cred.plan_type.clone();
+        }
+        if fresh.organization_id.is_none() {
+            fresh.organization_id = cred.organization_id.clone();
+        }
+        if fresh.organization_name.is_none() {
+            fresh.organization_name = cred.organization_name.clone();
+        }
+        if let Some(ref te) = cred.token_endpoint {
+            if !te.is_empty() {
+                fresh.token_endpoint = Some(te.clone());
+            }
+        }
+        if fresh.sub.is_none() {
+            fresh.sub = cred.sub.clone();
+        }
+        // Preserve per-credential proxy / using_api across refresh.
+        if fresh.proxy_url.is_none() {
+            fresh.proxy_url = cred.proxy_url.clone();
+        }
+        if fresh.using_api.is_none() {
+            fresh.using_api = cred.using_api;
+        }
+        // Merge unknown extra keys without wiping using_api/proxy carried in extra.
+        for (k, v) in &cred.extra {
+            fresh.extra.entry(k.clone()).or_insert_with(|| v.clone());
         }
         Ok(fresh)
     }
@@ -135,9 +194,14 @@ mod tests {
             last_refresh: None,
             email: None,
             account_id: None,
+            plan_type: None,
+            organization_id: None,
+            organization_name: None,
             sub: None,
             base_url: None,
             token_endpoint: None,
+            proxy_url: None,
+            using_api: None,
             extra: Default::default(),
         };
         let out = coord.ensure_fresh(cred).await.unwrap();

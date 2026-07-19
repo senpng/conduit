@@ -1,7 +1,9 @@
 //! L3 Router stage: pure function call into conduit-router.
 
+use std::collections::HashSet;
+
 use conduit_ir::error::GatewayError;
-use conduit_router::{decision::route_with_seed, table::RoutingTable};
+use conduit_router::{decision::route_with_options, table::RoutingTable};
 
 use super::context::{PipelineContext, ResolvedProvider};
 
@@ -10,13 +12,23 @@ pub fn route_request(
     ctx: &mut PipelineContext,
     preferred_provider_id: Option<&str>,
 ) -> Result<(), GatewayError> {
+    route_request_with_skip(ctx, preferred_provider_id, None)
+}
+
+/// Like [`route_request`] but skips provider ids currently in upstream cooldown.
+pub fn route_request_with_skip(
+    ctx: &mut PipelineContext,
+    preferred_provider_id: Option<&str>,
+    skip_provider_ids: Option<&HashSet<String>>,
+) -> Result<(), GatewayError> {
     let alias = ctx.request.alias.clone();
-    let decision = route_with_seed(
+    let decision = route_with_options(
         &alias,
         &ctx.routing_table,
         ctx.attempt_no,
         preferred_provider_id,
-        ctx.routing_seed,
+        Some(ctx.routing_seed),
+        skip_provider_ids,
     )
     .map_err(|e| {
         GatewayError::Routing(format!("routing failed for '{}': {}", alias, e))
@@ -88,6 +100,8 @@ mod tests {
                     base_url: None,
                     weight: 1,
                     request_overrides: Default::default(),
+                    pool_id: None,
+                    pool_kind: None,
                 },
                 RouteTarget {
                     provider_id: "b".into(),
@@ -97,6 +111,8 @@ mod tests {
                     base_url: None,
                     weight: 1,
                     request_overrides: Default::default(),
+                    pool_id: None,
+                    pool_kind: None,
                 },
             ],
             retry_policy: RetryPolicy {

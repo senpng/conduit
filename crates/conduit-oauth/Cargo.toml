@@ -10,9 +10,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-reqwest = { workspace = true }
-# Firefox TLS fingerprint for Anthropic OAuth token endpoint (CLIProxyAPI utls Firefox)
-wreq = { version = "6.0.0-rc.29", features = ["json"] }
+# socks: ALL_PROXY=socks5://... (Clash / local clients)
+reqwest = { workspace = true, features = ["socks"] }
+# Chrome TLS fingerprint for Anthropic OAuth token endpoint (CLIProxyAPI utls HelloChrome_Auto)
+wreq = { version = "6.0.0-rc.29", features = ["json", "socks"] }
 wreq-util = "3.0.0-rc.14"
 secrecy = { workspace = true }
 chrono = { workspace = true }

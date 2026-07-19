@@ -53,11 +53,21 @@ pub enum OAuthError {
 }
 
 impl OAuthError {
+    /// Whether a refresh failure is safe to retry (CLIProxyAPI parity).
+    ///
+    /// 429 is **not** retryable here — Claude path applies Retry-After blocking instead.
     pub fn is_retryable_refresh(&self) -> bool {
         match self {
             Self::TokenRefresh { status, .. } => *status >= 500,
             Self::Network(_) => true,
             _ => false,
+        }
+    }
+
+    pub fn refresh_status(&self) -> Option<u16> {
+        match self {
+            Self::TokenRefresh { status, .. } => Some(*status),
+            _ => None,
         }
     }
 }

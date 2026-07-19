@@ -4,6 +4,7 @@ use thiserror::Error;
 
 use crate::{
     policy::RetryPolicy,
+    pool::{expand_route_target, select_among_members},
     table::{RouteTarget, RoutingStrategy, RoutingTable},
 };
 
@@ -26,6 +27,9 @@ pub enum RouterError {
         attempt_no: u32,
         max_retries: u32,
     },
+
+    #[error("route '{alias}': {message}")]
+    Pool { alias: String, message: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -69,11 +73,7 @@ pub fn route(
     attempt_no: u32,
     preferred_provider_id: Option<&str>,
 ) -> Result<RoutingDecision, RouterError> {
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    route_with_seed(alias, table, attempt_no, preferred_provider_id, seed)
+    route_with_options(alias, table, attempt_no, preferred_provider_id, None, None)
 }
 
 /// Same as [`route`] but with an explicit seed for weighted load-balancing.
@@ -87,6 +87,36 @@ pub fn route_with_seed(
     preferred_provider_id: Option<&str>,
     seed: u64,
 ) -> Result<RoutingDecision, RouterError> {
+    route_with_options(
+        alias,
+        table,
+        attempt_no,
+        preferred_provider_id,
+        Some(seed),
+        None,
+    )
+}
+
+/// Full routing entry: optional seed + skip set for cooled-down providers.
+///
+/// Targets whose `provider_id` is in `skip_provider_ids` are preferred **last**.
+/// If every target is cooling, the first original target is still returned so
+/// single-provider routes keep working (caller sees the upstream error).
+pub fn route_with_options(
+    alias: &str,
+    table: &RoutingTable,
+    attempt_no: u32,
+    preferred_provider_id: Option<&str>,
+    seed: Option<u64>,
+    skip_provider_ids: Option<&std::collections::HashSet<String>>,
+) -> Result<RoutingDecision, RouterError> {
+    let seed = seed.unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    });
+
     let r = table.get(alias).ok_or_else(|| RouterError::UnknownAlias {
         alias: alias.to_string(),
     })?;
@@ -105,21 +135,66 @@ pub fn route_with_seed(
         });
     }
 
-    let target = match r.strategy {
-        RoutingStrategy::Fixed => &r.targets[0],
-        RoutingStrategy::Fallback => {
-            let order = sticky_target_order(&r.targets, preferred_provider_id);
-            let idx = (attempt_no as usize).min(order.len() - 1);
-            order[idx]
+    // Expand pool targets into concrete providers; keep single-provider targets as-is.
+    let mut expanded: Vec<RouteTarget> = Vec::new();
+    for t in &r.targets {
+        match expand_route_target(t, &table.providers, &table.pools) {
+            Ok(chunk) => expanded.extend(chunk),
+            Err(message) => {
+                return Err(RouterError::Pool {
+                    alias: alias.to_string(),
+                    message,
+                });
+            }
         }
-        RoutingStrategy::Weighted => {
-            let order = weighted_target_order(&r.targets, preferred_provider_id, seed);
-            let idx = (attempt_no as usize).min(order.len() - 1);
-            order[idx]
-        }
+    }
+    if expanded.is_empty() {
+        return Err(RouterError::NoTargets {
+            alias: alias.to_string(),
+        });
+    }
+
+    // Pool-style selection when any original target was a pool, or always use
+    // sticky+cooldown-aware pick among expanded members.
+    let has_pool = r.targets.iter().any(|t| t.is_pool_target());
+    if has_pool {
+        let chosen = select_among_members(
+            &expanded,
+            preferred_provider_id,
+            skip_provider_ids,
+            attempt_no,
+            seed,
+        )
+        .ok_or_else(|| RouterError::NoTargets {
+            alias: alias.to_string(),
+        })?;
+        return Ok(decision_from(chosen, attempt_no, r.retry_policy.clone()));
+    }
+
+    // Prefer non-cooling targets; if all cooling, fall back to full target list.
+    let available = filter_targets_by_cooldown(&expanded, skip_provider_ids);
+    let pool: Vec<&RouteTarget> = if available.is_empty() {
+        expanded.iter().collect()
+    } else {
+        available
     };
 
-    Ok(RoutingDecision {
+    let target = select_from_pool(
+        &r.strategy,
+        &pool,
+        preferred_provider_id,
+        attempt_no,
+        seed,
+    );
+    Ok(decision_from(target, attempt_no, r.retry_policy.clone()))
+}
+
+fn decision_from(
+    target: &RouteTarget,
+    attempt_no: u32,
+    retry_policy: RetryPolicy,
+) -> RoutingDecision {
+    RoutingDecision {
         provider_id: target.provider_id.clone(),
         model_id: target.model_id.clone(),
         upstream_key_id: target.upstream_key_id.clone(),
@@ -127,8 +202,110 @@ pub fn route_with_seed(
         base_url: target.base_url.clone(),
         request_overrides: target.request_overrides.clone(),
         attempt_no,
-        retry_policy: r.retry_policy.clone(),
-    })
+        retry_policy,
+    }
+}
+
+fn select_from_pool<'a>(
+    strategy: &RoutingStrategy,
+    pool: &[&'a RouteTarget],
+    preferred_provider_id: Option<&str>,
+    attempt_no: u32,
+    seed: u64,
+) -> &'a RouteTarget {
+    if pool.is_empty() {
+        unreachable!("caller guarantees non-empty pool");
+    }
+    match strategy {
+        RoutingStrategy::Fixed => pool[0],
+        RoutingStrategy::Fallback => {
+            let order = sticky_target_order_refs(pool, preferred_provider_id);
+            let idx = (attempt_no as usize).min(order.len() - 1);
+            order[idx]
+        }
+        RoutingStrategy::Weighted => {
+            let order = weighted_target_order_refs(pool, preferred_provider_id, seed);
+            let idx = (attempt_no as usize).min(order.len() - 1);
+            order[idx]
+        }
+    }
+}
+
+/// Non-cooling targets first; if `skip` is empty/None, all targets.
+fn filter_targets_by_cooldown<'a>(
+    targets: &'a [RouteTarget],
+    skip: Option<&std::collections::HashSet<String>>,
+) -> Vec<&'a RouteTarget> {
+    let Some(skip) = skip.filter(|s| !s.is_empty()) else {
+        return targets.iter().collect();
+    };
+    let available: Vec<_> = targets
+        .iter()
+        .filter(|t| !skip.contains(&t.provider_id))
+        .collect();
+    available
+}
+
+fn sticky_target_order_refs<'a>(
+    targets: &[&'a RouteTarget],
+    preferred_provider_id: Option<&str>,
+) -> Vec<&'a RouteTarget> {
+    if let Some(pref) = preferred_provider_id.filter(|s| !s.is_empty()) {
+        if targets.iter().any(|t| t.provider_id == pref) {
+            let mut out = Vec::with_capacity(targets.len());
+            if let Some(t) = targets.iter().find(|t| t.provider_id == pref) {
+                out.push(*t);
+            }
+            for t in targets {
+                if t.provider_id != pref {
+                    out.push(*t);
+                }
+            }
+            return out;
+        }
+    }
+    targets.to_vec()
+}
+
+fn weighted_target_order_refs<'a>(
+    targets: &[&'a RouteTarget],
+    preferred_provider_id: Option<&str>,
+    seed: u64,
+) -> Vec<&'a RouteTarget> {
+    if preferred_provider_id
+        .filter(|s| !s.is_empty())
+        .is_some_and(|p| targets.iter().any(|t| t.provider_id == p))
+    {
+        return sticky_target_order_refs(targets, preferred_provider_id);
+    }
+    // Convert to owned slice of RouteTarget for pick_weighted_index compatibility
+    // by building index over references with weight.
+    let first_idx = pick_weighted_index_refs(targets, seed);
+    let first = targets[first_idx];
+    let mut out = Vec::with_capacity(targets.len());
+    out.push(first);
+    for (i, t) in targets.iter().enumerate() {
+        if i != first_idx {
+            out.push(*t);
+        }
+    }
+    out
+}
+
+fn pick_weighted_index_refs(targets: &[&RouteTarget], seed: u64) -> usize {
+    let total: u64 = targets.iter().map(|t| t.weight as u64).sum();
+    if total == 0 {
+        return 0;
+    }
+    let mut r = seed % total;
+    for (i, t) in targets.iter().enumerate() {
+        let w = t.weight as u64;
+        if r < w {
+            return i;
+        }
+        r -= w;
+    }
+    0
 }
 
 /// Preferred provider first (if still listed), then remaining targets in table order.
@@ -212,6 +389,7 @@ mod tests {
     use crate::{
         affinity::AffinityStore,
         policy::RetryPolicy,
+        pool::{auto_kind_pools, ProviderCatalogEntry},
         table::{Route, RouteTarget, RoutingStrategy, RoutingTable},
     };
 
@@ -228,6 +406,8 @@ mod tests {
             base_url: None,
             weight,
             request_overrides: Default::default(),
+            pool_id: None,
+            pool_kind: None,
         }
     }
 
@@ -587,6 +767,139 @@ mod tests {
         }]);
         let err = route_with_seed("empty", &table, 0, None, 0).unwrap_err();
         assert!(matches!(err, RouterError::NoTargets { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Provider pools (scheme B) + sticky + cooldown
+    // -----------------------------------------------------------------------
+
+    fn catalog_entry(id: &str, kind: &str) -> ProviderCatalogEntry {
+        ProviderCatalogEntry {
+            id: id.into(),
+            kind: kind.into(),
+            base_url: Some(format!("https://{id}.example")),
+            upstream_key_id: id.into(),
+            weight: 1,
+        }
+    }
+
+    fn pool_route_table() -> RoutingTable {
+        let providers = vec![
+            catalog_entry("c1", "claude-oauth"),
+            catalog_entry("c2", "claude-oauth"),
+            catalog_entry("o1", "openai"),
+        ];
+        let pools = auto_kind_pools(&providers);
+        let route = Route {
+            alias: "claude".into(),
+            strategy: RoutingStrategy::Fallback,
+            targets: vec![RouteTarget {
+                provider_id: String::new(),
+                model_id: "claude-sonnet".into(),
+                upstream_key_id: String::new(),
+                provider_kind: "claude-oauth".into(),
+                base_url: None,
+                weight: 1,
+                request_overrides: Default::default(),
+                pool_id: None,
+                pool_kind: Some("claude-oauth".into()),
+            }],
+            retry_policy: retry(2),
+        };
+        RoutingTable::new([route]).with_provider_catalog(providers, pools)
+    }
+
+    #[test]
+    fn pool_kind_expands_and_picks_member() {
+        let table = pool_route_table();
+        let d = route_with_seed("claude", &table, 0, None, 0).unwrap();
+        assert!(d.provider_id == "c1" || d.provider_id == "c2");
+        assert_eq!(d.model_id, "claude-sonnet");
+        assert_eq!(d.provider_kind, "claude-oauth");
+        assert_eq!(d.upstream_key_id, d.provider_id);
+    }
+
+    #[test]
+    fn pool_sticky_pin_when_available() {
+        let table = pool_route_table();
+        let store = AffinityStore::new();
+        store.remember("key-1", "claude", "c2");
+        let pref = store.preferred("key-1", "claude");
+        let d = route_with_seed("claude", &table, 0, pref.as_deref(), 99).unwrap();
+        assert_eq!(d.provider_id, "c2");
+    }
+
+    #[test]
+    fn pool_sticky_pin_ignored_when_cooling() {
+        let table = pool_route_table();
+        let mut skip = std::collections::HashSet::new();
+        skip.insert("c2".into());
+        let d = route_with_options(
+            "claude",
+            &table,
+            0,
+            Some("c2"),
+            Some(0),
+            Some(&skip),
+        )
+        .unwrap();
+        assert_eq!(d.provider_id, "c1");
+    }
+
+    #[test]
+    fn pool_shared_across_aliases() {
+        let providers = vec![
+            catalog_entry("c1", "claude-oauth"),
+            catalog_entry("c2", "claude-oauth"),
+        ];
+        let pools = auto_kind_pools(&providers);
+        let mk = |alias: &str| Route {
+            alias: alias.into(),
+            strategy: RoutingStrategy::Fixed,
+            targets: vec![RouteTarget {
+                provider_id: String::new(),
+                model_id: "m".into(),
+                upstream_key_id: String::new(),
+                provider_kind: "claude-oauth".into(),
+                base_url: None,
+                weight: 1,
+                request_overrides: Default::default(),
+                pool_id: Some("claude-oauth".into()),
+                pool_kind: None,
+            }],
+            retry_policy: retry(1),
+        };
+        let table = RoutingTable::new([mk("alias-a"), mk("alias-b")])
+            .with_provider_catalog(providers, pools);
+        let a = route_with_seed("alias-a", &table, 0, Some("c1"), 0).unwrap();
+        let b = route_with_seed("alias-b", &table, 0, Some("c1"), 0).unwrap();
+        assert_eq!(a.provider_id, "c1");
+        assert_eq!(b.provider_id, "c1");
+    }
+
+    #[test]
+    fn empty_pool_returns_pool_error() {
+        let providers = vec![catalog_entry("o1", "openai")];
+        let pools = auto_kind_pools(&providers);
+        let route = Route {
+            alias: "claude".into(),
+            strategy: RoutingStrategy::Fallback,
+            targets: vec![RouteTarget {
+                provider_id: String::new(),
+                model_id: "m".into(),
+                upstream_key_id: String::new(),
+                provider_kind: "claude-oauth".into(),
+                base_url: None,
+                weight: 1,
+                request_overrides: Default::default(),
+                pool_id: None,
+                pool_kind: Some("claude-oauth".into()),
+            }],
+            retry_policy: retry(1),
+        };
+        let table = RoutingTable::new([route]).with_provider_catalog(providers, pools);
+        let err = route_with_seed("claude", &table, 0, None, 0).unwrap_err();
+        assert!(matches!(err, RouterError::Pool { .. }), "{err:?}");
     }
 
     #[test]

@@ -22,6 +22,7 @@ use crate::{
     auth::{AuthStrategy, BearerAuth, CompositeAuth, HeaderAuth},
     claude_oauth,
     client::HttpClientFactory,
+    rate_limit::{self, RateLimitHeaderSink},
     sse::response_to_sse,
 };
 
@@ -76,6 +77,8 @@ pub struct ProviderClientConfig {
     pub path: UpstreamPath,
     /// Static target-specific fields merged after protocol encoding.
     pub request_overrides: Map<String, Value>,
+    /// Optional sink for `anthropic-ratelimit-*` / `x-ratelimit-*` / `retry-after` headers.
+    pub rate_limit_sink: Option<RateLimitHeaderSink>,
 }
 
 impl ProviderClientConfig {
@@ -88,6 +91,7 @@ impl ProviderClientConfig {
             timeouts: TimeoutConfig::default(),
             path: UpstreamPath::ChatCompletions,
             request_overrides: Map::new(),
+            rate_limit_sink: None,
         }
     }
 
@@ -100,6 +104,7 @@ impl ProviderClientConfig {
             timeouts: TimeoutConfig::default(),
             path: UpstreamPath::Messages,
             request_overrides: Map::new(),
+            rate_limit_sink: None,
         }
     }
 
@@ -116,6 +121,7 @@ impl ProviderClientConfig {
             timeouts: TimeoutConfig::default(),
             path: UpstreamPath::Messages,
             request_overrides: Map::new(),
+            rate_limit_sink: None,
         }
     }
 
@@ -132,6 +138,7 @@ impl ProviderClientConfig {
             timeouts: TimeoutConfig::default(),
             path: UpstreamPath::Responses,
             request_overrides: Map::new(),
+            rate_limit_sink: None,
         }
     }
 
@@ -149,7 +156,13 @@ impl ProviderClientConfig {
             timeouts: TimeoutConfig::default(),
             path: UpstreamPath::Responses,
             request_overrides: Map::new(),
+            rate_limit_sink: None,
         }
+    }
+
+    pub fn with_rate_limit_sink(mut self, sink: RateLimitHeaderSink) -> Self {
+        self.rate_limit_sink = Some(sink);
+        self
     }
 
     pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
@@ -290,6 +303,8 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
                 &claude_oauth::ClaudeOAuthRelayOptions::default(),
                 &self.config.request_overrides,
                 self.config.timeouts.overall_ms,
+                self.config.rate_limit_sink.clone(),
+                &self.config.id,
             )
             .await;
         }
@@ -320,6 +335,13 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
                 ProviderError::Network(e.to_string())
             }
         })?;
+
+        // Capture rate-limit headers before consuming the body.
+        rate_limit::emit(
+            &self.config.rate_limit_sink,
+            &self.config.id,
+            rate_limit::collect_from_reqwest(resp.headers()),
+        );
 
         let status = resp.status();
         if !status.is_success() {
@@ -355,6 +377,8 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
                 secret,
                 &claude_oauth::ClaudeOAuthRelayOptions::default(),
                 &self.config.request_overrides,
+                self.config.rate_limit_sink.clone(),
+                &self.config.id,
             )
             .await;
         }
@@ -385,6 +409,12 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
                 ProviderError::Network(e.to_string())
             }
         })?;
+
+        rate_limit::emit(
+            &self.config.rate_limit_sink,
+            &self.config.id,
+            rate_limit::collect_from_reqwest(resp.headers()),
+        );
 
         let status = resp.status();
         if !status.is_success() {

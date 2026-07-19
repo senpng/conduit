@@ -6,15 +6,15 @@ Conduit is a **local-first, single-binary LLM gateway**. It proxies requests to 
 
 1. **Faithful Proxy**: Any field silently changed, dropped, or degraded during codec translation is a bug. All losses are recorded in `LossReport`.
 2. **Local-first operator surface**: Configuration, usage, and secrets stay on the host running `conduitd`.
-3. **Local-First, Single Binary**: No cloud dependencies. Offline-capable. Distribution = one signed binary (+ optional UI bundle). **Operator path is CLI + desktop console** (`conduitctl` + `conduit-ui`).
+3. **Local-First, Single Binary**: No cloud dependencies. Offline-capable. Distribution = one signed binary (+ optional UI bundle). **Operator path is CLI/TUI + optional desktop console** (`conduitctl` + `conduit-ui`).
 
 ## Process Model
 
 ```
 ┌─────────────────────┐         ┌──────────────────────────────┐
 │  conduit-ui         │         │  conduitctl                  │
-│  (Tauri + Svelte)   │         │  one-shot operator CLI       │
-│  operator console   │         │  (scripts / automation)      │
+│  (Tauri + Svelte)   │         │  one-shot CLI + interactive  │
+│  optional desktop   │         │  TUI (primary terminal UX)   │
 └─────────┬───────────┘         └──────────────┬───────────────┘
           │   loopback HTTP + console API         │
           └──────────────────┬──────────────────┘
@@ -26,7 +26,7 @@ Conduit is a **local-first, single-binary LLM gateway**. It proxies requests to 
                   └──────────────────────┘
 ```
 
-**Operator UX:** interactive console is **`conduit-ui`** (desktop). Scriptable operations use **`conduitctl`**. Oral alias *conduitcli* → formal name `conduitctl`.
+**Operator UX:** primary interactive surface in the terminal is **`conduitctl tui`** (also launched when `conduitctl` is run with no subcommand on a TTY). One-shot subcommands remain for scripts/automation. **`conduit-ui`** is an optional desktop shell over the same console API. Oral alias *conduitcli* → formal name `conduitctl`.
 
 ### Tauri UI transport (Q5)
 
@@ -36,7 +36,7 @@ Conduit is a **local-first, single-binary LLM gateway**. It proxies requests to 
 not used for providers/routes/keys. Override the console base with
 `VITE_CONDUIT_CONSOLE_URL` at build/dev time.
 
-**Product priority (2026-07):** `conduit-ui` is the **operator console** (light product shell; providers/routes/keys/usage; multi-target route wizard; zero remote resources).
+**Product priority (2026-07):** terminal operator console is **`conduitctl` TUI** (providers/routes/keys/usage/pricing/oauth; multi-target route wizard). `conduit-ui` remains an optional desktop shell over the same loopback console API (zero remote resources).
 
 CSP (`src-tauri/tauri.conf.json`) allows both `http://127.0.0.1:4001` and
 `http://localhost:4001` under `connect-src` for fetch/SSE. The console listener
@@ -74,7 +74,7 @@ conduit-upstream     (IR + codec + reqwest HTTP client)
 conduit-pipeline     (all of the above, L1-L6 orchestration)
     ↑
 conduitd             (binary: axum server + console API + OAuth callbacks)
-conduitctl           (binary: operator CLI)
+conduitctl           (binary: operator CLI + TUI)
 ```
 
 ## OAuth Providers
@@ -83,11 +83,23 @@ Conduit supports subscription-style OAuth for:
 
 | Kind | Flow | Callback / UX | Upstream |
 |------|------|---------------|----------|
-| `claude-oauth` | Auth code + PKCE (Firefox_Auto TLS on token) | `http://localhost:54545/callback` | Messages `?beta=true` + **Chrome_Auto TLS** (wreq latest Chrome) + cloak/cch/tool-remap/signature |
-| `codex-oauth` | Auth code + PKCE | `http://localhost:1455/auth/callback` | ChatGPT Codex `/responses` |
-| `grok-oauth` | Device code (RFC 8628) | user_code + verification_uri | **Grok CLI chat-proxy** `https://cli-chat-proxy.grok.com/v1/responses` (not official `api.x.ai` chat) |
+| `claude-oauth` | Auth code + PKCE (**Chrome_Auto TLS** on token + Messages) | `http://localhost:54545/callback` | Messages `?beta=true` + Chrome TLS + cloak/cch/tool-remap/signature; refresh: 429 block + 3 retries |
+| `codex-oauth` | Auth code + PKCE | `http://localhost:1455/auth/callback` | ChatGPT Codex `/responses`; refresh: 3 retries |
+| `grok-oauth` | Device code (RFC 8628) | user_code + verification_uri | Chat defaults to **cli-chat-proxy**; set credential `using_api=true` for official `api.x.ai` |
 
 Credentials (access + refresh + expiry + account metadata) are stored as JSON in the secret backend under scope `upstream_key`. On each request, `CredentialResolver` refreshes tokens near expiry (singleflight) and injects provider-specific headers (e.g. `Chatgpt-Account-Id`, `anthropic-beta`).
+
+**Proxy** (OAuth login + token refresh): credential `proxy_url` → `CONDUIT_PROXY_URL` → `conduit.toml` `proxy_url` → `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` (SOCKS supported). Bypass: `NO_PROXY`.
+
+**Codex multi-auth naming**: provider id derived from email + `chatgpt_plan_type` (+ account hash for `team`/`k12`), e.g. `codex-user_x.com-plus`, `codex-{hash}-user_x.com-team`.
+
+**Upstream cooldown**: on HTTP 429 / `usage_limit_reached`, the provider is marked cooling (duration from `resets_in_seconds` / `resets_at` when present). Multi-target routes skip cooling providers. Console: `GET/DELETE /console/cooldowns`.
+
+**OAuth callback ports**: IdP-registered fixed ports (Claude 54545, Codex 1455). New login stops prior Conduit callback listeners first; if another process still holds the port → `PortInUse` (cannot invent alternate ports without `redirect_uri_mismatch`). Grok device poll respects session cancel.
+
+**Proxy**: configured proxy URL must apply; construction fails instead of falling back to direct connect.
+
+**Quota snapshots**: best-effort last-seen rate-limit headers / 429 bodies per provider — `GET /console/quota-snapshots`, `POST .../{id}/refresh` (optional `clear_cooldown`), `POST .../refresh` (probe all OAuth). For **Claude/Codex OAuth**, refresh proactively calls the subscription usage APIs (`/api/oauth/usage`, `wham/usage`) and stores **session (5h) / weekly (7d) remaining %**. Successful and error upstream responses also record `anthropic-ratelimit-*` / `x-ratelimit-*` / `retry-after`. TUI Providers tab shows a **REMAINING** column and detail meters (`u` re-probes).
 
 Console API: `POST /console/oauth/{kind}/start`, `GET /console/oauth/sessions/{id}`, `POST .../cancel`, `POST /console/oauth/{provider_id}/refresh`. CLI: `conduitctl oauth start <claude|codex|grok>`.
 
@@ -143,6 +155,13 @@ Cost estimation uses a layered pricing table (USD per million tokens):
 | Operator overrides | `{data_dir}/pricing.json` | highest |
 
 Later layers win on `(provider_kind, model_id)`.
+
+**Operator overrides** (tokscale-style custom pricing): exact `(provider_kind, model_id)`
+rows in `pricing.json`, USD **per million tokens**. Manage via:
+
+- `GET/PUT /console/pricing/overrides`, `DELETE /console/pricing/overrides?provider_kind=…&model_id=…` (query params: model ids may contain `/`)
+- `conduitctl pricing overrides|set|unset`
+- TUI Pricing tab: `o` toggle overrides pane, `a`/`e`/`d` CRUD
 
 **Standard remote source:** LiteLLM
 [`model_prices_and_context_window.json`](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json)

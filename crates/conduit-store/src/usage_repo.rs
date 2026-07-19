@@ -52,15 +52,42 @@ impl<'a> UsageRepo<'a> {
     }
 
     /// Recent usage rows, newest first.
+    ///
+    /// Optional `period` (`YYYY-MM`) scopes rows with `ts LIKE 'YYYY-MM%'`.
+    /// Optional `key_id` scopes to one downstream key.
     #[instrument(skip(self))]
     pub async fn list(
         &self,
         limit: usize,
         key_id: Option<&str>,
+        period: Option<&str>,
     ) -> Result<Vec<UsageRecordRow>, StoreError> {
         let limit = limit.clamp(1, 500) as i64;
-        let rows = match key_id {
-            Some(kid) => {
+        let period_pat = period
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| format!("{p}%"));
+
+        let rows = match (key_id, period_pat.as_deref()) {
+            (Some(kid), Some(pat)) => {
+                sqlx::query(
+                    r#"SELECT id, ts, request_id, downstream_key_id, alias,
+                          provider_id, provider_kind, model_id,
+                          prompt_tokens, completion_tokens, total_tokens,
+                          reasoning_tokens, cache_read_tokens, cache_write_tokens,
+                          cost_usd, stream
+                   FROM usage_records
+                   WHERE downstream_key_id = ? AND ts LIKE ?
+                   ORDER BY ts DESC
+                   LIMIT ?"#,
+                )
+                .bind(kid)
+                .bind(pat)
+                .bind(limit)
+                .fetch_all(self.pool)
+                .await
+            }
+            (Some(kid), None) => {
                 sqlx::query(
                     r#"SELECT id, ts, request_id, downstream_key_id, alias,
                           provider_id, provider_kind, model_id,
@@ -77,7 +104,24 @@ impl<'a> UsageRepo<'a> {
                 .fetch_all(self.pool)
                 .await
             }
-            None => {
+            (None, Some(pat)) => {
+                sqlx::query(
+                    r#"SELECT id, ts, request_id, downstream_key_id, alias,
+                          provider_id, provider_kind, model_id,
+                          prompt_tokens, completion_tokens, total_tokens,
+                          reasoning_tokens, cache_read_tokens, cache_write_tokens,
+                          cost_usd, stream
+                   FROM usage_records
+                   WHERE ts LIKE ?
+                   ORDER BY ts DESC
+                   LIMIT ?"#,
+                )
+                .bind(pat)
+                .bind(limit)
+                .fetch_all(self.pool)
+                .await
+            }
+            (None, None) => {
                 sqlx::query(
                     r#"SELECT id, ts, request_id, downstream_key_id, alias,
                           provider_id, provider_kind, model_id,
@@ -254,6 +298,86 @@ impl<'a> UsageRepo<'a> {
             })
             .collect())
     }
+
+    /// Model breakdown nested under each downstream key for a calendar period.
+    #[instrument(skip(self))]
+    pub async fn summary_by_key_model(
+        &self,
+        period: &str,
+    ) -> Result<Vec<UsageKeyModelRow>, StoreError> {
+        let pattern = format!("{period}%");
+        let rows = sqlx::query(
+            r#"SELECT
+                   COALESCE(downstream_key_id, '') AS downstream_key_id,
+                   COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
+                   provider_kind,
+                   COUNT(*) AS request_count,
+                   COALESCE(SUM(cost_usd), 0) AS total_usd,
+                   COALESCE(SUM(total_tokens), 0) AS total_tokens
+               FROM usage_records
+               WHERE ts LIKE ?
+               GROUP BY COALESCE(downstream_key_id, ''),
+                        COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
+                        provider_kind
+               ORDER BY total_usd DESC"#,
+        )
+        .bind(&pattern)
+        .fetch_all(self.pool)
+        .await
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| UsageKeyModelRow {
+                downstream_key_id: r.get("downstream_key_id"),
+                label: r.get("label"),
+                provider_kind: r.get("provider_kind"),
+                request_count: r.get::<i64, _>("request_count") as u64,
+                total_usd: r.get("total_usd"),
+                total_tokens: r.get::<i64, _>("total_tokens") as u64,
+            })
+            .collect())
+    }
+
+    /// Model breakdown nested under each UTC day for a calendar period.
+    #[instrument(skip(self))]
+    pub async fn summary_by_day_model(
+        &self,
+        period: &str,
+    ) -> Result<Vec<UsageDayModelRow>, StoreError> {
+        let pattern = format!("{period}%");
+        let rows = sqlx::query(
+            r#"SELECT
+                   substr(ts, 1, 10) AS day,
+                   COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
+                   provider_kind,
+                   COUNT(*) AS request_count,
+                   COALESCE(SUM(cost_usd), 0) AS total_usd,
+                   COALESCE(SUM(total_tokens), 0) AS total_tokens
+               FROM usage_records
+               WHERE ts LIKE ?
+               GROUP BY substr(ts, 1, 10),
+                        COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
+                        provider_kind
+               ORDER BY day ASC, total_usd DESC"#,
+        )
+        .bind(&pattern)
+        .fetch_all(self.pool)
+        .await
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| UsageDayModelRow {
+                day: r.get("day"),
+                label: r.get("label"),
+                provider_kind: r.get("provider_kind"),
+                request_count: r.get::<i64, _>("request_count") as u64,
+                total_usd: r.get("total_usd"),
+                total_tokens: r.get::<i64, _>("total_tokens") as u64,
+            })
+            .collect())
+    }
 }
 
 /// Period rollup used by console summary.
@@ -280,6 +404,28 @@ pub struct UsageDayRow {
 /// One model/alias within a period summary.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageModelRow {
+    pub label: String,
+    pub provider_kind: Option<String>,
+    pub request_count: u64,
+    pub total_usd: f64,
+    pub total_tokens: u64,
+}
+
+/// Model rollup for one downstream key within a period.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageKeyModelRow {
+    pub downstream_key_id: String,
+    pub label: String,
+    pub provider_kind: Option<String>,
+    pub request_count: u64,
+    pub total_usd: f64,
+    pub total_tokens: u64,
+}
+
+/// Model rollup for one UTC day within a period.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageDayModelRow {
+    pub day: String,
     pub label: String,
     pub provider_kind: Option<String>,
     pub request_count: u64,
@@ -374,15 +520,70 @@ mod tests {
         );
         repo.insert(&row).await.unwrap();
 
-        let listed = repo.list(10, None).await.unwrap();
+        let listed = repo.list(10, None, None).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].request_id, "req-1");
         assert!((listed[0].cost_usd - 0.012).abs() < 1e-9);
 
-        let by_key = repo.list(10, Some("dk1")).await.unwrap();
+        let by_key = repo.list(10, Some("dk1"), None).await.unwrap();
         assert_eq!(by_key.len(), 1);
-        let empty = repo.list(10, Some("other")).await.unwrap();
+        let empty = repo.list(10, Some("other"), None).await.unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_period() {
+        let pool = open_db("sqlite::memory:").await.unwrap();
+        let repo = UsageRepo::new(&pool);
+
+        let mut a = new_usage_record(
+            "req-a",
+            Some("dk1".into()),
+            None,
+            None,
+            None,
+            Some("m1".into()),
+            1,
+            1,
+            2,
+            0,
+            0,
+            0,
+            0.01,
+            false,
+        );
+        a.ts = "2026-06-15T12:00:00Z".into();
+        repo.insert(&a).await.unwrap();
+
+        let mut b = new_usage_record(
+            "req-b",
+            Some("dk1".into()),
+            None,
+            None,
+            None,
+            Some("m1".into()),
+            1,
+            1,
+            2,
+            0,
+            0,
+            0,
+            0.02,
+            false,
+        );
+        b.ts = "2026-07-01T08:00:00Z".into();
+        repo.insert(&b).await.unwrap();
+
+        let july = repo.list(10, None, Some("2026-07")).await.unwrap();
+        assert_eq!(july.len(), 1);
+        assert_eq!(july[0].request_id, "req-b");
+
+        let june = repo.list(10, None, Some("2026-06")).await.unwrap();
+        assert_eq!(june.len(), 1);
+        assert_eq!(june[0].request_id, "req-a");
+
+        let all = repo.list(10, None, None).await.unwrap();
+        assert_eq!(all.len(), 2);
     }
 
     #[tokio::test]

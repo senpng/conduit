@@ -35,13 +35,16 @@ impl OAuthProviderKind {
         }
     }
 
-    /// Default upstream base URL after OAuth login.
+    /// Default upstream base URL stored after OAuth login.
+    ///
+    /// For xAI this is the **official** API base (CLIProxyAPI `DefaultAPIBaseURL`
+    /// parity). Chat traffic still rewrites empty/official bases to
+    /// `cli-chat-proxy` at request time via [`crate::providers::grok::resolve_oauth_chat_base`].
     pub fn default_base_url(self) -> &'static str {
         match self {
             Self::Claude => "https://api.anthropic.com",
             Self::Codex => "https://chatgpt.com/backend-api/codex",
-            // OAuth subscription chat must hit cli-chat-proxy, not official API.
-            Self::Xai => "https://cli-chat-proxy.grok.com/v1",
+            Self::Xai => "https://api.x.ai/v1",
         }
     }
 
@@ -96,6 +99,18 @@ pub struct OAuthCredential {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
 
+    /// ChatGPT plan type from id_token (e.g. `plus`, `team`, `k12`) — Codex multi-auth naming.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "plan")]
+    pub plan_type: Option<String>,
+
+    /// Claude organization UUID (token response `organization.uuid`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_id: Option<String>,
+
+    /// Claude organization name (token response `organization.name`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_name: Option<String>,
+
     /// xAI subject claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub: Option<String>,
@@ -106,6 +121,16 @@ pub struct OAuthCredential {
     /// Grok: discovered token endpoint for refresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_endpoint: Option<String>,
+
+    /// Per-credential HTTP(S)/SOCKS proxy (CLIProxyAPI `auth.ProxyURL`).
+    /// Overrides daemon config / env when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+
+    /// xAI: when true, chat uses the official API base instead of cli-chat-proxy
+    /// (CLIProxyAPI `using_api` attribute). Default false for OAuth subscription.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub using_api: Option<bool>,
 
     /// Preserve unknown fields on round-trip.
     #[serde(flatten)]
@@ -167,6 +192,53 @@ impl OAuthCredential {
         }
         Some(cred)
     }
+
+    /// Effective per-credential proxy override (field or `extra.proxy_url`).
+    pub fn proxy_url_override(&self) -> Option<&str> {
+        self.proxy_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.extra
+                    .get("proxy_url")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
+    }
+
+    /// CLIProxyAPI `using_api` semantics (default false for OAuth subscription).
+    pub fn using_api(&self) -> bool {
+        if let Some(v) = self.using_api {
+            return v;
+        }
+        match self.extra.get("using_api") {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::String(s)) => {
+                let s = s.trim();
+                s.eq_ignore_ascii_case("true") || s == "1"
+            }
+            Some(Value::Number(n)) => n.as_i64() == Some(1),
+            _ => false,
+        }
+    }
+
+    /// Effective plan type (field or `extra.plan_type`).
+    pub fn plan_type_str(&self) -> Option<&str> {
+        self.plan_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.extra
+                    .get("plan_type")
+                    .or_else(|| self.extra.get("plan"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
+    }
 }
 
 /// Result of resolving a provider secret for an upstream call.
@@ -178,6 +250,8 @@ pub struct ResolvedCredential {
     pub extra_headers: Vec<(String, String)>,
     /// Email / account label for logging (non-secret).
     pub label: Option<String>,
+    /// xAI OAuth: use official API instead of cli-chat-proxy (CLIProxyAPI `using_api`).
+    pub using_api: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,7 +301,20 @@ pub fn oauth_extra_headers(
             }
             h
         }
-        OAuthProviderKind::Xai => crate::providers::grok::cli_proxy_headers(),
+        OAuthProviderKind::Xai => {
+            // CLIProxyAPI `applyXAIChatHeaders`: CLI identity headers only when
+            // not using_api and the resolved chat base is cli-chat-proxy.
+            let using_api = cred.using_api();
+            let base = crate::providers::grok::resolve_oauth_chat_base(
+                cred.base_url.as_deref(),
+                using_api,
+            );
+            if !using_api && crate::providers::grok::is_cli_chat_proxy_base(&base) {
+                crate::providers::grok::cli_proxy_headers()
+            } else {
+                vec![]
+            }
+        }
     }
 }
 
@@ -248,9 +335,14 @@ mod tests {
             last_refresh: None,
             email: Some("a@b.com".into()),
             account_id: None,
+            plan_type: None,
+            organization_id: None,
+            organization_name: None,
             sub: None,
             base_url: None,
             token_endpoint: None,
+            proxy_url: None,
+            using_api: None,
             extra: Default::default(),
         };
         let bytes = c.to_json_bytes().unwrap();
@@ -262,6 +354,37 @@ mod tests {
     #[test]
     fn try_parse_raw_api_key_returns_none() {
         assert!(OAuthCredential::try_parse_secret(b"sk-live-abc").is_none());
+    }
+
+    #[test]
+    fn using_api_from_field_and_extra() {
+        let mut c = OAuthCredential {
+            provider_type: "xai".into(),
+            auth_kind: "oauth".into(),
+            access_token: "t".into(),
+            refresh_token: "r".into(),
+            id_token: None,
+            token_type: None,
+            expired: None,
+            last_refresh: None,
+            email: None,
+            account_id: None,
+            plan_type: None,
+            organization_id: None,
+            organization_name: None,
+            sub: None,
+            base_url: None,
+            token_endpoint: None,
+            proxy_url: None,
+            using_api: Some(true),
+            extra: Default::default(),
+        };
+        assert!(c.using_api());
+        c.using_api = None;
+        assert!(!c.using_api());
+        c.extra
+            .insert("using_api".into(), Value::String("true".into()));
+        assert!(c.using_api());
     }
 
     #[test]
@@ -277,9 +400,14 @@ mod tests {
             last_refresh: None,
             email: None,
             account_id: None,
+            plan_type: None,
+            organization_id: None,
+            organization_name: None,
             sub: None,
             base_url: None,
             token_endpoint: None,
+            proxy_url: None,
+            using_api: None,
             extra: Default::default(),
         };
         assert!(c.needs_refresh(Duration::minutes(5)));

@@ -41,6 +41,12 @@ impl CredentialResolver {
         self
     }
 
+    /// Daemon config proxy (CLIProxyAPI `cfg.ProxyURL`); env / per-cred still apply.
+    pub fn with_default_proxy(mut self, proxy: Option<String>) -> Self {
+        self.refresh = std::mem::take(&mut self.refresh).with_default_proxy(proxy);
+        self
+    }
+
     /// Resolve a secret id into an access token + auth mode for upstream calls.
     pub async fn resolve(&self, key_id: &str) -> Result<ResolvedCredential, OAuthError> {
         tracing::debug!(key_id, "credential resolve: loading secret");
@@ -72,6 +78,7 @@ impl CredentialResolver {
             auth_mode: AuthMode::ApiKey,
             extra_headers: vec![],
             label: None,
+            using_api: false,
         })
     }
 
@@ -101,11 +108,13 @@ impl CredentialResolver {
 
         let headers = oauth_extra_headers(kind, &fresh);
         let label = fresh.email.clone();
+        let using_api = fresh.using_api();
         Ok(ResolvedCredential {
             access_token: SecretString::new(fresh.access_token),
             auth_mode: AuthMode::OAuth(kind),
             extra_headers: headers,
             label,
+            using_api,
         })
     }
 
@@ -205,9 +214,14 @@ mod tests {
             last_refresh: None,
             email: Some("u@c.com".into()),
             account_id: None,
+            plan_type: None,
+            organization_id: None,
+            organization_name: None,
             sub: None,
             base_url: None,
             token_endpoint: None,
+            proxy_url: None,
+            using_api: None,
             extra: Default::default(),
         };
         store
@@ -230,5 +244,6 @@ mod tests {
             r.extra_headers.is_empty(),
             "claude oauth extra_headers should be empty to avoid header duplication"
         );
+        assert!(!r.using_api);
     }
 }

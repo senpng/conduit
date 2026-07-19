@@ -4,35 +4,53 @@ use chrono::{Duration, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{credential::OAuthCredential, error::OAuthError};
+use crate::{
+    credential::OAuthCredential,
+    error::OAuthError,
+    proxy::{apply_reqwest_proxy, env_proxy_url},
+};
 
 pub const ISSUER: &str = "https://auth.x.ai";
 pub const DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
 pub const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 pub const SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
 pub const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
-/// Official xAI API base (API keys / using_api=true / media / websocket).
+/// Official xAI API base — stored on OAuth credentials (CLIProxyAPI `DefaultAPIBaseURL`).
 pub const DEFAULT_API_BASE: &str = "https://api.x.ai/v1";
-/// Grok CLI chat-proxy — OAuth subscription chat must use this (CLIProxyAPI parity).
+/// Grok CLI chat-proxy — OAuth subscription **chat** rewrites empty/official base here.
 pub const CLI_CHAT_PROXY_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
 /// Client version expected by cli-chat-proxy (keep in sync with Grok CLI).
 pub const CLI_CLIENT_VERSION: &str = "0.2.93";
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 pub const MAX_POLL_DURATION_SECS: u64 = 30 * 60;
 
-/// Resolve chat base URL for Grok OAuth (CLIProxyAPI `xaiChatBaseURL` semantics):
-/// empty or official `api.x.ai/v1` → rewrite to cli-chat-proxy; custom URL honored.
-pub fn resolve_oauth_chat_base(configured: Option<&str>) -> String {
+/// Resolve chat base URL for Grok OAuth (CLIProxyAPI `xaiChatBaseURL` semantics).
+///
+/// - `using_api == true`: official API path — empty → `DEFAULT_API_BASE`, else honor configured.
+/// - `using_api == false` (OAuth subscription default): empty or official default →
+///   rewrite to cli-chat-proxy; explicit custom base is honored.
+pub fn resolve_oauth_chat_base(configured: Option<&str>, using_api: bool) -> String {
     let b = configured.unwrap_or("").trim().trim_end_matches('/');
+    if using_api {
+        if b.is_empty() {
+            return DEFAULT_API_BASE.to_string();
+        }
+        return b.to_string();
+    }
     if b.is_empty() || is_official_api_base(b) {
         return CLI_CHAT_PROXY_BASE.to_string();
     }
     b.to_string()
 }
 
-fn is_official_api_base(base: &str) -> bool {
+pub fn is_official_api_base(base: &str) -> bool {
     let n = base.trim().trim_end_matches('/');
     n == DEFAULT_API_BASE || n == "https://api.x.ai"
+}
+
+pub fn is_cli_chat_proxy_base(base: &str) -> bool {
+    let n = base.trim().trim_end_matches('/');
+    n == CLI_CHAT_PROXY_BASE || n == "https://cli-chat-proxy.grok.com"
 }
 
 /// Identity headers required by cli-chat-proxy for OAuth/CLI clients.
@@ -64,28 +82,31 @@ pub struct DeviceCodeResponse {
     pub token_endpoint: String,
 }
 
+fn build_client(proxy_url: Option<&str>) -> Result<reqwest::Client, OAuthError> {
+    let builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
+    apply_reqwest_proxy(builder, proxy_url)?
+        .build()
+        .map_err(|e| OAuthError::Network(format!("grok oauth client: {e}")))
+}
+
 pub struct GrokOAuth {
     client: reqwest::Client,
     discovery_url: String,
     client_id: String,
 }
 
-impl Default for GrokOAuth {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl GrokOAuth {
-    pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .unwrap_or_default(),
+    /// Build with proxy from env. Configured proxy failures do **not** fall back to direct.
+    pub fn new() -> Result<Self, OAuthError> {
+        Self::with_proxy_url(env_proxy_url())
+    }
+
+    pub fn with_proxy_url(proxy_url: Option<String>) -> Result<Self, OAuthError> {
+        Ok(Self {
+            client: build_client(proxy_url.as_deref())?,
             discovery_url: DISCOVERY_URL.into(),
             client_id: CLIENT_ID.into(),
-        }
+        })
     }
 
     pub fn with_discovery_url(mut self, url: impl Into<String>) -> Self {
@@ -260,11 +281,8 @@ impl GrokOAuth {
             .and_then(|t| parse_id_token_identity(t).ok())
             .unwrap_or((None, None));
 
-        let expires_in = if payload.expires_in > 0 {
-            payload.expires_in
-        } else {
-            3600
-        };
+        // CLIProxyAPI uses expires_in as-is (Go zero → immediate expiry).
+        let expires_in = payload.expires_in.max(0);
 
         Ok(Some(OAuthCredential {
             provider_type: "xai".into(),
@@ -273,22 +291,43 @@ impl GrokOAuth {
             refresh_token: payload.refresh_token.unwrap_or_default(),
             id_token: payload.id_token,
             token_type: payload.token_type,
-            expired: Some((Utc::now() + Duration::seconds(expires_in as i64)).to_rfc3339()),
+            expired: Some((Utc::now() + Duration::seconds(expires_in)).to_rfc3339()),
             last_refresh: Some(Utc::now().to_rfc3339()),
             email,
             account_id: None,
+            plan_type: None,
+            organization_id: None,
+            organization_name: None,
             sub,
-            // Persist chat-proxy as the default OAuth chat base (CLIProxyAPI parity).
-            base_url: Some(CLI_CHAT_PROXY_BASE.into()),
+            // Persist official API base (CLIProxyAPI AuthBundle.BaseURL = DefaultAPIBaseURL).
+            // Chat rewrites to cli-chat-proxy at request time via resolve_oauth_chat_base.
+            base_url: Some(DEFAULT_API_BASE.into()),
             token_endpoint: Some(token_endpoint.to_string()),
+            proxy_url: None,
+            // OAuth subscription default: chat-proxy (using_api=false).
+            using_api: Some(false),
             extra: Default::default(),
         }))
     }
 
-    /// Poll until authorized, expired, or context cancelled.
+    /// Poll until authorized, expired, or cancelled.
+    ///
+    /// `cancel` is checked each loop iteration (session cancel / explicit abort).
     pub async fn wait_for_authorization(
         &self,
         device: &DeviceCodeResponse,
+    ) -> Result<OAuthCredential, OAuthError> {
+        self.wait_for_authorization_cancellable(device, || false)
+            .await
+    }
+
+    /// Like [`wait_for_authorization`] with a cancel predicate.
+    ///
+    /// `is_cancelled` returns true when the login should abort (e.g. session cancelled).
+    pub async fn wait_for_authorization_cancellable(
+        &self,
+        device: &DeviceCodeResponse,
+        mut is_cancelled: impl FnMut() -> bool,
     ) -> Result<OAuthCredential, OAuthError> {
         let mut interval =
             std::time::Duration::from_secs(device.interval.max(DEFAULT_POLL_INTERVAL_SECS));
@@ -296,6 +335,9 @@ impl GrokOAuth {
             + std::time::Duration::from_secs(device.expires_in.clamp(1, MAX_POLL_DURATION_SECS));
 
         loop {
+            if is_cancelled() {
+                return Err(OAuthError::SessionCancelled);
+            }
             match self
                 .poll_once(&device.token_endpoint, &device.device_code)
                 .await
@@ -311,7 +353,16 @@ impl GrokOAuth {
             if std::time::Instant::now() >= deadline {
                 return Err(OAuthError::DeviceCodeExpired);
             }
-            tokio::time::sleep(interval).await;
+            // Interruptible sleep: wake early to re-check cancel.
+            let slice = interval.min(std::time::Duration::from_secs(1));
+            let mut slept = std::time::Duration::ZERO;
+            while slept < interval {
+                if is_cancelled() {
+                    return Err(OAuthError::SessionCancelled);
+                }
+                tokio::time::sleep(slice).await;
+                slept += slice;
+            }
         }
     }
 
@@ -361,11 +412,7 @@ impl GrokOAuth {
             .refresh_token
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| refresh_token.to_string());
-        let expires_in = if payload.expires_in > 0 {
-            payload.expires_in
-        } else {
-            3600
-        };
+        let expires_in = payload.expires_in.max(0);
         let (email, sub) = payload
             .id_token
             .as_deref()
@@ -379,13 +426,18 @@ impl GrokOAuth {
             refresh_token: new_refresh,
             id_token: payload.id_token,
             token_type: payload.token_type,
-            expired: Some((Utc::now() + Duration::seconds(expires_in as i64)).to_rfc3339()),
+            expired: Some((Utc::now() + Duration::seconds(expires_in)).to_rfc3339()),
             last_refresh: Some(Utc::now().to_rfc3339()),
             email,
             account_id: None,
+            plan_type: None,
+            organization_id: None,
+            organization_name: None,
             sub,
-            base_url: Some(CLI_CHAT_PROXY_BASE.into()),
+            base_url: Some(DEFAULT_API_BASE.into()),
             token_endpoint: Some(endpoint),
+            proxy_url: None,
+            using_api: Some(false),
             extra: Default::default(),
         })
     }
@@ -491,22 +543,35 @@ mod tests {
 
     #[test]
     fn oauth_chat_base_rewrites_official_api_to_cli_proxy() {
-        assert_eq!(resolve_oauth_chat_base(None), CLI_CHAT_PROXY_BASE);
+        assert_eq!(resolve_oauth_chat_base(None, false), CLI_CHAT_PROXY_BASE);
         assert_eq!(
-            resolve_oauth_chat_base(Some("https://api.x.ai/v1")),
+            resolve_oauth_chat_base(Some("https://api.x.ai/v1"), false),
             CLI_CHAT_PROXY_BASE
         );
         assert_eq!(
-            resolve_oauth_chat_base(Some("https://api.x.ai/v1/")),
+            resolve_oauth_chat_base(Some("https://api.x.ai/v1/"), false),
             CLI_CHAT_PROXY_BASE
         );
         assert_eq!(
-            resolve_oauth_chat_base(Some("https://custom.example/v1")),
+            resolve_oauth_chat_base(Some("https://custom.example/v1"), false),
             "https://custom.example/v1"
         );
         assert_eq!(
-            resolve_oauth_chat_base(Some(CLI_CHAT_PROXY_BASE)),
+            resolve_oauth_chat_base(Some(CLI_CHAT_PROXY_BASE), false),
             CLI_CHAT_PROXY_BASE
+        );
+    }
+
+    #[test]
+    fn oauth_chat_base_using_api_keeps_official() {
+        assert_eq!(resolve_oauth_chat_base(None, true), DEFAULT_API_BASE);
+        assert_eq!(
+            resolve_oauth_chat_base(Some("https://api.x.ai/v1"), true),
+            "https://api.x.ai/v1"
+        );
+        assert_eq!(
+            resolve_oauth_chat_base(Some("https://custom.example/v1"), true),
+            "https://custom.example/v1"
         );
     }
 
@@ -543,7 +608,7 @@ mod tests {
             .await;
 
         // Bypass host validation by calling request_device_code directly with mock URLs
-        let oauth = GrokOAuth::new();
+        let oauth = GrokOAuth::new().unwrap();
         let device = oauth
             .request_device_code(
                 &format!("{}/device", server.uri()),
