@@ -339,6 +339,7 @@ impl PipelineHandle {
                             provider_kind: resolved.provider_kind.clone(),
                             model_id: resolved.model_id.clone(),
                             started_at: ctx.started_at,
+                            attempt_started_at: attempt_started,
                             route_strategy: route_meta.route_strategy,
                             attempt_no: resolved.attempt_no,
                             attempt_count,

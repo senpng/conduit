@@ -28,7 +28,10 @@ pub struct StreamRecordMeta {
     pub provider_id: String,
     pub provider_kind: String,
     pub model_id: String,
+    /// Request start (gateway accept) — main-row duration / client TTFB.
     pub started_at: DateTime<Utc>,
+    /// This upstream try's start — final attempt row duration / attempt TTFB.
+    pub attempt_started_at: DateTime<Utc>,
     pub route_strategy: Option<String>,
     pub attempt_no: u32,
     pub attempt_count: u32,
@@ -48,8 +51,10 @@ pub struct UsageTrackingStream {
     pricing_fn: PricingFn,
     quota: Arc<dyn QuotaEngine>,
     meta: StreamRecordMeta,
-    /// Set on first successful upstream chunk (TTFB).
+    /// Request-level TTFB (first Ok chunk vs `started_at`) for the main ledger row.
     ttfb_ms: Option<u64>,
+    /// Attempt-local TTFB (first Ok chunk vs `attempt_started_at`) for the final try row.
+    attempt_ttfb_ms: Option<u64>,
     finish_reason: Option<String>,
     /// Last terminal stream error, if any.
     terminal_error: Option<ProviderError>,
@@ -70,6 +75,7 @@ impl UsageTrackingStream {
             quota,
             meta,
             ttfb_ms: None,
+            attempt_ttfb_ms: None,
             finish_reason: None,
             terminal_error: None,
         }
@@ -100,11 +106,18 @@ impl UsageTrackingStream {
     }
 
     fn stamp_ttfb(&mut self) {
+        let now = Utc::now();
+        // Main-row / client TTFB: from request accept.
         if self.ttfb_ms.is_none() {
-            let ms = (Utc::now() - self.meta.started_at)
+            let ms = (now - self.meta.started_at).num_milliseconds().max(0) as u64;
+            self.ttfb_ms = Some(ms);
+        }
+        // Per-try TTFB: from this upstream attempt's start only.
+        if self.attempt_ttfb_ms.is_none() {
+            let ms = (now - self.meta.attempt_started_at)
                 .num_milliseconds()
                 .max(0) as u64;
-            self.ttfb_ms = Some(ms);
+            self.attempt_ttfb_ms = Some(ms);
         }
     }
 
@@ -120,7 +133,11 @@ impl UsageTrackingStream {
                 pf(pk, mid)
             });
 
-        let duration_ms = (Utc::now() - self.meta.started_at)
+        let now = Utc::now();
+        // Main ledger row: end-to-end from request accept.
+        let duration_ms = (now - self.meta.started_at).num_milliseconds().max(0) as u64;
+        // Final attempt row: only this try (not prior retries).
+        let attempt_duration_ms = (now - self.meta.attempt_started_at)
             .num_milliseconds()
             .max(0) as u64;
 
@@ -159,8 +176,8 @@ impl UsageTrackingStream {
             status: status.clone(),
             error_class: error_class.clone(),
             http_status,
-            duration_ms: Some(duration_ms),
-            ttfb_ms: self.ttfb_ms,
+            duration_ms: Some(attempt_duration_ms),
+            ttfb_ms: self.attempt_ttfb_ms,
             reason: Some(if self.meta.attempt_no == 0 {
                 "initial".into()
             } else {
@@ -309,6 +326,7 @@ mod tests {
     }
 
     fn meta(request_id: &str) -> StreamRecordMeta {
+        let now = Utc::now();
         StreamRecordMeta {
             request_id: request_id.into(),
             downstream_key_id: Some("dk1".into()),
@@ -316,7 +334,8 @@ mod tests {
             provider_id: "openai".into(),
             provider_kind: "openai".into(),
             model_id: "gpt-4o".into(),
-            started_at: Utc::now(),
+            started_at: now,
+            attempt_started_at: now,
             route_strategy: Some("fixed".into()),
             attempt_no: 0,
             attempt_count: 1,
@@ -390,6 +409,7 @@ mod tests {
         let started = Utc::now() - chrono::Duration::milliseconds(50);
         let mut m = meta("req-ttfb");
         m.started_at = started;
+        m.attempt_started_at = started;
 
         let c1 = CanonicalChunk::text_delta("a");
         let c2 = CanonicalChunk {
@@ -445,7 +465,12 @@ mod tests {
         let quota = Arc::new(CapturingQuota {
             recorded: recorded.clone(),
         });
+        // Request accepted 250ms ago (includes failed try); this attempt just started.
+        let request_started = Utc::now() - chrono::Duration::milliseconds(250);
+        let attempt_started = Utc::now() - chrono::Duration::milliseconds(15);
         let mut m = meta("req-multi");
+        m.started_at = request_started;
+        m.attempt_started_at = attempt_started;
         m.attempt_no = 1;
         m.attempt_count = 2;
         m.prior_attempts = vec![QuotaAttemptRecord {
@@ -456,7 +481,7 @@ mod tests {
             status: "error".into(),
             error_class: Some("rate_limited".into()),
             http_status: Some(429),
-            duration_ms: Some(15),
+            duration_ms: Some(200),
             ttfb_ms: None,
             reason: Some("initial".into()),
         }];
@@ -483,5 +508,34 @@ mod tests {
         assert_eq!(rows[0].attempts[0].provider_id.as_deref(), Some("p0"));
         assert_eq!(rows[0].attempts[1].status, "ok");
         assert_eq!(rows[0].attempt_count, 2);
+
+        let main_duration = rows[0].duration_ms.expect("main duration");
+        let final_attempt = &rows[0].attempts[1];
+        let attempt_duration = final_attempt.duration_ms.expect("attempt duration");
+        // Main row spans the whole request (prior try + current).
+        assert!(
+            main_duration >= 250,
+            "main duration must cover request start, got {main_duration}"
+        );
+        // Final attempt is attempt-local — not prior+current.
+        assert!(
+            attempt_duration < 100,
+            "final attempt duration must be attempt-local, got {attempt_duration}"
+        );
+        assert!(
+            attempt_duration < main_duration,
+            "attempt {attempt_duration} must be < main {main_duration}"
+        );
+        // Attempt TTFB is also relative to attempt start, not request start.
+        let attempt_ttfb = final_attempt.ttfb_ms.expect("attempt ttfb");
+        let main_ttfb = rows[0].ttfb_ms.expect("main ttfb");
+        assert!(
+            attempt_ttfb <= main_ttfb,
+            "attempt ttfb {attempt_ttfb} should be ≤ main ttfb {main_ttfb}"
+        );
+        assert!(
+            attempt_ttfb < 100,
+            "attempt ttfb must be attempt-local, got {attempt_ttfb}"
+        );
     }
 }
