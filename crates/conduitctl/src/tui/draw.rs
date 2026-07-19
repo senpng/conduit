@@ -635,46 +635,72 @@ fn draw_month_model_mix(
 
     let total: u64 = mix.iter().map(|(_, t)| *t).sum::<u64>().max(1);
     let n = (inner.height as usize).min(mix.len()).min(8);
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(n);
+    let w = inner.width as usize;
 
+    // Pre-size trailing columns so every row aligns; bar fills remaining width.
+    // Layout: " name……  ████████████  100%  1.19M"
+    let pct_w = mix
+        .iter()
+        .take(n)
+        .map(|(_, tok)| {
+            let pct = *tok as f64 / total as f64 * 100.0;
+            display_width(&format_model_pct(pct))
+        })
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let tok_w = mix
+        .iter()
+        .take(n)
+        .map(|(_, tok)| display_width(&format_tokens(*tok)))
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    // leading space + gaps around name/bar/pct/tok
+    let gaps = 4usize;
+    let flex = w.saturating_sub(pct_w + tok_w + gaps).max(10);
+    // ~40% name, rest bar — no max clamp so wide panes use full width.
+    let name_w = (flex * 40 / 100).clamp(8, flex.saturating_sub(6));
+    let bar_w = flex.saturating_sub(name_w);
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(n);
     for (i, (name, tok)) in mix.iter().take(n).enumerate() {
         let pct = *tok as f64 / total as f64 * 100.0;
-        let pct_s = if pct >= 9.95 {
-            format!("{pct:.0}%")
-        } else if pct >= 0.05 {
-            format!("{pct:.1}%")
-        } else if pct > 0.0 {
-            "<0.1%".into()
-        } else {
-            "0%".into()
-        };
-        // Prefer: name  ████░  99%  1.19M
-        let w = inner.width as usize;
+        let pct_s = format_model_pct(pct);
         let tok_s = format_tokens(*tok);
         let color = theme.chart_color(i);
-        // Budget: " " + name + " " + bar + " " + pct + " " + tok
-        let pct_w = display_width(&pct_s).max(3);
-        let tok_w = display_width(&tok_s).max(3);
-        let fixed = 1 + 1 + 1 + pct_w + 1 + tok_w; // spaces around bar/pct/tok
-        let name_w = w.saturating_sub(fixed + 4).clamp(4, 18);
-        let bar_w = w
-            .saturating_sub(1 + name_w + 1 + 1 + pct_w + 1 + tok_w)
-            .clamp(4, 16);
-        let line = format!(
-            " {} {} {} {}",
-            pad_display(&truncate(name, name_w), name_w),
-            ratio_bar(*tok as f64 / total as f64, bar_w),
-            pad_display(&pct_s, pct_w),
-            tok_s,
-        );
-        lines.push(Line::from(Span::styled(
-            truncate(&line, w),
-            Style::default().fg(color),
-        )));
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                pad_display(&truncate(name, name_w), name_w),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                ratio_bar(*tok as f64 / total as f64, bar_w),
+                Style::default().fg(color),
+            ),
+            Span::raw(" "),
+            Span::styled(pad_display(&pct_s, pct_w), theme.muted()),
+            Span::raw(" "),
+            Span::styled(pad_display(&tok_s, tok_w), theme.warning()),
+        ]));
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
     restore_right_border(frame, area, border_style);
+}
+
+fn format_model_pct(pct: f64) -> String {
+    if pct >= 9.95 {
+        format!("{pct:.0}%")
+    } else if pct >= 0.05 {
+        format!("{pct:.1}%")
+    } else if pct > 0.0 {
+        "<0.1%".into()
+    } else {
+        "0%".into()
+    }
 }
 
 /// Aggregate model token totals for `YYYY-MM` from `by_day_model`.
@@ -935,175 +961,88 @@ fn day_axis_line(
     }
 }
 
+/// All-time model token ranking — same single-line recipe as month Models mix:
+/// `name  ████████  99%  1.19M` filling the full panel width.
 fn draw_overview_top_models(frame: &mut Frame, area: Rect, app: &App) {
-    let mut rows: Vec<(String, f64)> = app
-        .overview_summary
-        .as_ref()
-        .map(|s| {
-            s.by_model
-                .iter()
-                .map(|m| (m.label.clone(), m.total_tokens as f64))
-                .collect()
-        })
-        .unwrap_or_default();
-    rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    draw_overview_rank_bars(
-        frame,
-        area,
-        app,
-        "Top models  ·  tokens  ·  all-time",
-        &rows,
-        "no model tokens",
-        true,
-        true,
-    );
-}
-
-/// Shared name + bar + value layout used by Top models.
-///
-/// When `as_tokens` is true, values are rendered with [`format_tokens`].
-fn draw_overview_rank_bars(
-    frame: &mut Frame,
-    area: Rect,
-    app: &App,
-    title: &str,
-    rows: &[(String, f64)],
-    empty_hint: &str,
-    join_left: bool,
-    as_tokens: bool,
-) {
     let theme = &app.theme;
-    let block = if join_left {
-        overview_right_block(theme, title)
-    } else {
-        panel_block(theme, title, false)
-    };
+    let block = overview_right_block(theme, "Top models  ·  tokens  ·  all-time");
     let border_style = theme.border();
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Clear, inner);
 
+    let mut rows: Vec<(String, u64)> = app
+        .overview_summary
+        .as_ref()
+        .map(|s| {
+            s.by_model
+                .iter()
+                .filter(|m| m.total_tokens > 0)
+                .map(|m| (m.label.clone(), m.total_tokens))
+                .collect()
+        })
+        .unwrap_or_default();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+
     if rows.is_empty() {
         frame.render_widget(
-            Paragraph::new(Span::styled(format!("  {empty_hint}"), theme.subtle())),
+            Paragraph::new(Span::styled("  no model tokens", theme.subtle())),
             inner,
         );
         restore_right_border(frame, area, border_style);
         return;
     }
 
-    let max = rows
-        .iter()
-        .map(|(_, c)| *c)
-        .fold(0.0_f64, f64::max)
-        .max(1e-9);
+    let total: u64 = rows.iter().map(|(_, t)| *t).sum::<u64>().max(1);
+    let n = (inner.height as usize).min(rows.len()).min(8);
+    let w = inner.width as usize;
 
-    // Compact: one line per row when short; two-line (name/bar) when tall.
-    let two_line = inner.height >= 8;
-    let row_h: u16 = if two_line { 2 } else { 1 };
-    let n = ((inner.height / row_h) as usize).max(1).min(rows.len()).min(6);
-
-    let value_strings: Vec<String> = rows
+    let pct_w = rows
         .iter()
         .take(n)
-        .map(|(_, c)| {
-            if as_tokens {
-                format_tokens(c.round().max(0.0) as u64)
-            } else {
-                format_usd(*c)
-            }
-        })
-        .collect();
-    let value_col = value_strings
-        .iter()
-        .map(|s| display_width(s))
+        .map(|(_, tok)| display_width(&format_model_pct(*tok as f64 / total as f64 * 100.0)))
         .max()
-        .unwrap_or(6)
-        .saturating_add(1)
-        .clamp(7, 14) as u16;
+        .unwrap_or(4)
+        .max(4);
+    let tok_w = rows
+        .iter()
+        .take(n)
+        .map(|(_, tok)| display_width(&format_tokens(*tok)))
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    // leading space + 3 gaps (name|bar, bar|pct, pct|tok)
+    let gaps = 4usize;
+    let flex = w.saturating_sub(pct_w + tok_w + gaps).max(10);
+    let name_w = (flex * 40 / 100).clamp(8, flex.saturating_sub(6));
+    let bar_w = flex.saturating_sub(name_w);
 
-    for (i, (name, value)) in rows.iter().take(n).enumerate() {
-        let y = inner.y + (i as u16) * row_h;
-        if y >= inner.y + inner.height {
-            break;
-        }
-        let block_h = row_h.min(inner.y + inner.height - y);
-        let row = Rect {
-            x: inner.x,
-            y,
-            width: inner.width,
-            height: block_h,
-        };
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(8), Constraint::Length(value_col)])
-            .split(row);
-        let (left, right) = (cols[0], cols[1]);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(n);
+    for (i, (name, tok)) in rows.iter().take(n).enumerate() {
+        let pct = *tok as f64 / total as f64 * 100.0;
         let color = theme.chart_color(i);
-
-        if two_line && block_h >= 2 {
-            let name_w = (left.width as usize).saturating_sub(1).max(4);
-            let bar_w = (left.width as usize).saturating_sub(1).clamp(4, 48);
-            let left_lines = vec![
-                Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled(
-                        truncate(name, name_w),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled(
-                        ratio_bar(value / max, bar_w),
-                        Style::default().fg(color),
-                    ),
-                ]),
-            ];
-            frame.render_widget(Paragraph::new(left_lines), left);
-            let value_y = right.y + right.height / 2;
-            let value_y = value_y.min(right.y + right.height.saturating_sub(1));
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    value_strings[i].clone(),
-                    theme.muted(),
-                )))
-                .alignment(Alignment::Right),
-                Rect {
-                    x: right.x,
-                    y: value_y,
-                    width: right.width,
-                    height: 1,
-                },
-            );
-        } else {
-            // Single-line: name ··· bar  value
-            let value_s = &value_strings[i];
-            let value_w = display_width(value_s);
-            let budget = (left.width as usize).saturating_sub(2).max(6);
-            let bar_w = (budget / 3).clamp(4, 16);
-            let name_w = budget.saturating_sub(bar_w + 1).max(4);
-            let line = Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    pad_display(&truncate(name, name_w), name_w),
-                    Style::default().fg(color),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    ratio_bar(value / max, bar_w),
-                    Style::default().fg(color),
-                ),
-            ]);
-            frame.render_widget(Paragraph::new(line), left);
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(value_s.clone(), theme.muted())))
-                    .alignment(Alignment::Right),
-                right,
-            );
-            let _ = value_w;
-        }
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                pad_display(&truncate(name, name_w), name_w),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                ratio_bar(*tok as f64 / total as f64, bar_w),
+                Style::default().fg(color),
+            ),
+            Span::raw(" "),
+            Span::styled(pad_display(&format_model_pct(pct), pct_w), theme.muted()),
+            Span::raw(" "),
+            Span::styled(
+                pad_display(&format_tokens(*tok), tok_w),
+                theme.warning(),
+            ),
+        ]));
     }
+
+    frame.render_widget(Paragraph::new(lines), inner);
     restore_right_border(frame, area, border_style);
 }
 
@@ -1158,21 +1097,27 @@ fn draw_overview_provider_health(frame: &mut Frame, area: Rect, app: &App) {
     });
 
     let width = inner.width as usize;
-    // Fixed-ish columns; name absorbs leftover.
-    // "  name…  kind  ████████  99%  120ms  3.45M"
-    let kind_w = 10usize;
-    let bar_w = if width >= 72 {
+    // Column recipe — fill the full panel width (no max clamp on name).
+    // Leading space + gaps between the 6 fields.
+    // " name……  kind………  ████████████  100%  5.5s  1.19M"
+    let kind_w = if width >= 90 {
+        14 // "claude-oauth"
+    } else if width >= 70 {
         12
-    } else if width >= 56 {
-        8
     } else {
-        6
+        10
     };
-    let pct_w = 5usize; // " 99%"
-    let ttfb_w = 6usize; // "120ms"
-    let tok_w = 7usize; // " 3.45M"
-    let fixed = 1 + kind_w + 1 + bar_w + 1 + pct_w + 1 + ttfb_w + 1 + tok_w + 1;
-    let name_w = width.saturating_sub(fixed).clamp(8, 22);
+    let pct_w = 5usize; // "100%"
+    let ttfb_w = 7usize; // "1200ms" / "5.5s  "
+    let tok_w = 8usize; // "12.34M "
+    // 1 leading + 5 inter-column spaces
+    let gaps = 6usize;
+    let fixed = kind_w + pct_w + ttfb_w + tok_w + gaps;
+    let flex = width.saturating_sub(fixed).max(16);
+    // Give name room for "codex (user@email.com)"; leftover grows the success bar.
+    // Never force a min bar wider than remaining flex (avoids overflow on narrow panes).
+    let name_w = (flex * 45 / 100).clamp(12, flex.saturating_sub(8));
+    let bar_w = flex.saturating_sub(name_w);
 
     let show_header = inner.height >= 3 && width >= 48;
     let body_h = if show_header {
@@ -1194,10 +1139,7 @@ fn draw_overview_provider_health(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(" "),
             Span::styled(pad_display("ttfb", ttfb_w), theme.muted()),
             Span::raw(" "),
-            Span::styled(
-                pad_display(&truncate("tokens", tok_w), tok_w),
-                theme.muted(),
-            ),
+            Span::styled(pad_display("tokens", tok_w), theme.muted()),
         ]));
     }
 
