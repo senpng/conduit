@@ -32,8 +32,11 @@ use crate::{
 ///
 /// The value is the secret token used only for lookup; after auth succeeds the
 /// pipeline stores the stable DB key id, never this raw string.
-/// Headers forwarded into Claude OAuth device-profile / cloak (CLIProxyAPI gin headers).
-fn extract_client_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+/// Headers forwarded into Claude OAuth device-profile / cloak **and** session affinity.
+///
+/// Session affinity needs: `X-Session-ID`, `Session-Id` / `Session_id`,
+/// `X-Claude-Code-Session-Id`, `X-Client-Request-Id` (and related).
+pub(crate) fn extract_client_headers(headers: &HeaderMap) -> Vec<(String, String)> {
     const NAMES: &[&str] = &[
         "user-agent",
         "x-stainless-package-version",
@@ -47,6 +50,10 @@ fn extract_client_headers(headers: &HeaderMap) -> Vec<(String, String)> {
         "anthropic-beta",
         "anthropic-version",
         "x-app",
+        // Session affinity (order does not matter here; extract_session_id prioritizes).
+        "x-session-id",
+        "session-id",
+        "session_id",
         "x-claude-code-session-id",
         "x-client-request-id",
     ];
@@ -61,6 +68,9 @@ fn extract_client_headers(headers: &HeaderMap) -> Vec<(String, String)> {
                     "anthropic-beta" => "Anthropic-Beta",
                     "anthropic-version" => "Anthropic-Version",
                     "x-app" => "X-App",
+                    "x-session-id" => "X-Session-ID",
+                    "session-id" => "Session-Id",
+                    "session_id" => "Session_id",
                     other => other,
                 };
                 // Stainless headers: title-case like CLIProxyAPI
@@ -707,6 +717,84 @@ mod auth_status_tests {
         let mut h = HeaderMap::new();
         h.insert("x-api-key", "ck_test_secret".parse().unwrap());
         assert_eq!(extract_key_id(&h).as_deref(), Some("ck_test_secret"));
+    }
+
+    /// Live path: daemon header filter → pipeline session resolve → affinity pin key.
+    #[test]
+    fn session_headers_forwarded_and_resolved_for_affinity() {
+        use conduit_ir::canonical::CanonicalChatRequest;
+        use conduit_pipeline::handle::resolve_session_id;
+        use conduit_router::AffinityStore;
+
+        // X-Session-ID is the primary affinity header for generic clients.
+        let mut h = HeaderMap::new();
+        h.insert("x-session-id", "sess-from-header".parse().unwrap());
+        h.insert("user-agent", "test-agent/1".parse().unwrap());
+        let forwarded = extract_client_headers(&h);
+        assert!(
+            forwarded
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("x-session-id") && v == "sess-from-header"),
+            "extract_client_headers must forward x-session-id: {forwarded:?}"
+        );
+        let req = CanonicalChatRequest::new("gpt-4o", vec![]);
+        let sid = resolve_session_id(&forwarded, &req);
+        assert_eq!(sid.as_deref(), Some("sess-from-header"));
+        let store = AffinityStore::new();
+        store.remember(sid.as_deref().unwrap(), "gpt-4o", "prov-a");
+        assert_eq!(
+            store.preferred("sess-from-header", "gpt-4o").as_deref(),
+            Some("prov-a")
+        );
+    }
+
+    #[test]
+    fn claude_code_session_header_forwarded_and_resolved() {
+        use conduit_ir::canonical::CanonicalChatRequest;
+        use conduit_pipeline::handle::resolve_session_id;
+
+        let mut h = HeaderMap::new();
+        h.insert(
+            "x-claude-code-session-id",
+            "claude-sess-xyz".parse().unwrap(),
+        );
+        let forwarded = extract_client_headers(&h);
+        assert!(
+            forwarded.iter().any(|(k, v)| {
+                k.eq_ignore_ascii_case("x-claude-code-session-id") && v == "claude-sess-xyz"
+            }),
+            "must forward x-claude-code-session-id: {forwarded:?}"
+        );
+        let req = CanonicalChatRequest::new("claude", vec![]);
+        assert_eq!(
+            resolve_session_id(&forwarded, &req).as_deref(),
+            Some("claude-sess-xyz")
+        );
+    }
+
+    #[test]
+    fn openai_body_conversation_id_lands_in_meta_for_session() {
+        use conduit_pipeline::handle::resolve_session_id;
+
+        let body = json!({
+            "model": "gpt-4o",
+            "conversation_id": "conv-live-1",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = OpenAiCodec::decode_request(body, "gpt-4o".into(), false, "req-1".into(), "k1".into())
+            .expect("decode openai request");
+        assert_eq!(
+            req.meta
+                .extra
+                .get("conversation_id")
+                .and_then(|v| v.as_str()),
+            Some("conv-live-1")
+        );
+        // No session headers — body field via meta must still resolve.
+        assert_eq!(
+            resolve_session_id(&[], &req).as_deref(),
+            Some("conv-live-1")
+        );
     }
 
 }

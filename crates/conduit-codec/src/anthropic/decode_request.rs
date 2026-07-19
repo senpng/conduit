@@ -90,6 +90,16 @@ pub fn decode_request(
         meta.extra
             .insert("thinking".into(), body["thinking"].clone());
     }
+    // Session affinity: conversation / metadata.user_id (Claude Code session).
+    for key in ["conversation_id", "session_id"] {
+        if let Some(s) = body[key].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            meta.extra
+                .insert(key.into(), serde_json::Value::String(s.to_string()));
+        }
+    }
+    if let Some(m) = body.get("metadata").filter(|v| !v.is_null()) {
+        meta.extra.insert("metadata".into(), m.clone());
+    }
 
     Ok(CanonicalChatRequest {
         id: request_id.clone(),

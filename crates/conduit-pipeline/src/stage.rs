@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use conduit_ir::error::GatewayError;
-use conduit_router::{decision::route_with_options, table::RoutingTable};
+use conduit_router::{decision::route_with_options, table::RoutingTable, PoolCursorStore};
 
 use super::context::{PipelineContext, ResolvedProvider};
 
@@ -12,7 +12,7 @@ pub fn route_request(
     ctx: &mut PipelineContext,
     preferred_provider_id: Option<&str>,
 ) -> Result<(), GatewayError> {
-    route_request_with_skip(ctx, preferred_provider_id, None)
+    route_request_with_skip(ctx, preferred_provider_id, None, None)
 }
 
 /// Like [`route_request`] but skips provider ids currently in upstream cooldown.
@@ -20,6 +20,7 @@ pub fn route_request_with_skip(
     ctx: &mut PipelineContext,
     preferred_provider_id: Option<&str>,
     skip_provider_ids: Option<&HashSet<String>>,
+    pool_cursors: Option<&PoolCursorStore>,
 ) -> Result<(), GatewayError> {
     let alias = ctx.request.alias.clone();
     let decision = route_with_options(
@@ -29,6 +30,7 @@ pub fn route_request_with_skip(
         preferred_provider_id,
         Some(ctx.routing_seed),
         skip_provider_ids,
+        pool_cursors,
     )
     .map_err(|e| {
         GatewayError::Routing(format!("routing failed for '{}': {}", alias, e))
@@ -90,6 +92,7 @@ mod tests {
         Arc::new(RoutingTable::new([Route {
             alias: "lb".into(),
             strategy: RoutingStrategy::Weighted,
+            pool_strategy: conduit_router::PoolStrategy::default(),
             targets: vec![
                 RouteTarget {
                     provider_id: "a".into(),

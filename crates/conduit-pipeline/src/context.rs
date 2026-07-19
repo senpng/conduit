@@ -49,6 +49,10 @@ pub struct PipelineContext {
     pub attempt_no: u32,
     pub ingress_wire: Option<IngressWire>,
     pub routing_seed: u64,
+    /// Session identity for affinity (empty / None → no pin).
+    pub session_id: Option<String>,
+    /// Client headers forwarded for session extraction / upstream.
+    pub client_headers: Vec<(String, String)>,
 }
 
 impl PipelineContext {
@@ -77,7 +81,14 @@ impl PipelineContext {
                 format: wire_format,
             }),
             routing_seed,
+            session_id: None,
+            client_headers: Vec::new(),
         }
+    }
+
+    pub fn with_client_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.client_headers = headers;
+        self
     }
 
     pub fn with_ingress_wire(mut self, wire: IngressWire) -> Self {

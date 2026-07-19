@@ -927,12 +927,33 @@ impl WireCodec for OpenAiResponsesCodec {
                     .map(str::to_string),
                 ..Default::default()
             },
-            meta: conduit_ir::canonical::RequestMeta {
-                user: body
-                    .get("user")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                extra: Default::default(),
+            meta: {
+                let mut meta = conduit_ir::canonical::RequestMeta {
+                    user: body
+                        .get("user")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    extra: Default::default(),
+                };
+                for key in [
+                    "conversation_id",
+                    "session_id",
+                    "previous_response_id",
+                ] {
+                    if let Some(s) = body
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        meta.extra
+                            .insert(key.into(), serde_json::Value::String(s.to_string()));
+                    }
+                }
+                if let Some(m) = body.get("metadata").filter(|v| !v.is_null()) {
+                    meta.extra.insert("metadata".into(), m.clone());
+                }
+                meta
             },
             stream,
             loss_report: LossReport::default(),

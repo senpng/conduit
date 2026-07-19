@@ -55,7 +55,15 @@ client ──► L1 Transport      (axum, tower middleware stack)
         ── L6 Egress Filter  (cost calculation, usage ledger)
 ```
 
-**L3 Router is a pure function**: `route(alias, table, attempt_no) → Decision`. Zero IO, zero locks. Fully unit-testable and deterministic.
+**L3 Router is a pure function**: `route(alias, table, attempt_no) → Decision` (plus optional skip set / pool cursors). Fully unit-testable.
+
+**Affinity** is **session-scoped** (`session_id` + alias → `provider_id`), not downstream API key. Session id comes from headers (`X-Session-ID`, …) or body/metadata; no session → no pin.
+
+**Pool targets** (`pool_kind` / `pool_id`) schedule members with `pool_strategy`:
+- `round_robin` (default) — stable cursor across requests
+- `fill_first` — always first eligible in stable `provider_id` order  
+
+Session pin is the base layer before pool mode. Explicit multi-target lists still use `fixed` / `fallback` / `weighted`.
 
 Request **usage** is recorded directly from the pipeline into `usage_records`.
 

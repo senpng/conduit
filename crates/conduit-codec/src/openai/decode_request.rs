@@ -154,9 +154,26 @@ pub fn decode_request(
         tool_choice,
         response_format,
         sampling,
-        meta: RequestMeta {
-            user: body["user"].as_str().map(String::from),
-            extra: Default::default(),
+        meta: {
+            let mut meta = RequestMeta {
+                user: body["user"].as_str().map(String::from),
+                extra: Default::default(),
+            };
+            // Session affinity fields (gateway pool pins by session, not API key).
+            for key in [
+                "conversation_id",
+                "session_id",
+                "previous_response_id",
+            ] {
+                if let Some(s) = body[key].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    meta.extra
+                        .insert(key.into(), serde_json::Value::String(s.to_string()));
+                }
+            }
+            if let Some(m) = body.get("metadata").filter(|v| !v.is_null()) {
+                meta.extra.insert("metadata".into(), m.clone());
+            }
+            meta
         },
         stream,
         loss_report: Default::default(),

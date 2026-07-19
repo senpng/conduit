@@ -4,6 +4,7 @@ pub mod decision;
 pub mod policy;
 pub mod pool;
 pub mod quota_snapshot;
+pub mod session;
 pub mod table;
 
 pub use affinity::AffinityStore;
@@ -12,6 +13,8 @@ pub use cooldown::{
     DEFAULT_COOLDOWN,
 };
 pub use pool::{
-    auto_kind_pools, expand_route_target, select_among_members, NamedPool, ProviderCatalogEntry,
+    auto_kind_pools, expand_route_target, select_among_members, NamedPool, PoolCursorStore,
+    PoolStrategy, ProviderCatalogEntry,
 };
 pub use quota_snapshot::{QuotaSnapshot, UpstreamQuotaStore};
+pub use session::extract_session_id;

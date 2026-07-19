@@ -5,26 +5,31 @@ use serde_json::Map;
 
 use crate::{
     policy::RetryPolicy,
-    pool::{NamedPool, ProviderCatalogEntry},
+    pool::{NamedPool, PoolStrategy, ProviderCatalogEntry},
 };
 
 // ---------------------------------------------------------------------------
 // Routing strategy
 // ---------------------------------------------------------------------------
 
-/// How the router picks a target for a given attempt number.
+/// How the router picks a target for a given attempt number on **explicit**
+/// multi-target lists (`provider_id` rows).
 ///
-/// Sticky affinity (last successful provider per key+alias) is a **cross-cutting
-/// preference** applied to [`Fallback`] and [`Weighted`], not a standalone strategy.
+/// Session affinity is a **cross-cutting preference** applied to [`Fallback`]
+/// and [`Weighted`], not a standalone strategy.
+///
+/// When a route has a **pool** target, member pick uses [`PoolStrategy`]
+/// (`round_robin` / `fill_first`) instead — `Fixed`/`Fallback`/`Weighted` do
+/// not select among pool members.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RoutingStrategy {
     /// Always use `targets[0]`. Ignores sticky pin and weights.
     Fixed,
-    /// Ordered failover: `targets` order (or sticky-preferred first, then the rest).
+    /// Ordered failover: `targets` order (or session-preferred first, then the rest).
     /// Attempt `n` uses the n-th entry, clamping to the last.
     Fallback,
-    /// Weighted load balance on attempt 0 (respects sticky pin when present);
+    /// Weighted load balance on attempt 0 (respects session pin when present);
     /// later attempts walk remaining targets in table order.
     Weighted,
 }
@@ -83,7 +88,12 @@ pub struct RouteTarget {
 pub struct Route {
     /// The virtual model alias callers use (e.g. `"gpt-4o"`, `"fast"`).
     pub alias: String,
+    /// Explicit multi-target strategy (`fixed` / `fallback` / `weighted`).
+    /// Ignored for pool-member selection (see [`pool_strategy`]).
     pub strategy: RoutingStrategy,
+    /// Pool member schedule when any target is a pool (`round_robin` default).
+    #[serde(default)]
+    pub pool_strategy: PoolStrategy,
     /// Ordered list of targets. Must be non-empty.
     pub targets: Vec<RouteTarget>,
     pub retry_policy: RetryPolicy,
@@ -198,6 +208,7 @@ mod tests {
         let route = Route {
             alias: "GPT-4O".into(),
             strategy: RoutingStrategy::Fixed,
+            pool_strategy: PoolStrategy::default(),
             targets: vec![make_target("openai", "gpt-4o")],
             retry_policy: default_retry(),
         };
@@ -216,6 +227,7 @@ mod tests {
         let t1 = RoutingTable::new([Route {
             alias: "fast".into(),
             strategy: RoutingStrategy::Fixed,
+            pool_strategy: PoolStrategy::default(),
             targets: vec![make_target("openai", "gpt-4o-mini")],
             retry_policy: default_retry(),
         }]);
@@ -235,12 +247,14 @@ mod tests {
         let r1 = Route {
             alias: "fast".into(),
             strategy: RoutingStrategy::Fixed,
+            pool_strategy: PoolStrategy::default(),
             targets: vec![make_target("openai", "gpt-4o-mini")],
             retry_policy: default_retry(),
         };
         let r2 = Route {
             alias: "fast".into(),
             strategy: RoutingStrategy::Fixed,
+            pool_strategy: PoolStrategy::default(),
             targets: vec![make_target("anthropic", "claude-haiku")],
             retry_policy: default_retry(),
         };

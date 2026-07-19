@@ -8,8 +8,8 @@ use conduit_ir::{
     wire_format::WireFormat,
 };
 use conduit_router::{
-    is_usage_limit_body, parse_cooldown_duration, table::RoutingTable, AffinityStore,
-    ProviderCooldownStore, UpstreamQuotaStore,
+    extract_session_id, is_usage_limit_body, parse_cooldown_duration, table::RoutingTable,
+    AffinityStore, PoolCursorStore, ProviderCooldownStore, UpstreamQuotaStore,
 };
 use futures::stream::BoxStream;
 use tracing::warn;
@@ -40,7 +40,10 @@ pub struct PipelineDeps {
     pub pricing_fn: PricingFn,
     pub quota: Arc<dyn conduit_quota::engine::QuotaEngine>,
     pub key_policy_fn: KeyPolicyFn,
+    /// Session → provider affinity (default base layer for multi-target / pool).
     pub affinity: Arc<AffinityStore>,
+    /// Round-robin cursors for pool routes (per alias).
+    pub pool_cursors: Arc<PoolCursorStore>,
     /// Upstream provider cooldown after 429 / usage_limit (CLIProxyAPI parity).
     pub cooldown: Arc<ProviderCooldownStore>,
     /// Last-seen rate-limit / quota signals from upstream responses.
@@ -75,8 +78,11 @@ impl PipelineHandle {
         let table_snap = self.deps.routing_table.load_full();
         let stream = request.stream;
         let wire_format = ingress_wire.format;
-        let mut ctx =
-            PipelineContext::new(request, None, table_snap, wire_format).with_ingress_wire(ingress_wire);
+        let session_id = resolve_session_id(&client_headers, &request);
+        let mut ctx = PipelineContext::new(request, None, table_snap, wire_format)
+            .with_ingress_wire(ingress_wire)
+            .with_client_headers(client_headers.clone());
+        ctx.session_id = session_id;
 
         if let Err((_error_type, _http_status, err)) =
             self.run_ingress_checks(&mut ctx, downstream_bearer).await
@@ -84,12 +90,14 @@ impl PipelineHandle {
             return Err(err);
         }
 
-        let preferred = ctx
-            .downstream_key_id
-            .as_deref()
-            .and_then(|k| self.deps.affinity.preferred(k, &ctx.request.alias));
+        let preferred = self.session_preferred(&ctx);
         let skip = self.deps.cooldown.cooling_ids();
-        if let Err(e) = route_request_with_skip(&mut ctx, preferred.as_deref(), Some(&skip)) {
+        if let Err(e) = route_request_with_skip(
+            &mut ctx,
+            preferred.as_deref(),
+            Some(&skip),
+            Some(self.deps.pool_cursors.as_ref()),
+        ) {
             return Err(e);
         }
 
@@ -175,7 +183,7 @@ impl PipelineHandle {
                     );
 
                     self.record_usage(&ctx, &resolved, cost_usd, false).await;
-                    self.remember_affinity(&ctx, &resolved);
+                    self.remember_session_affinity(&ctx, &resolved);
                     return Ok(PipelineResult::Complete(resp));
                 }
 
@@ -183,14 +191,14 @@ impl PipelineHandle {
                     self.note_upstream_error(&resolved, &e);
                     let table = ctx.routing_table.clone();
                     if should_retry(&mut ctx, &table, &e) {
-                        let preferred = ctx
-                            .downstream_key_id
-                            .as_deref()
-                            .and_then(|k| self.deps.affinity.preferred(k, &ctx.request.alias));
+                        let preferred = self.session_preferred(&ctx);
                         let skip = self.deps.cooldown.cooling_ids();
-                        if let Err(routing_err) =
-                            route_request_with_skip(&mut ctx, preferred.as_deref(), Some(&skip))
-                        {
+                        if let Err(routing_err) = route_request_with_skip(
+                            &mut ctx,
+                            preferred.as_deref(),
+                            Some(&skip),
+                            Some(self.deps.pool_cursors.as_ref()),
+                        ) {
                             return Err(routing_err);
                         }
                         let new_resolved = ctx.resolved.as_ref().unwrap().clone();
@@ -230,7 +238,7 @@ impl PipelineHandle {
             match result {
                 Ok((stream, loss)) => {
                     ctx.loss_report = loss;
-                    self.remember_affinity(&ctx, &resolved);
+                    self.remember_session_affinity(&ctx, &resolved);
 
                     let instrumented = UsageTrackingStream::new(
                         stream,
@@ -251,14 +259,14 @@ impl PipelineHandle {
                     self.note_upstream_error(&resolved, &e);
                     let table = ctx.routing_table.clone();
                     if should_retry(&mut ctx, &table, &e) {
-                        let preferred = ctx
-                            .downstream_key_id
-                            .as_deref()
-                            .and_then(|k| self.deps.affinity.preferred(k, &ctx.request.alias));
+                        let preferred = self.session_preferred(&ctx);
                         let skip = self.deps.cooldown.cooling_ids();
-                        if let Err(routing_err) =
-                            route_request_with_skip(&mut ctx, preferred.as_deref(), Some(&skip))
-                        {
+                        if let Err(routing_err) = route_request_with_skip(
+                            &mut ctx,
+                            preferred.as_deref(),
+                            Some(&skip),
+                            Some(self.deps.pool_cursors.as_ref()),
+                        ) {
                             return Err(routing_err);
                         }
                         let new_resolved = ctx.resolved.as_ref().unwrap().clone();
@@ -316,12 +324,59 @@ impl PipelineHandle {
         (self.deps.secret_fn)(key_id.to_string()).await
     }
 
-    fn remember_affinity(&self, ctx: &PipelineContext, resolved: &ResolvedProvider) {
+    /// Session-scoped preferred provider when a session id is present.
+    fn session_preferred(&self, ctx: &PipelineContext) -> Option<String> {
+        let sid = ctx.session_id.as_deref()?.trim();
+        if sid.is_empty() {
+            return None;
+        }
+        self.deps.affinity.preferred(sid, &ctx.request.alias)
+    }
+}
+
+/// Resolve session id from headers and request metadata (for affinity).
+///
+/// Public for integration tests of the live header → pin path.
+pub fn resolve_session_id(
+    headers: &[(String, String)],
+    request: &CanonicalChatRequest,
+) -> Option<String> {
+    if let Some(s) = extract_session_id(headers, None) {
+        return Some(s);
+    }
+    // Fold RequestMeta into a JSON object for the shared extractor.
+    let mut map = serde_json::Map::new();
+    if let Some(ref user) = request.meta.user {
+        let mut meta = serde_json::Map::new();
+        meta.insert("user_id".into(), serde_json::Value::String(user.clone()));
+        map.insert("metadata".into(), serde_json::Value::Object(meta));
+    }
+    for (k, v) in &request.meta.extra {
+        map.insert(k.clone(), v.clone());
+    }
+    if map.is_empty() {
+        return None;
+    }
+    extract_session_id(&[], Some(&serde_json::Value::Object(map)))
+}
+
+impl PipelineHandle {
+    /// Remember successful provider for this **session** (not downstream key).
+    ///
+    /// Applies to multi-target fallback/weighted and any pool route. No-ops
+    /// when no session id was extracted.
+    fn remember_session_affinity(&self, ctx: &PipelineContext, resolved: &ResolvedProvider) {
+        let Some(sid) = ctx.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            return;
+        };
         let alias = ctx.request.alias.as_str();
-        let uses_sticky = ctx
-            .routing_table
-            .get(alias)
+        let route = ctx.routing_table.get(alias);
+        let uses_affinity = route
             .map(|r| {
+                let has_pool = r.targets.iter().any(|t| t.is_pool_target());
+                if has_pool {
+                    return true;
+                }
                 matches!(
                     r.strategy,
                     conduit_router::table::RoutingStrategy::Fallback
@@ -329,17 +384,12 @@ impl PipelineHandle {
                 ) && r.targets.len() > 1
             })
             .unwrap_or(false);
-        if !uses_sticky {
+        if !uses_affinity {
             return;
         }
-        let key = ctx
-            .downstream_key_id
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("_anonymous");
         self.deps
             .affinity
-            .remember(key, alias, &resolved.provider_id);
+            .remember(sid, alias, &resolved.provider_id);
     }
 
     async fn record_usage(
@@ -413,6 +463,7 @@ mod hotpath_tests {
         RoutingTable::new(vec![Route {
             alias: "gpt-4o".into(),
             strategy: RoutingStrategy::Fixed,
+            pool_strategy: conduit_router::PoolStrategy::default(),
             targets: vec![RouteTarget {
                 provider_id: "openai".into(),
                 model_id: model.into(),
@@ -492,6 +543,7 @@ mod hotpath_tests {
                 })
             }),
             affinity: Arc::new(AffinityStore::new()),
+            pool_cursors: Arc::new(PoolCursorStore::new()),
             cooldown: Arc::new(ProviderCooldownStore::new()),
             quota_snapshots: Arc::new(UpstreamQuotaStore::new()),
         }));
@@ -557,6 +609,7 @@ mod hotpath_tests {
             quota: Arc::new(CapturingQuota { ids: checked_ids2 }),
             key_policy_fn: policy_for(raw_bearer, stable_id),
             affinity: Arc::new(AffinityStore::new()),
+            pool_cursors: Arc::new(PoolCursorStore::new()),
             cooldown: Arc::new(ProviderCooldownStore::new()),
             quota_snapshots: Arc::new(UpstreamQuotaStore::new()),
         }));

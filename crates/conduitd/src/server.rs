@@ -181,6 +181,7 @@ pub async fn run(
         quota: quota.clone(),
         key_policy_fn,
         affinity: Arc::new(AffinityStore::new()),
+        pool_cursors: Arc::new(conduit_router::PoolCursorStore::new()),
         cooldown: cooldown.clone(),
         quota_snapshots: quota_snapshots.clone(),
     })));
@@ -506,14 +507,35 @@ pub fn rows_to_routes(
             }
             let retry_policy: conduit_router::policy::RetryPolicy =
                 serde_json::from_str(&row.retry_policy_json).unwrap_or_default();
-            let strategy = match row.strategy.as_str() {
-                "fallback" => RoutingStrategy::Fallback,
-                "weighted" | "weight" | "lb" => RoutingStrategy::Weighted,
-                _ => RoutingStrategy::Fixed,
+            // Multi-target: fixed|fallback|weighted.
+            // Pool schedule (when targets use pool_kind/pool_id): round_robin|fill_first
+            // may also be stored in `strategy` for operator convenience.
+            let (strategy, pool_strategy) = match row.strategy.as_str() {
+                "fallback" => (
+                    RoutingStrategy::Fallback,
+                    conduit_router::PoolStrategy::RoundRobin,
+                ),
+                "weighted" | "weight" | "lb" => (
+                    RoutingStrategy::Weighted,
+                    conduit_router::PoolStrategy::RoundRobin,
+                ),
+                "fill_first" | "fill-first" | "fillfirst" => (
+                    RoutingStrategy::Fixed,
+                    conduit_router::PoolStrategy::FillFirst,
+                ),
+                "round_robin" | "round-robin" | "rr" => (
+                    RoutingStrategy::Fixed,
+                    conduit_router::PoolStrategy::RoundRobin,
+                ),
+                _ => (
+                    RoutingStrategy::Fixed,
+                    conduit_router::PoolStrategy::RoundRobin,
+                ),
             };
             Ok(Route {
                 alias: row.match_alias,
                 strategy,
+                pool_strategy,
                 targets,
                 retry_policy,
             })
@@ -647,6 +669,7 @@ mod hotpath_tests {
         RoutingTable::new(vec![Route {
             alias: alias.into(),
             strategy: RoutingStrategy::Fixed,
+            pool_strategy: conduit_router::PoolStrategy::default(),
             targets: vec![RouteTarget {
                 provider_id: "openai".into(),
                 model_id: model.into(),

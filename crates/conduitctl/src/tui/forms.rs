@@ -268,7 +268,7 @@ impl KeyForm {
 ///
 /// - [`Provider`](Self::Provider): fixed single account
 /// - [`PoolKind`](Self::PoolKind): expand to all providers of that kind at
-///   decision time (multi-account pool; sticky pin + cooldown skip apply)
+///   decision time (multi-account pool; round_robin/fill_first + session affinity)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetBinding {
     Provider { id: String },
@@ -385,10 +385,19 @@ impl RouteWizard {
                 overrides: InputField::new(""),
             });
         }
-        let strategy_idx = match route.strategy.as_str() {
-            "fallback" => 1,
-            "weighted" | "weight" | "lb" => 2,
-            _ => 0,
+        // When any target is a pool, strategy stores pool schedule mode.
+        let has_pool = targets.iter().any(|t| t.binding.is_pool());
+        let strategy_idx = if has_pool {
+            match route.strategy.as_str() {
+                "fill_first" | "fill-first" | "fillfirst" => 1,
+                _ => 0, // round_robin
+            }
+        } else {
+            match route.strategy.as_str() {
+                "fallback" => 1,
+                "weighted" | "weight" | "lb" => 2,
+                _ => 0,
+            }
         };
         Self {
             edit_id: Some(route.id.clone()),
@@ -403,7 +412,18 @@ impl RouteWizard {
         }
     }
 
+    /// True when any target is a kind/named pool (multi-account).
+    pub fn has_pool_target(&self) -> bool {
+        self.targets.iter().any(|t| t.binding.is_pool())
+    }
+
     pub fn strategy(&self) -> &'static str {
+        if self.has_pool_target() {
+            return match self.strategy_idx {
+                1 => "fill_first",
+                _ => "round_robin",
+            };
+        }
         match self.strategy_idx {
             1 => "fallback",
             2 => "weighted",
@@ -412,15 +432,22 @@ impl RouteWizard {
     }
 
     pub fn strategy_hint(&self) -> &'static str {
+        if self.has_pool_target() {
+            return match self.strategy_idx {
+                1 => "pool: fill-first · session affinity",
+                _ => "pool: round-robin · session affinity",
+            };
+        }
         match self.strategy_idx {
-            1 => "ordered failover · sticky pin",
-            2 => "weighted LB among targets/pool · sticky pin",
+            1 => "ordered failover · session affinity",
+            2 => "weighted LB · session affinity",
             _ => "always first target",
         }
     }
 
     pub fn cycle_strategy(&mut self) {
-        self.strategy_idx = (self.strategy_idx + 1) % 3;
+        let n = if self.has_pool_target() { 2 } else { 3 };
+        self.strategy_idx = (self.strategy_idx + 1) % n;
     }
 
     pub fn add_target(&mut self) {

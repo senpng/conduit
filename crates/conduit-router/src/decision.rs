@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::{
     policy::RetryPolicy,
-    pool::{expand_route_target, select_among_members},
+    pool::{expand_route_target, select_among_members, PoolCursorStore},
     table::{RouteTarget, RoutingStrategy, RoutingTable},
 };
 
@@ -57,28 +57,37 @@ pub struct RoutingDecision {
 /// Production entry point: weighted first-picks use a wall-clock seed.
 /// For deterministic tests use [`route_with_seed`].
 ///
-/// Sticky affinity: when `preferred_provider_id` is set and still on the route,
+/// Session affinity: when `preferred_provider_id` is set and still on the route,
 /// it is preferred for attempt 0 (and reorders the retry chain) for
-/// [`Fallback`] and [`Weighted`].
+/// [`Fallback`] and [`Weighted`]. Pool routes use [`PoolStrategy`] instead.
 ///
 /// | Strategy   | Behaviour |
 /// |------------|-----------|
 /// | `Fixed`    | Always `targets[0]`. |
-/// | `Fallback` | Sticky-aware ordered failover. |
-/// | `Weighted` | Sticky pin if present; else weighted pick on attempt 0; retries remaining. |
+/// | `Fallback` | Session-aware ordered failover. |
+/// | `Weighted` | Session pin if present; else weighted pick on attempt 0; retries remaining. |
+/// | pool path  | `round_robin` / `fill_first` (+ session pin base layer). |
 pub fn route(
     alias: &str,
     table: &RoutingTable,
     attempt_no: u32,
     preferred_provider_id: Option<&str>,
 ) -> Result<RoutingDecision, RouterError> {
-    route_with_options(alias, table, attempt_no, preferred_provider_id, None, None)
+    route_with_options(
+        alias,
+        table,
+        attempt_no,
+        preferred_provider_id,
+        None,
+        None,
+        None,
+    )
 }
 
 /// Same as [`route`] but with an explicit seed for weighted load-balancing.
 ///
 /// Pure with respect to inputs: same `(alias, table, attempt_no, preferred, seed)`
-/// always yields the same decision.
+/// always yields the same decision (pool RR without a cursor store starts at 0).
 pub fn route_with_seed(
     alias: &str,
     table: &RoutingTable,
@@ -93,14 +102,17 @@ pub fn route_with_seed(
         preferred_provider_id,
         Some(seed),
         None,
+        None,
     )
 }
 
-/// Full routing entry: optional seed + skip set for cooled-down providers.
+/// Full routing entry: optional seed, cooldown skip set, and pool RR cursors.
 ///
-/// Targets whose `provider_id` is in `skip_provider_ids` are preferred **last**.
-/// If every target is cooling, the first original target is still returned so
-/// single-provider routes keep working (caller sees the upstream error).
+/// Targets whose `provider_id` is in `skip_provider_ids` are excluded when any
+/// non-cooling member remains; if every target is cooling, the full set is used
+/// so single-provider routes keep working (caller sees the upstream error).
+///
+/// Pool paths use [`Route::pool_strategy`] and optional [`PoolCursorStore`].
 pub fn route_with_options(
     alias: &str,
     table: &RoutingTable,
@@ -108,6 +120,7 @@ pub fn route_with_options(
     preferred_provider_id: Option<&str>,
     seed: Option<u64>,
     skip_provider_ids: Option<&std::collections::HashSet<String>>,
+    pool_cursors: Option<&PoolCursorStore>,
 ) -> Result<RoutingDecision, RouterError> {
     let seed = seed.unwrap_or_else(|| {
         SystemTime::now()
@@ -153,8 +166,7 @@ pub fn route_with_options(
         });
     }
 
-    // Pool-style selection when any original target was a pool, or always use
-    // sticky+cooldown-aware pick among expanded members.
+    // Pool path: session pin + round_robin / fill_first (ignores fixed/fallback/weighted).
     let has_pool = r.targets.iter().any(|t| t.is_pool_target());
     if has_pool {
         let chosen = select_among_members(
@@ -162,12 +174,18 @@ pub fn route_with_options(
             preferred_provider_id,
             skip_provider_ids,
             attempt_no,
-            seed,
+            r.pool_strategy,
+            alias,
+            pool_cursors,
         )
         .ok_or_else(|| RouterError::NoTargets {
             alias: alias.to_string(),
         })?;
-        return Ok(decision_from(chosen, attempt_no, r.retry_policy.clone()));
+        return Ok(decision_from(
+            chosen.target,
+            attempt_no,
+            r.retry_policy.clone(),
+        ));
     }
 
     // Prefer non-cooling targets; if all cooling, fall back to full target list.
@@ -387,7 +405,7 @@ mod tests {
     use crate::{
         affinity::AffinityStore,
         policy::RetryPolicy,
-        pool::{auto_kind_pools, ProviderCatalogEntry},
+        pool::{auto_kind_pools, PoolCursorStore, PoolStrategy, ProviderCatalogEntry},
         table::{Route, RouteTarget, RoutingStrategy, RoutingTable},
     };
 
@@ -419,6 +437,7 @@ mod tests {
         Route {
             alias: alias.into(),
             strategy: RoutingStrategy::Fixed,
+            pool_strategy: PoolStrategy::default(),
             targets,
             retry_policy: retry(2),
         }
@@ -428,6 +447,7 @@ mod tests {
         Route {
             alias: alias.into(),
             strategy: RoutingStrategy::Fallback,
+            pool_strategy: PoolStrategy::default(),
             targets,
             retry_policy: retry(3),
         }
@@ -437,6 +457,7 @@ mod tests {
         Route {
             alias: alias.into(),
             strategy: RoutingStrategy::Weighted,
+            pool_strategy: PoolStrategy::default(),
             targets,
             retry_policy: retry(3),
         }
@@ -722,11 +743,11 @@ mod tests {
             ),
         ]);
 
-        // Simulate success on p2
-        store.remember("key-a", "fb", "p2");
-        store.remember("key-a", "lb", "p2");
+        // Simulate success on p2 for session s-a
+        store.remember("s-a", "fb", "p2");
+        store.remember("s-a", "lb", "p2");
 
-        let pref_fb = store.preferred("key-a", "fb");
+        let pref_fb = store.preferred("s-a", "fb");
         assert_eq!(
             route_with_seed("fb", &table, 0, pref_fb.as_deref(), 0)
                 .unwrap()
@@ -734,7 +755,7 @@ mod tests {
             "p2"
         );
 
-        let pref_lb = store.preferred("key-a", "lb");
+        let pref_lb = store.preferred("s-a", "lb");
         assert_eq!(
             route_with_seed("lb", &table, 0, pref_lb.as_deref(), 0)
                 .unwrap()
@@ -759,6 +780,7 @@ mod tests {
         let table = RoutingTable::new([Route {
             alias: "empty".into(),
             strategy: RoutingStrategy::Fixed,
+            pool_strategy: PoolStrategy::default(),
             targets: vec![],
             retry_policy: retry(2),
         }]);
@@ -779,7 +801,7 @@ mod tests {
         }
     }
 
-    fn pool_route_table() -> RoutingTable {
+    fn pool_route_table(mode: PoolStrategy) -> RoutingTable {
         let providers = vec![
             catalog_entry("c1", "claude-oauth"),
             catalog_entry("c2", "claude-oauth"),
@@ -788,7 +810,8 @@ mod tests {
         let pools = auto_kind_pools(&providers);
         let route = Route {
             alias: "claude".into(),
-            strategy: RoutingStrategy::Fallback,
+            strategy: RoutingStrategy::Fallback, // ignored for pool member pick
+            pool_strategy: mode,
             targets: vec![RouteTarget {
                 provider_id: String::new(),
                 model_id: "claude-sonnet".into(),
@@ -806,26 +829,27 @@ mod tests {
 
     #[test]
     fn pool_kind_expands_and_picks_member() {
-        let table = pool_route_table();
+        let table = pool_route_table(PoolStrategy::FillFirst);
         let d = route_with_seed("claude", &table, 0, None, 0).unwrap();
-        assert!(d.provider_id == "c1" || d.provider_id == "c2");
+        // fill-first stable order → c1
+        assert_eq!(d.provider_id, "c1");
         assert_eq!(d.model_id, "claude-sonnet");
         assert_eq!(d.provider_kind, "claude-oauth");
     }
 
     #[test]
-    fn pool_sticky_pin_when_available() {
-        let table = pool_route_table();
+    fn pool_session_pin_when_available() {
+        let table = pool_route_table(PoolStrategy::RoundRobin);
         let store = AffinityStore::new();
-        store.remember("key-1", "claude", "c2");
-        let pref = store.preferred("key-1", "claude");
+        store.remember("sess-1", "claude", "c2");
+        let pref = store.preferred("sess-1", "claude");
         let d = route_with_seed("claude", &table, 0, pref.as_deref(), 99).unwrap();
         assert_eq!(d.provider_id, "c2");
     }
 
     #[test]
-    fn pool_sticky_pin_ignored_when_cooling() {
-        let table = pool_route_table();
+    fn pool_session_pin_ignored_when_cooling() {
+        let table = pool_route_table(PoolStrategy::FillFirst);
         let mut skip = std::collections::HashSet::new();
         skip.insert("c2".into());
         let d = route_with_options(
@@ -835,13 +859,36 @@ mod tests {
             Some("c2"),
             Some(0),
             Some(&skip),
+            None,
         )
         .unwrap();
         assert_eq!(d.provider_id, "c1");
     }
 
     #[test]
-    fn pool_shared_across_aliases() {
+    fn pool_round_robin_rotates_with_cursor_store() {
+        let table = pool_route_table(PoolStrategy::RoundRobin);
+        let cursors = PoolCursorStore::new();
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let d = route_with_options("claude", &table, 0, None, Some(0), None, Some(&cursors))
+                .unwrap();
+            seen.push(d.provider_id);
+        }
+        assert_eq!(seen, vec!["c1", "c2"]);
+    }
+
+    #[test]
+    fn pool_fill_first_stable() {
+        let table = pool_route_table(PoolStrategy::FillFirst);
+        for _ in 0..3 {
+            let d = route_with_seed("claude", &table, 0, None, 0).unwrap();
+            assert_eq!(d.provider_id, "c1");
+        }
+    }
+
+    #[test]
+    fn pool_session_pin_shared_across_aliases() {
         let providers = vec![
             catalog_entry("c1", "claude-oauth"),
             catalog_entry("c2", "claude-oauth"),
@@ -850,6 +897,7 @@ mod tests {
         let mk = |alias: &str| Route {
             alias: alias.into(),
             strategy: RoutingStrategy::Fixed,
+            pool_strategy: PoolStrategy::RoundRobin,
             targets: vec![RouteTarget {
                 provider_id: String::new(),
                 model_id: "m".into(),
@@ -877,6 +925,7 @@ mod tests {
         let route = Route {
             alias: "claude".into(),
             strategy: RoutingStrategy::Fallback,
+            pool_strategy: PoolStrategy::default(),
             targets: vec![RouteTarget {
                 provider_id: String::new(),
                 model_id: "m".into(),
