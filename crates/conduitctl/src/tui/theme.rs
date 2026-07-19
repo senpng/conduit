@@ -96,7 +96,6 @@ pub struct Theme {
     pub border: Color,
     pub border_focus: Color,
     pub accent: Color,
-    pub accent_dim: Color,
     pub fg: Color,
     pub muted: Color,
     pub subtle: Color,
@@ -120,7 +119,6 @@ impl Theme {
             border: Color::Rgb(48, 54, 66),
             border_focus: Color::Rgb(56, 189, 248), // sky-400
             accent: Color::Rgb(56, 189, 248),
-            accent_dim: Color::Rgb(14, 116, 144),
             fg: Color::Rgb(226, 232, 240),
             muted: Color::Rgb(148, 163, 184),
             subtle: Color::Rgb(100, 116, 139),
@@ -151,7 +149,6 @@ impl Theme {
             border: Color::Rgb(203, 213, 225),      // slate-300
             border_focus: Color::Rgb(2, 132, 199),  // sky-600
             accent: Color::Rgb(2, 132, 199),
-            accent_dim: Color::Rgb(125, 211, 252), // sky-300
             fg: Color::Rgb(15, 23, 42),            // slate-900
             muted: Color::Rgb(71, 85, 105),        // slate-600
             subtle: Color::Rgb(148, 163, 184),     // slate-400
@@ -259,6 +256,42 @@ impl Theme {
 
     pub fn chart_color(&self, i: usize) -> Color {
         self.chart[i % self.chart.len()]
+    }
+
+    /// GitHub / tokscale contribution greens (0 = empty … 4 = peak).
+    /// Dark matches github.com `#161b22 → #9be9a8 → #216e39`.
+    pub fn heat_color(&self, level: u8) -> Color {
+        let level = level.min(4);
+        match self.kind {
+            ThemeKind::Dark => match level {
+                0 => Color::Rgb(22, 27, 34),    // #161b22 empty
+                1 => Color::Rgb(14, 68, 41),     // #0e4429
+                2 => Color::Rgb(0, 109, 50),     // #006d32
+                3 => Color::Rgb(38, 166, 65),    // #26a641
+                _ => Color::Rgb(57, 211, 83),    // #39d353
+            },
+            ThemeKind::Light => match level {
+                // tokscale Green theme (light-ish on dark empty)
+                0 => Color::Rgb(235, 237, 240),
+                1 => Color::Rgb(155, 233, 168), // #9be9a8
+                2 => Color::Rgb(64, 196, 99),    // #40c463
+                3 => Color::Rgb(48, 161, 78),    // #30a14e
+                _ => Color::Rgb(33, 110, 57),    // #216e39
+            },
+        }
+    }
+
+    /// tokscale cell: `"██"` with `fg = heat_color` (empty uses subtle `· `).
+    pub fn heat_cell_style(&self, level: u8) -> Style {
+        Style::default().fg(self.heat_color(level.min(4)))
+    }
+
+    /// Selected cell: white on heat fill (tokscale `▓▓` + white/bg).
+    pub fn heat_selected_style(&self, level: u8) -> Style {
+        Style::default()
+            .fg(Color::White)
+            .bg(self.heat_color(level.min(4).max(1)))
+            .add_modifier(Modifier::BOLD)
     }
 }
 

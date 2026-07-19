@@ -1036,6 +1036,14 @@ pub async fn usage_summary(
         Ok(d) => d,
         Err(e) => return internal(e).into_response(),
     };
+    // Trailing ~400 days for the GitHub-style contribution graph (52 weeks).
+    let since = (now - chrono::Duration::days(400))
+        .format("%Y-%m-%d")
+        .to_string();
+    let by_day_trailing = match repo.summary_by_day_since(&since, key_id).await {
+        Ok(d) => d,
+        Err(e) => return internal(e).into_response(),
+    };
     let by_model = match repo.summary_by_model(&period, key_id).await {
         Ok(m) => m,
         Err(e) => return internal(e).into_response(),
@@ -1094,6 +1102,12 @@ pub async fn usage_summary(
                 "total_tokens": e.total_tokens,
             })).collect::<Vec<_>>(),
             "by_day": by_day.iter().map(|d| json!({
+                "day": d.day,
+                "request_count": d.request_count,
+                "total_usd": d.total_usd,
+                "total_tokens": d.total_tokens,
+            })).collect::<Vec<_>>(),
+            "by_day_trailing": by_day_trailing.iter().map(|d| json!({
                 "day": d.day,
                 "request_count": d.request_count,
                 "total_usd": d.total_usd,

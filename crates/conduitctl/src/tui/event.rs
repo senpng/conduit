@@ -126,7 +126,10 @@ fn map_browse(tab: Tab, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('x') if tab == Tab::Providers => Some(Action::OauthRefresh),
         KeyCode::Char('u') if tab == Tab::Providers => Some(Action::RefreshQuota),
         KeyCode::Char('c') if tab == Tab::Usage => Some(Action::CycleUsageSort),
-        KeyCode::Char('t') if tab == Tab::Usage => Some(Action::CycleUsageDetail),
+        // Overview heatmap says “press t”; Usage cycles detail panes (incl. by day).
+        KeyCode::Char('t') if matches!(tab, Tab::Overview | Tab::Usage) => {
+            Some(Action::CycleUsageDetail)
+        }
         _ => None,
     }
 }
@@ -258,10 +261,22 @@ mod tests {
             map_key(&Mode::Browse, Tab::Overview, key(KeyCode::Char('T'))),
             Some(Action::ToggleTheme)
         );
-        // plain `t` is Usage-only detail cycle — not theme.
+    }
+
+    #[test]
+    fn overview_t_opens_usage_by_day() {
+        // Home heatmap prompts “press t”; must not be a dead key.
         assert_eq!(
             map_key(&Mode::Browse, Tab::Overview, key(KeyCode::Char('t'))),
-            None
+            Some(Action::CycleUsageDetail)
+        );
+    }
+
+    #[test]
+    fn usage_t_cycles_detail() {
+        assert_eq!(
+            map_key(&Mode::Browse, Tab::Usage, key(KeyCode::Char('t'))),
+            Some(Action::CycleUsageDetail)
         );
     }
 

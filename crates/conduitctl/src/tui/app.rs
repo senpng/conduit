@@ -23,6 +23,7 @@ use super::input::InputField;
 use super::msg::{Msg, RefreshKind};
 use super::net;
 use super::theme::{Theme, ThemeMode};
+use super::widgets::{days_in_month, parse_year_month};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -600,18 +601,34 @@ impl App {
                 }
             }
             Action::CycleUsageDetail => {
-                if self.tab == Tab::Usage {
-                    self.usage_detail = self.usage_detail.next();
-                    self.selected[Tab::Usage.index()] = 0;
-                    self.status = format!("Usage detail: {}", self.usage_detail.label());
-                    // Detail switch changes which rollup list the filter applies to.
-                    self.refresh_filtered();
-                    // Entering Recent with a filter (or stale page) → re-fetch server page.
-                    if self.usage_detail == UsageDetail::Recent
-                        && self.filter != self.usage_applied_filter
-                    {
-                        self.usage_offset = 0;
-                        self.spawn_usage_load(false);
+                if !matches!(self.mode, Mode::Browse | Mode::Filter) {
+                    return;
+                }
+                match self.tab {
+                    // Home heatmap: t jumps straight into the selectable by-day calendar.
+                    Tab::Overview => {
+                        self.usage_detail = UsageDetail::ByDay;
+                        self.selected[Tab::Usage.index()] = 0;
+                        self.status =
+                            "Usage · by day — ↑↓ select a day on the calendar".into();
+                        self.switch_tab(Tab::Usage);
+                    }
+                    Tab::Usage => {
+                        self.mode = Mode::Browse;
+                        self.usage_detail = self.usage_detail.next();
+                        self.selected[Tab::Usage.index()] = 0;
+                        self.status = format!("Usage detail: {}", self.usage_detail.label());
+                        self.refresh_filtered();
+                        if self.usage_detail == UsageDetail::Recent
+                            && self.filter != self.usage_applied_filter
+                        {
+                            self.usage_offset = 0;
+                            self.spawn_usage_load(false);
+                        }
+                    }
+                    _ => {
+                        self.status =
+                            "t · daily spend calendar — press 1 (home) or 5 (Usage)".into();
                     }
                 }
             }
@@ -796,18 +813,50 @@ impl App {
                             .collect()
                     })
                     .unwrap_or_default(),
-                UsageDetail::ByDay => self
-                    .usage_summary
-                    .as_ref()
-                    .map(|s| {
-                        s.by_day
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, d)| match_q(&d.day))
-                            .map(|(i, _)| i)
+                // Full calendar indices (day-of-month − 1), including zero-spend days
+                // so the GitHub-style heatmap can highlight every cell.
+                UsageDetail::ByDay => {
+                    let period = self
+                        .usage_summary
+                        .as_ref()
+                        .map(|s| s.period.as_str())
+                        .unwrap_or(self.usage_period.as_str());
+                    if let Some((y, m)) = parse_year_month(period) {
+                        let n = days_in_month(y, m) as usize;
+                        (0..n)
+                            .filter(|&i| {
+                                if q.is_empty() {
+                                    return true;
+                                }
+                                let date = format!("{y:04}-{m:02}-{:02}", i + 1);
+                                match_q(&date)
+                                    || self
+                                        .usage_summary
+                                        .as_ref()
+                                        .and_then(|s| {
+                                            s.by_day.iter().find(|d| d.day == date)
+                                        })
+                                        .map(|d| {
+                                            match_q(&d.total_usd.to_string())
+                                                || match_q(&d.request_count.to_string())
+                                        })
+                                        .unwrap_or(false)
+                            })
                             .collect()
-                    })
-                    .unwrap_or_default(),
+                    } else {
+                        self.usage_summary
+                            .as_ref()
+                            .map(|s| {
+                                s.by_day
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, d)| match_q(&d.day))
+                                    .map(|(i, _)| i)
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    }
+                }
                 UsageDetail::ByProvider => self
                     .usage_summary
                     .as_ref()
@@ -925,7 +974,9 @@ impl App {
             ("tab", "next"),
         ];
         match self.tab {
-            Tab::Overview => {}
+            Tab::Overview => {
+                v.extend([("t", "by day")]);
+            }
             Tab::Providers => {
                 v.extend([
                     ("a", "add"),
@@ -963,6 +1014,9 @@ impl App {
                 ]);
                 if self.usage_detail == UsageDetail::Recent {
                     v.extend([("PgUp", "prev pg"), ("PgDn", "next pg")]);
+                }
+                if self.usage_detail == UsageDetail::ByDay {
+                    v.extend([("↑↓", "day cell")]);
                 }
             }
             Tab::Pricing => match self.pricing_pane {

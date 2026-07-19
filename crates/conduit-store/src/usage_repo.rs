@@ -304,6 +304,64 @@ impl<'a> UsageRepo<'a> {
             .collect())
     }
 
+    /// Daily rollup for a trailing window ending today (`since_day` = `YYYY-MM-DD`).
+    ///
+    /// Used by the TUI contribution graph (≈52 weeks), independent of the
+    /// selected calendar-month period cards.
+    #[instrument(skip(self))]
+    pub async fn summary_by_day_since(
+        &self,
+        since_day: &str,
+        key_id: Option<&str>,
+    ) -> Result<Vec<UsageDayRow>, StoreError> {
+        let rows = match key_id {
+            Some(kid) => {
+                sqlx::query(
+                    r#"SELECT
+                       substr(ts, 1, 10) AS day,
+                       COUNT(*) AS request_count,
+                       COALESCE(SUM(cost_usd), 0) AS total_usd,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                   FROM usage_records
+                   WHERE substr(ts, 1, 10) >= ? AND downstream_key_id = ?
+                   GROUP BY substr(ts, 1, 10)
+                   ORDER BY day ASC"#,
+                )
+                .bind(since_day)
+                .bind(kid)
+                .fetch_all(self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    r#"SELECT
+                       substr(ts, 1, 10) AS day,
+                       COUNT(*) AS request_count,
+                       COALESCE(SUM(cost_usd), 0) AS total_usd,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                   FROM usage_records
+                   WHERE substr(ts, 1, 10) >= ?
+                   GROUP BY substr(ts, 1, 10)
+                   ORDER BY day ASC"#,
+                )
+                .bind(since_day)
+                .fetch_all(self.pool)
+                .await
+            }
+        }
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| UsageDayRow {
+                day: r.get("day"),
+                request_count: r.get::<i64, _>("request_count") as u64,
+                total_usd: r.get("total_usd"),
+                total_tokens: r.get::<i64, _>("total_tokens") as u64,
+            })
+            .collect())
+    }
+
     /// Daily rollup for a calendar period (`YYYY-MM`), UTC day from `ts` prefix.
     ///
     /// Optional `key_id` scopes to one downstream key. Used by the Usage UI so

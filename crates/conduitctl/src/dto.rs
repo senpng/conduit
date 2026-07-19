@@ -398,6 +398,9 @@ pub struct UsageSummaryView {
     pub entries: Vec<UsageSummaryEntry>,
     #[serde(default)]
     pub by_day: Vec<UsageDayEntry>,
+    /// Trailing ~year of daily spend for the contribution graph (52 weeks).
+    #[serde(default)]
+    pub by_day_trailing: Vec<UsageDayEntry>,
     #[serde(default)]
     pub by_model: Vec<UsageModelEntry>,
     /// Per-key model rollups for Usage → by key detail.

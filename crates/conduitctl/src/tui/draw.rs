@@ -4,7 +4,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    BarChart, Block, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table, Tabs, Wrap,
+    Block, Borders, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap,
 };
 use ratatui::Frame;
 
@@ -12,9 +12,10 @@ use super::app::{App, Mode, PricingPane, Tab, UsageDetail};
 use super::forms::{ConfirmAction, ProviderFormKind};
 use super::theme::Theme;
 use super::widgets::{
-    detail_kv, empty_state, fill_bg, format_local_time, format_local_time_short, format_tokens,
-    format_usd, health_badge, keybind_line, modal, pad_display, panel_block, ratio_bar, spinner,
-    truncate,
+    build_contribution_weeks, detail_kv, display_width, empty_state, fill_bg, format_local_time,
+    format_local_time_short, format_tokens, format_usd, health_badge, heat_level, keybind_line,
+    modal, month_day_spends, pad_display, panel_block, ratio_bar, spinner, truncate,
+    ContributionCell, DaySpend,
 };
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -226,8 +227,9 @@ fn draw_overview(frame: &mut Frame, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // metric cards: title / value / bottom
-            Constraint::Length(10),
+            Constraint::Length(3), // metric cards
+            // Heatmap (7 rows) + top models (2 lines/row) need vertical room.
+            Constraint::Length(12),
             Constraint::Min(4),
         ])
         .split(area);
@@ -271,10 +273,10 @@ fn draw_overview(frame: &mut Frame, area: Rect, app: &App) {
         ],
     );
 
-    // Daily sparkline + top models
+    // Daily heatmap + top models — give models enough width for names.
     let mid = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(cols[1]);
 
     draw_overview_sparkline(frame, mid[0], app);
@@ -286,36 +288,23 @@ fn draw_overview(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_overview_sparkline(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
-    let block = panel_block(theme, "Spend pulse (by day)", true);
+    let block = panel_block(theme, "Contribution graph  ·  last 52 weeks", true);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let data: Vec<u64> = app
-        .usage_summary
-        .as_ref()
-        .map(|s| {
-            s.by_day
-                .iter()
-                .map(|d| ((d.total_usd * 10_000.0).round() as u64).max(1))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if data.is_empty() {
+    let rows = usage_trailing_tuples(app);
+    if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Span::styled(
-                "  no usage yet this period — send traffic through the gateway",
+                "  no usage yet — send traffic through the gateway",
                 theme.subtle(),
             )),
             inner,
         );
         return;
     }
-
-    let spark = Sparkline::default()
-        .data(&data)
-        .style(Style::default().fg(theme.accent));
-    frame.render_widget(spark, inner);
+    let lines = contribution_graph_lines(theme, &rows, None, "t · by-day");
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_overview_top_models(frame: &mut Frame, area: Rect, app: &App) {
@@ -324,11 +313,11 @@ fn draw_overview_top_models(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let models = app
+    let mut models: Vec<&crate::dto::UsageModelEntry> = app
         .usage_summary
         .as_ref()
-        .map(|s| s.by_model.as_slice())
-        .unwrap_or(&[]);
+        .map(|s| s.by_model.iter().collect())
+        .unwrap_or_default();
     if models.is_empty() {
         frame.render_widget(
             Paragraph::new(Span::styled("  —", theme.subtle())),
@@ -336,31 +325,94 @@ fn draw_overview_top_models(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
+    // Highest spend first.
+    models.sort_by(|a, b| {
+        b.total_usd
+            .partial_cmp(&a.total_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
     let max = models
         .iter()
         .map(|m| m.total_usd)
         .fold(0.0_f64, f64::max)
         .max(1e-9);
-    let bar_w = (inner.width as usize).saturating_sub(28).clamp(6, 20);
-    let lines: Vec<Line> = models
+
+    // Each model = name + bar (2 rows) + 1 blank gap. Cost sits in a right
+    // column vertically centered against the name/bar pair.
+    let row_h: u16 = 3;
+    let n = ((inner.height / row_h) as usize).max(1).min(models.len());
+
+    // Widest cost string among visible rows → fixed right column.
+    let cost_strings: Vec<String> = models
         .iter()
-        .take(inner.height as usize)
-        .enumerate()
-        .map(|(i, m)| {
-            Line::from(vec![
-                Span::styled(
-                    pad_display(&m.label, 14),
-                    Style::default().fg(theme.chart_color(i)),
-                ),
+        .take(n)
+        .map(|m| format_usd(m.total_usd))
+        .collect();
+    let cost_col = cost_strings
+        .iter()
+        .map(|s| display_width(s))
+        .max()
+        .unwrap_or(6)
+        .saturating_add(1) // leading gap before amount
+        .clamp(7, 14) as u16;
+
+    for (i, m) in models.iter().take(n).enumerate() {
+        let y = inner.y + (i as u16) * row_h;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let block_h = 2u16.min(inner.y + inner.height - y);
+        let row = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: block_h,
+        };
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(8), Constraint::Length(cost_col)])
+            .split(row);
+        let (left, right) = (cols[0], cols[1]);
+
+        let color = theme.chart_color(i);
+        let name_w = (left.width as usize).saturating_sub(1).max(4);
+        let name = truncate(&m.label, name_w);
+        let bar_w = (left.width as usize).saturating_sub(1).clamp(4, 48);
+
+        // Left: name on top, bar below.
+        let mut left_lines = vec![Line::from(vec![
+            Span::raw(" "),
+            Span::styled(name, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        ])];
+        if block_h >= 2 {
+            left_lines.push(Line::from(vec![
+                Span::raw(" "),
                 Span::styled(
                     ratio_bar(m.total_usd / max, bar_w),
-                    Style::default().fg(theme.chart_color(i)),
+                    Style::default().fg(color),
                 ),
-                Span::styled(format!(" {}", format_usd(m.total_usd)), theme.muted()),
-            ])
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), inner);
+            ]));
+        }
+        frame.render_widget(Paragraph::new(left_lines), left);
+
+        // Right: amount vertically centered against the name+bar block.
+        // For height 2, (h-1)/2 floors to the name row; use rounded-half so the
+        // dollar sits on the optical mid-line (bar row) of the pair.
+        let cost = &cost_strings[i];
+        let cost_y = right.y + (right.height as u16) / 2;
+        let cost_y = cost_y.min(right.y + right.height.saturating_sub(1));
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(cost.clone(), theme.muted())))
+                .alignment(Alignment::Right),
+            Rect {
+                x: right.x,
+                y: cost_y,
+                width: right.width,
+                height: 1,
+            },
+        );
+    }
 }
 
 fn draw_overview_quickstart(frame: &mut Frame, area: Rect, app: &App) {
@@ -986,11 +1038,12 @@ fn draw_master_detail_keys(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_usage(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
+    // Heatmap needs ~10 rows (legend + 7 weekdays + pad); give it room.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // metric cards: title / value / bottom
-            Constraint::Length(9),
+            Constraint::Length(3), // metric cards
+            Constraint::Length(12), // GitHub-style daily spend calendar
             Constraint::Min(5),
         ])
         .split(area);
@@ -1025,65 +1078,250 @@ fn draw_usage(frame: &mut Frame, area: Rect, app: &App) {
         ],
     );
 
-    // Bar chart for daily cost
-    draw_usage_barchart(frame, chunks[1], app);
+    draw_usage_heatmap(frame, chunks[1], app);
     draw_usage_detail(frame, chunks[2], app);
 }
 
-fn draw_usage_barchart(frame: &mut Frame, area: Rect, app: &App) {
+fn usage_by_day_tuples(app: &App) -> Vec<(String, u64, u64, f64)> {
+    app.usage_summary
+        .as_ref()
+        .map(|s| {
+            s.by_day
+                .iter()
+                .map(|d| {
+                    (
+                        d.day.clone(),
+                        d.request_count,
+                        d.total_tokens,
+                        d.total_usd,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Trailing-year daily rows for the contribution graph (falls back to period).
+fn usage_trailing_tuples(app: &App) -> Vec<(String, u64, u64, f64)> {
+    app.usage_summary
+        .as_ref()
+        .map(|s| {
+            let src = if s.by_day_trailing.is_empty() {
+                s.by_day.as_slice()
+            } else {
+                s.by_day_trailing.as_slice()
+            };
+            src.iter()
+                .map(|d| {
+                    (
+                        d.day.clone(),
+                        d.request_count,
+                        d.total_tokens,
+                        d.total_usd,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn today_ymd() -> String {
+    let n = chrono::Local::now().date_naive();
+    n.format("%Y-%m-%d").to_string()
+}
+
+/// Top-of-Usage tokscale/GitHub contribution graph (52 weeks).
+fn draw_usage_heatmap(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
-    let days = app
+    let period = app
         .usage_summary
         .as_ref()
-        .map(|s| s.by_day.as_slice())
-        .unwrap_or(&[]);
+        .map(|s| s.period.clone())
+        .unwrap_or_else(|| app.usage_period.clone());
+
+    // Highlight the selected calendar day when browsing by-day.
+    let selected_date = if app.usage_detail == UsageDetail::ByDay {
+        let cal = month_day_spends(&period, &usage_by_day_tuples(app));
+        let rows = usage_day_view_rows(app, &cal);
+        let sel = app.selected[Tab::Usage.index()].min(rows.len().saturating_sub(1));
+        rows.get(sel).map(|d| d.date.clone())
+    } else {
+        None
+    };
 
     let block = panel_block(
         theme,
-        format!(
-            "Daily cost  ·  sort={}  detail={}  [ ] month · / filter",
-            app.usage_sort.label(),
-            app.usage_detail.label()
-        ),
+        format!("Contribution graph  ·  52 weeks  ·  period cards: {period}"),
         true,
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if days.is_empty() {
+    let rows = usage_trailing_tuples(app);
+    if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Span::styled("  no daily data", theme.subtle())),
             inner,
         );
         return;
     }
+    let idle = if app.usage_detail == UsageDetail::ByDay {
+        String::new()
+    } else {
+        "t · by-day".into()
+    };
+    let lines = contribution_graph_lines(theme, &rows, selected_date.as_deref(), &idle);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
 
-    // BarChart wants (&str, u64) with static-ish labels — use owned vec of labels.
-    let take = days.len().min(14);
-    let start = days.len().saturating_sub(take);
-    let slice = &days[start..];
-    let labels: Vec<String> = slice
-        .iter()
-        .map(|d| {
-            // day-of-month from `YYYY-MM-DD`; use char-safe slicing so a
-            // malformed multi-byte `day` can never panic the render thread.
-            d.day.get(8..10).map(str::to_string).unwrap_or_else(|| d.day.clone())
-        })
-        .collect();
-    let data: Vec<(&str, u64)> = labels
-        .iter()
-        .zip(slice.iter())
-        .map(|(l, d)| (l.as_str(), ((d.total_usd * 1000.0).round() as u64).max(1)))
-        .collect();
+/// tokscale-style contribution graph lines.
+///
+/// ```text
+///   Jul Aug Sep …
+///   Mon ██ ·· ██ …
+///   Wed …
+///   Fri …
+///   Less · ██ ██ ██ ██ More
+/// ```
+fn contribution_graph_lines(
+    theme: &Theme,
+    by_day: &[(String, u64, u64, f64)],
+    selected_date: Option<&str>,
+    idle_hint: &str,
+) -> Vec<Line<'static>> {
+    let today = today_ymd();
+    let weeks = build_contribution_weeks(by_day, &today);
+    if weeks.is_empty() {
+        return vec![Line::from(Span::styled("  (no graph)", theme.subtle()))];
+    }
 
-    let chart = BarChart::default()
-        .data(&data)
-        .bar_width(3)
-        .bar_gap(1)
-        .bar_style(Style::default().fg(theme.accent))
-        .value_style(Style::default().fg(theme.fg).bg(theme.accent_dim))
-        .label_style(theme.subtle());
-    frame.render_widget(chart, inner);
+    // Fit as many trailing weeks as the terminal allows (~2 cols each).
+    // Caller draws into a panel; we use a soft cap of 52.
+    let max_weeks = 52usize.min(weeks.len());
+    let start = weeks.len().saturating_sub(max_weeks);
+    let shown = &weeks[start..];
+
+    let mut lines = Vec::new();
+
+    // Month labels on the first week-column of each new month (tokscale).
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut month_spans = vec![Span::raw("    ")]; // gutter for day labels
+    let mut last_month: Option<u32> = None;
+    for week in shown {
+        // First non-empty day in the week determines month.
+        let m = week.iter().flatten().find_map(|c| {
+            c.date
+                .get(5..7)
+                .and_then(|s| s.parse::<u32>().ok())
+        });
+        if let Some(m) = m {
+            if last_month != Some(m) && (1..=12).contains(&m) {
+                month_spans.push(Span::styled(
+                    format!("{:<2}", MONTHS[(m - 1) as usize]),
+                    theme.muted(),
+                ));
+                last_month = Some(m);
+            } else {
+                month_spans.push(Span::raw("  "));
+            }
+        } else {
+            month_spans.push(Span::raw("  "));
+        }
+    }
+    lines.push(Line::from(month_spans));
+
+    // Rows = weekdays; only Mon/Wed/Fri labeled (tokscale / GitHub).
+    const ROW_LABEL: [&str; 7] = ["", "Mon", "", "Wed", "", "Fri", ""];
+    for wd in 0..7 {
+        let mut spans = vec![Span::styled(
+            format!("{:<4}", ROW_LABEL[wd]),
+            theme.subtle(),
+        )];
+        for week in shown {
+            match &week[wd] {
+                None => spans.push(Span::raw("  ")),
+                Some(cell) => {
+                    let lvl = heat_level_from_intensity(cell.intensity);
+                    let selected = selected_date == Some(cell.date.as_str());
+                    let (glyph, style) = if selected {
+                        ("▓▓", theme.heat_selected_style(lvl))
+                    } else if cell.intensity <= 0.0 && cell.total_usd <= 0.0 {
+                        ("· ", theme.subtle())
+                    } else {
+                        ("██", theme.heat_cell_style(lvl))
+                    };
+                    spans.push(Span::styled(glyph, style));
+                }
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // Legend (tokscale footer style).
+    let mut footer = vec![
+        Span::raw("    "),
+        Span::styled("Less ", theme.subtle()),
+        Span::styled("· ", theme.subtle()),
+    ];
+    for lvl in 1u8..=4 {
+        footer.push(Span::styled("██", theme.heat_cell_style(lvl)));
+        footer.push(Span::raw(" "));
+    }
+    footer.push(Span::styled("More", theme.subtle()));
+
+    if let Some(date) = selected_date {
+        if let Some(cell) = find_cell(shown, date) {
+            footer.push(Span::styled(
+                format!(
+                    "   ▸ {}  {}  ·  {} req",
+                    cell.date,
+                    format_usd(cell.total_usd),
+                    cell.request_count
+                ),
+                theme.accent_bold(),
+            ));
+        }
+    } else if !idle_hint.is_empty() {
+        footer.push(Span::styled(format!("   {idle_hint}"), theme.subtle()));
+    }
+    lines.push(Line::from(footer));
+
+    lines
+}
+
+fn heat_level_from_intensity(intensity: f64) -> u8 {
+    let r = if intensity.is_finite() {
+        intensity.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if r <= 0.0 {
+        0
+    } else if r < 0.25 {
+        1
+    } else if r < 0.50 {
+        2
+    } else if r < 0.75 {
+        3
+    } else {
+        4
+    }
+}
+
+fn find_cell<'a>(
+    weeks: &'a [[Option<ContributionCell>; 7]],
+    date: &str,
+) -> Option<&'a ContributionCell> {
+    for week in weeks {
+        for cell in week.iter().flatten() {
+            if cell.date == date {
+                return Some(cell);
+            }
+        }
+    }
+    None
 }
 
 /// Shared list + right-hand detail split used by every Usage pane.
@@ -1702,61 +1940,70 @@ fn draw_usage_by_provider(frame: &mut Frame, area: Rect, app: &App, sel: usize) 
 
 fn draw_usage_by_day(frame: &mut Frame, area: Rect, app: &App, sel: usize, period_total: f64) {
     let theme = &app.theme;
-    let filtered = app.filtered_indices();
-    let mut days: Vec<(String, u64, u64, f64)> = app
+    let period = app
         .usage_summary
         .as_ref()
-        .map(|s| {
-            filtered
-                .iter()
-                .filter_map(|&i| {
-                    s.by_day.get(i).map(|d| {
-                        (
-                            d.day.clone(),
-                            d.request_count,
-                            d.total_tokens,
-                            d.total_usd,
-                        )
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+        .map(|s| s.period.as_str())
+        .unwrap_or(app.usage_period.as_str());
+    let calendar = month_day_spends(period, &usage_by_day_tuples(app));
+    let days = usage_day_view_rows(app, &calendar);
     if days.is_empty() {
         let hint = if !app.filter.is_empty() {
             "no matches for filter"
         } else {
-            "no daily rows"
+            "no days in period"
         };
         empty_state(frame, area, theme, "By day", hint);
         return;
     }
-    // Keep chronological by default for day view unless cost/token sort.
-    match app.usage_sort {
-        super::app::UsageSort::Cost => {
-            days.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
-        }
-        super::app::UsageSort::Tokens => days.sort_by(|a, b| b.2.cmp(&a.2)),
-        super::app::UsageSort::Date => days.sort_by(|a, b| a.0.cmp(&b.0)),
-    }
     let sel = sel.min(days.len().saturating_sub(1));
+    let cal_idx = day_spend_calendar_index(&days[sel]);
+
     let (list_area, detail_area, show_detail) = usage_master_detail(area);
-    let max_cost = days
+    let max_cost = calendar
         .iter()
-        .map(|d| d.3)
+        .map(|d| d.total_usd)
         .fold(0.0_f64, f64::max)
         .max(1e-9);
+
+    // Mini heatmap above the day table when vertical space allows.
+    let list_chunks = if list_area.height >= 16 {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(10), Constraint::Min(4)])
+            .split(list_area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(0), Constraint::Min(4)])
+            .split(list_area)
+    };
+
+    if list_chunks[0].height >= 8 {
+        let block = panel_block(theme, "Contribution (↑↓ select · c sort)", true);
+        let inner = block.inner(list_chunks[0]);
+        frame.render_widget(block, list_chunks[0]);
+        let sel_date = cal_idx.and_then(|i| calendar.get(i).map(|d| d.date.as_str()));
+        let lines =
+            contribution_graph_lines(theme, &usage_trailing_tuples(app), sel_date, "");
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
 
     let rows: Vec<Row> = days
         .iter()
         .enumerate()
-        .map(|(i, (day, req, tok, cost))| {
+        .map(|(i, d)| {
+            let heat = heat_level(d.total_usd, max_cost);
+            let mark = if heat == 0 { "· " } else { "██" };
             let row = Row::new(vec![
-                day.clone(),
-                req.to_string(),
-                format_tokens(*tok),
-                format_usd(*cost),
-                format!("{:.0}%", (cost / max_cost) * 100.0),
+                Cell::from(Line::from(vec![
+                    Span::styled(mark, theme.heat_cell_style(heat)),
+                    Span::raw(format!(" {}", d.date)),
+                ])),
+                Cell::from(d.request_count.to_string()),
+                Cell::from(format_tokens(d.total_tokens)),
+                Cell::from(format_usd(d.total_usd)),
+                Cell::from(format!("{:.0}%", (d.total_usd / max_cost) * 100.0)),
             ]);
             if i == sel {
                 row.style(theme.selection())
@@ -1768,7 +2015,7 @@ fn draw_usage_by_day(frame: &mut Frame, area: Rect, app: &App, sel: usize, perio
     let table = Table::new(
         rows,
         [
-            Constraint::Length(12),
+            Constraint::Length(14),
             Constraint::Length(7),
             Constraint::Length(10),
             Constraint::Length(10),
@@ -1778,43 +2025,72 @@ fn draw_usage_by_day(frame: &mut Frame, area: Rect, app: &App, sel: usize, perio
     .header(
         Row::new(vec!["DAY", "REQS", "TOKENS", "COST", "%"]).style(theme.header_cell()),
     )
-    .block(panel_block(theme, "By day", true));
-    frame.render_widget(table, list_area);
+    .block(panel_block(
+        theme,
+        format!("By day  {}/{}", sel + 1, days.len()),
+        true,
+    ));
+    frame.render_widget(table, list_chunks[1]);
 
     if show_detail {
-        let (day, req, tok, cost) = (
-            &days[sel].0,
-            days[sel].1,
-            days[sel].2,
-            days[sel].3,
-        );
-        let share = (cost / period_total) * 100.0;
-        let models = models_for_day(app, day);
+        let d = &days[sel];
+        let share = (d.total_usd / period_total) * 100.0;
+        let models = models_for_day(app, &d.date);
         draw_usage_rollup_detail(
             frame,
             detail_area,
             theme,
             "Day detail",
-            day,
+            &d.date,
             &[
-                ("day", day.clone()),
-                ("requests", req.to_string()),
-                ("tokens", format_tokens(tok)),
-                ("cost", format_usd(cost)),
+                ("day", d.date.clone()),
+                ("requests", d.request_count.to_string()),
+                ("tokens", format_tokens(d.total_tokens)),
+                ("cost", format_usd(d.total_usd)),
                 ("share", format!("{share:.1}% of period")),
                 (
                     "avg $/req",
-                    if req > 0 {
-                        format_usd(cost / req as f64)
+                    if d.request_count > 0 {
+                        format_usd(d.total_usd / d.request_count as f64)
                     } else {
                         "—".into()
                     },
                 ),
             ],
-            cost / max_cost,
+            d.total_usd / max_cost,
             &models,
         );
     }
+}
+
+/// Filtered + sorted day rows for the By day pane (same order as the table).
+fn usage_day_view_rows(app: &App, calendar: &[DaySpend]) -> Vec<DaySpend> {
+    let filtered = app.filtered_indices();
+    let mut days: Vec<DaySpend> = filtered
+        .iter()
+        .filter_map(|&i| calendar.get(i).cloned())
+        .collect();
+    match app.usage_sort {
+        super::app::UsageSort::Cost => {
+            days.sort_by(|a, b| {
+                b.total_usd
+                    .partial_cmp(&a.total_usd)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        super::app::UsageSort::Tokens => {
+            days.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+        }
+        super::app::UsageSort::Date => {}
+    }
+    days
+}
+
+fn day_spend_calendar_index(d: &DaySpend) -> Option<usize> {
+    d.date
+        .get(8..10)
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|dom| dom.saturating_sub(1))
 }
 
 fn draw_usage_rollup_detail(
@@ -2452,6 +2728,7 @@ Global
   PgUp/PgDn     Page                g / G      Top / bottom
   /             Filter lists        r          Refresh
   T             Theme auto/dark/light (also CONDUIT_THEME=…)
+  t             Home → Usage by-day calendar · on Usage cycles detail
   ?             Help                q          Quit
 
 Providers  (OAuth is an add method here)
@@ -2483,6 +2760,8 @@ Keys
 
 Usage
   [ ] month · c sort · t cycle list · / filter
+  Daily spend = GitHub-style heat calendar (cost intensity)
+  By day: ↑↓ select day cells · zero days still listed
   Recent: PgUp/PgDn page · g/G first/last page
   (right pane is detail; no Enter modal)
 

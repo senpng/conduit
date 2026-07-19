@@ -109,6 +109,247 @@ pub fn ratio_bar(ratio: f64, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(empty))
 }
 
+// ── Daily spend calendar (GitHub contribution-style) ────────────────────────
+
+/// One calendar day of gateway spend for heatmap cells.
+#[derive(Debug, Clone)]
+pub struct DaySpend {
+    /// `YYYY-MM-DD`
+    pub date: String,
+    pub request_count: u64,
+    pub total_tokens: u64,
+    pub total_usd: f64,
+}
+
+/// Parse `YYYY-MM` → (year, month).
+pub fn parse_year_month(period: &str) -> Option<(i32, u32)> {
+    let mut parts = period.trim().split('-');
+    let y: i32 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    if (1..=12).contains(&m) && (1970..=2100).contains(&y) {
+        Some((y, m))
+    } else {
+        None
+    }
+}
+
+pub fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    }
+}
+
+/// Heat bucket 0..=4 from intensity 0..=1 (tokscale / GitHub thresholds).
+pub fn heat_level(value: f64, max: f64) -> u8 {
+    if value <= 0.0 || !value.is_finite() || max <= 0.0 {
+        return 0;
+    }
+    let r = (value / max).clamp(0.0, 1.0);
+    // Match tokscale `intensity_color` bands.
+    if r < 0.25 {
+        1
+    } else if r < 0.50 {
+        2
+    } else if r < 0.75 {
+        3
+    } else {
+        4
+    }
+}
+
+/// One cell in a tokscale-style contribution column (Sun..=Sat).
+#[derive(Debug, Clone)]
+pub struct ContributionCell {
+    pub date: String,
+    pub request_count: u64,
+    pub total_usd: f64,
+    /// 0.0..=1.0 relative to peak cost in the window.
+    pub intensity: f64,
+}
+
+/// Build ~52 weeks of contribution columns ending on `today_ymd` (`YYYY-MM-DD`).
+///
+/// Mirrors tokscale `build_contribution_graph_for_today`: start on the Sunday
+/// on or before (today − 364 days), fill every day through today (zeros when
+/// missing), intensity = cost / max_cost.
+pub fn build_contribution_weeks(
+    by_day: &[(String, u64, u64, f64)],
+    today_ymd: &str,
+) -> Vec<[Option<ContributionCell>; 7]> {
+    let Some(today) = parse_ymd(today_ymd) else {
+        return Vec::new();
+    };
+    let (ty, tm, td) = today;
+    // Weekday of today (0=Sun).
+    let today_wd = weekday_sun0(ty, tm, td) as i64;
+    // tokscale: start = today - (364 + days_to_sunday)
+    let start_offset = 364 + today_wd;
+    let Some((sy, sm, sd)) = add_days(ty, tm, td, -start_offset) else {
+        return Vec::new();
+    };
+
+    let mut map = std::collections::HashMap::new();
+    for (d, r, t, c) in by_day {
+        map.insert(d.as_str(), (*r, *t, *c));
+    }
+    let max_cost = by_day
+        .iter()
+        .map(|(_, _, _, c)| *c)
+        .fold(0.0_f64, f64::max)
+        .max(1e-12);
+
+    let mut weeks: Vec<[Option<ContributionCell>; 7]> = Vec::new();
+    let mut col = [const { None }; 7];
+    let mut y = sy;
+    let mut m = sm;
+    let mut d = sd;
+    let mut wd = weekday_sun0(y, m, d) as usize;
+
+    loop {
+        let date = format!("{y:04}-{m:02}-{d:02}");
+        let (r, _t, c) = map.get(date.as_str()).copied().unwrap_or((0, 0, 0.0));
+        let intensity = if c > 0.0 {
+            (c / max_cost).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        col[wd] = Some(ContributionCell {
+            date: date.clone(),
+            request_count: r,
+            total_usd: c,
+            intensity,
+        });
+
+        let is_end = y == ty && m == tm && d == td;
+        if wd == 6 || is_end {
+            weeks.push(col);
+            col = [const { None }; 7];
+            wd = 0;
+        } else {
+            wd += 1;
+        }
+        if is_end {
+            break;
+        }
+        let Some(next) = add_days(y, m, d, 1) else {
+            break;
+        };
+        y = next.0;
+        m = next.1;
+        d = next.2;
+    }
+    weeks
+}
+
+fn parse_ymd(s: &str) -> Option<(i32, u32, u32)> {
+    let mut p = s.trim().split('-');
+    let y: i32 = p.next()?.parse().ok()?;
+    let m: u32 = p.next()?.parse().ok()?;
+    let d: u32 = p.next()?.parse().ok()?;
+    if (1..=12).contains(&m) && (1..=31).contains(&d) {
+        Some((y, m, d))
+    } else {
+        None
+    }
+}
+
+fn add_days(y: i32, m: u32, d: u32, delta: i64) -> Option<(i32, u32, u32)> {
+    // Civil day arithmetic via Rata Die (Howard Hinnant).
+    let day_number = date_to_rd(y, m, d)? + delta;
+    rd_to_date(day_number)
+}
+
+fn date_to_rd(y: i32, m: u32, d: u32) -> Option<i64> {
+    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
+        return None;
+    }
+    let y = y as i64;
+    let m = m as i64;
+    let d = d as i64;
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146097 + doe - 719468)
+}
+
+fn rd_to_date(mut z: i64) -> Option<(i32, u32, u32)> {
+    z += 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    Some((y as i32, m as u32, d as u32))
+}
+
+/// Weekday index for heatmap rows: **Sunday = 0** … Saturday = 6 (GitHub layout).
+pub fn weekday_sun0(year: i32, month: u32, day: u32) -> u32 {
+    // Sakamoto's methods — no chrono dependency needed here.
+    let mut y = year;
+    let m = month;
+    let d = day;
+    static T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    if m < 3 {
+        y -= 1;
+    }
+    let w = (y + y / 4 - y / 100 + y / 400 + T[(m - 1) as usize] + d as i32) % 7;
+    // Sakamoto: 0=Sunday … 6=Saturday — already what we want.
+    w.rem_euclid(7) as u32
+}
+
+/// Full calendar for `period` (`YYYY-MM`), zero-filled days with no traffic.
+///
+/// `by_day` rows are keyed by `YYYY-MM-DD` (UTC day from the usage ledger).
+pub fn month_day_spends(
+    period: &str,
+    by_day: &[(String, u64, u64, f64)],
+) -> Vec<DaySpend> {
+    let Some((y, m)) = parse_year_month(period) else {
+        return by_day
+            .iter()
+            .map(|(d, r, t, c)| DaySpend {
+                date: d.clone(),
+                request_count: *r,
+                total_tokens: *t,
+                total_usd: *c,
+            })
+            .collect();
+    };
+    let n = days_in_month(y, m);
+    let mut map = std::collections::HashMap::new();
+    for (d, r, t, c) in by_day {
+        map.insert(d.as_str(), (*r, *t, *c));
+    }
+    (1..=n)
+        .map(|dom| {
+            let date = format!("{y:04}-{m:02}-{dom:02}");
+            let (r, t, c) = map.get(date.as_str()).copied().unwrap_or((0, 0, 0.0));
+            DaySpend {
+                date,
+                request_count: r,
+                total_tokens: t,
+                total_usd: c,
+            }
+        })
+        .collect()
+}
+
 pub fn empty_state(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, hint: &str) {
     let block = panel_block(theme, title, true);
     let inner = block.inner(area);
@@ -444,5 +685,52 @@ pub fn health_badge(theme: &Theme, ok: bool, label: &str) -> Span<'static> {
         Span::styled(format!(" {label} "), theme.badge_ok())
     } else {
         Span::styled(format!(" {label} "), theme.badge_err())
+    }
+}
+
+#[cfg(test)]
+mod heatmap_tests {
+    use super::*;
+
+    #[test]
+    fn heat_level_buckets() {
+        // tokscale bands: 0 | <0.25 | <0.50 | <0.75 | else
+        assert_eq!(heat_level(0.0, 10.0), 0);
+        assert_eq!(heat_level(1.0, 10.0), 1); // 0.10
+        assert_eq!(heat_level(3.0, 10.0), 2); // 0.30
+        assert_eq!(heat_level(5.0, 10.0), 3); // 0.50 → grade 3 (>=0.50)
+        assert_eq!(heat_level(8.0, 10.0), 4); // 0.80
+        assert_eq!(heat_level(10.0, 10.0), 4);
+    }
+
+    #[test]
+    fn contribution_weeks_cover_year() {
+        let weeks = build_contribution_weeks(&[], "2026-07-20");
+        // ~52–53 weeks from start Sunday through today.
+        assert!(weeks.len() >= 52, "got {}", weeks.len());
+        assert!(weeks.len() <= 54, "got {}", weeks.len());
+        // Every week has 7 slots; last week ends on the given day.
+        let last = weeks.last().unwrap();
+        let last_day = last.iter().flatten().last().unwrap();
+        assert_eq!(last_day.date, "2026-07-20");
+    }
+
+    #[test]
+    fn month_fills_zeros() {
+        let rows = vec![("2026-07-02".into(), 1u64, 100u64, 1.5f64)];
+        let days = month_day_spends("2026-07", &rows);
+        assert_eq!(days.len(), 31);
+        assert_eq!(days[0].total_usd, 0.0);
+        assert_eq!(days[1].date, "2026-07-02");
+        assert_eq!(days[1].total_usd, 1.5);
+        assert_eq!(days[30].date, "2026-07-31");
+    }
+
+    #[test]
+    fn weekday_sun0_known() {
+        // 2026-07-01 was a Wednesday → Sun0 index 3
+        assert_eq!(weekday_sun0(2026, 7, 1), 3);
+        // 2026-07-05 was a Sunday → 0
+        assert_eq!(weekday_sun0(2026, 7, 5), 0);
     }
 }
