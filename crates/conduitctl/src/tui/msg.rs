@@ -1,8 +1,8 @@
 //! Messages from async network tasks back to the UI thread.
 
 use crate::dto::{
-    CooldownView, HealthResponse, KeyCreateResponse, KeyView, OAuthSessionView, PricingView,
-    ProviderSecretView, ProviderView, QuotaSnapshotView, RouteView, UsageListResponse,
+    CooldownView, HealthResponse, KeyCreateResponse, KeySecretView, KeyView, OAuthSessionView,
+    PricingView, ProviderSecretView, ProviderView, QuotaSnapshotView, RouteView, UsageListResponse,
     UsageSummaryView,
 };
 
@@ -57,6 +57,8 @@ pub enum Msg {
     KeyCreated(Result<KeyCreateResponse, String>),
     /// Decrypted provider secret for detail / modal.
     ProviderSecret(Result<ProviderSecretView, String>),
+    /// Decrypted downstream key raw token for the reveal modal.
+    KeySecret(Result<KeySecretView, String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

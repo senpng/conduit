@@ -201,6 +201,17 @@ pub struct KeyView {
     pub updated_at: String,
 }
 
+/// `GET /console/keys/{id}/secret` — decrypted downstream raw token.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct KeySecretView {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub secret_kind: String,
+    pub key: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct UsageRecordView {
     #[serde(default)]

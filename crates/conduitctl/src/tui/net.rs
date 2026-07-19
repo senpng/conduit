@@ -99,6 +99,17 @@ pub fn spawn_provider_secret(
     });
 }
 
+/// Decrypt a downstream key's raw token for the reveal modal.
+pub fn spawn_key_secret(client: ConsoleClient, key_id: String, tx: UnboundedSender<Msg>) {
+    tokio::spawn(async move {
+        let r = client
+            .get_key_secret(&key_id)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(Msg::KeySecret(r));
+    });
+}
+
 /// Probe selected (or all) OAuth remaining, then reload snapshots.
 pub fn spawn_quota_refresh(
     client: ConsoleClient,

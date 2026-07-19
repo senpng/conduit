@@ -53,7 +53,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 theme.border_active(),
             );
         }
-        Mode::SecretReveal { title, secret } => {
+        Mode::SecretReveal {
+            title,
+            secret,
+            single_value,
+        } => {
             let mut lines: Vec<Line> = secret
                 .lines()
                 .map(|l| {
@@ -67,10 +71,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 lines.push(Line::from(Span::styled("(empty)", theme.subtle())));
             }
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "y/c copy full · a copy token/key · Enter/Esc close",
-                theme.muted(),
-            )));
+            // A lone token copies the same either way — drop the `a` hint.
+            let footer = if *single_value {
+                "y/c copy · Enter/Esc close"
+            } else {
+                "y/c copy full · a copy token/key · Enter/Esc close"
+            };
+            lines.push(Line::from(Span::styled(footer, theme.muted())));
             modal(frame, theme, title, lines, Style::default().fg(theme.warning));
         }
         Mode::ProviderAddChooser(c) => draw_provider_add_chooser(frame, theme, c),
@@ -948,7 +955,7 @@ fn draw_master_detail_keys(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(table, list_area);
 
     let k = &app.keys[filtered[sel]];
-    let lines = detail_kv(
+    let mut lines = detail_kv(
         theme,
         &[
             ("id", k.id.clone()),
@@ -964,6 +971,11 @@ fn draw_master_detail_keys(frame: &mut Frame, area: Rect, app: &App) {
             ("created", format_local_time(&k.created_at)),
         ],
     );
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  v show token · e edit · d delete",
+        theme.subtle(),
+    )));
     frame.render_widget(
         Paragraph::new(lines).block(panel_block(theme, "Detail", false)),
         detail_area,
@@ -2465,7 +2477,8 @@ Routes
           pool target = multi-account of same kind
 
 Keys
-  a add · e edit · d delete
+  a add · e edit · d delete · v show token
+  (right pane is detail; no Enter modal · v reveals raw token to copy)
 
 Usage
   [ ] month · c sort · t cycle list · / filter

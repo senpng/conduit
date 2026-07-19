@@ -83,7 +83,16 @@ pub enum Mode {
     Help,
     Confirm(ConfirmAction),
     Alert { title: String, body: String },
-    SecretReveal { title: String, secret: String },
+    /// One-shot / decrypted secret shown in a modal.
+    ///
+    /// `single_value` distinguishes a lone token (downstream key, one-shot
+    /// reveal) from a provider's multi-field dump. For a lone token the `full`
+    /// and `primary` copies are identical, so the footer drops the `a` hint.
+    SecretReveal {
+        title: String,
+        secret: String,
+        single_value: bool,
+    },
     /// Choose how to add a provider (API key vs OAuth).
     ProviderAddChooser(ProviderAddChooser),
     ProviderForm(ProviderForm),
@@ -462,6 +471,15 @@ impl App {
                         net::spawn_provider_secret(self.client.clone(), id, self.tx.clone());
                     } else {
                         self.status = "Select a provider first".into();
+                    }
+                } else if self.tab == Tab::Keys {
+                    // Reveal the raw token in a one-shot modal (copy from there).
+                    if let Some(id) = self.selected_key_id() {
+                        self.status = "Revealing key…".into();
+                        self.loading = true;
+                        net::spawn_key_secret(self.client.clone(), id, self.tx.clone());
+                    } else {
+                        self.status = "Select a key first".into();
                     }
                 }
             }
@@ -1538,6 +1556,14 @@ impl App {
         self.providers.get(idx).map(|p| p.id.clone())
     }
 
+    fn selected_key_id(&self) -> Option<String> {
+        if self.tab != Tab::Keys {
+            return None;
+        }
+        let idx = self.selected_data_index()?;
+        self.keys.get(idx).map(|k| k.id.clone())
+    }
+
     pub fn quota_for(&self, provider_id: &str) -> Option<&crate::dto::QuotaSnapshotView> {
         self.quota_snapshots
             .iter()
@@ -1767,6 +1793,7 @@ impl App {
                         self.mode = Mode::SecretReveal {
                             title,
                             secret: body,
+                            single_value: false,
                         };
                         self.status =
                             "Secret decrypted — shown in detail & modal (v to hide; others keep)"
@@ -1775,6 +1802,28 @@ impl App {
                     Err(e) => {
                         self.error = Some(e);
                         self.status = "Failed to decrypt secret".into();
+                    }
+                }
+            }
+            Msg::KeySecret(r) => {
+                self.loading = false;
+                match r {
+                    Ok(view) => {
+                        let title = if view.name.is_empty() {
+                            format!("Key {} — token", view.id)
+                        } else {
+                            format!("Key {} — token", view.name)
+                        };
+                        self.mode = Mode::SecretReveal {
+                            title,
+                            secret: view.key,
+                            single_value: true,
+                        };
+                        self.status = "Key revealed — y/c copy · Esc close".into();
+                    }
+                    Err(e) => {
+                        self.error = Some(e);
+                        self.status = "Failed to reveal key".into();
                     }
                 }
             }
@@ -1904,6 +1953,7 @@ impl App {
                         self.mode = Mode::SecretReveal {
                             title: "Secret (copy now — shown once)".into(),
                             secret: sec,
+                            single_value: true,
                         };
                     }
                 } else {
@@ -1920,6 +1970,7 @@ impl App {
                     self.mode = Mode::SecretReveal {
                         title: format!("Downstream key {} — copy now (shown once)", k.name),
                         secret: k.key,
+                        single_value: true,
                     };
                 }
                     Err(e) => {

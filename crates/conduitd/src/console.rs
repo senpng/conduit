@@ -540,6 +540,18 @@ pub async fn create_key(
     let repo = KeyRepo::new(&state.pool);
     match repo.insert(&row).await {
         Ok(()) => {
+            // Store the raw token encrypted so it can be revealed later
+            // (mirrors provider upstream keys). Only the hash lives in SQLite.
+            let secret = secrecy::SecretVec::new(raw_key.clone().into_bytes());
+            if let Err(e) = state.secret_backend.put("downstream_key", &id, secret).await {
+                // Roll back so we never keep a key whose token can't be revealed.
+                let _ = repo.delete(&id).await;
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to store key secret: {e}"),
+                )
+                .into_response();
+            }
             let resp = KeyCreateResponse {
                 id,
                 key: raw_key,
@@ -551,6 +563,50 @@ pub async fn create_key(
             (StatusCode::CREATED, Json(json!(resp))).into_response()
         }
         Err(e) => internal(e).into_response(),
+    }
+}
+
+/// GET /console/keys/{id}/secret — decrypt and return the raw downstream token.
+///
+/// Mirrors [`get_provider_secret`]. Only keys created with reveal support have a
+/// stored token; older keys return 404.
+pub async fn get_key_secret(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    use secrecy::ExposeSecret;
+
+    let repo = KeyRepo::new(&state.pool);
+    let row = match repo.get(&id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "key not found").into_response(),
+        Err(e) => return internal(e).into_response(),
+    };
+
+    match state.secret_backend.get("downstream_key", &id).await {
+        Ok(Some(s)) => {
+            let key = String::from_utf8_lossy(s.expose_secret()).to_string();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "id": id,
+                    "name": row.name,
+                    "secret_kind": "api_key",
+                    "key": key,
+                })),
+            )
+                .into_response()
+        }
+        Ok(None) => err(
+            StatusCode::NOT_FOUND,
+            format!("no stored token for key '{id}'"),
+        )
+        .into_response(),
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to decrypt key secret: {e}"),
+        )
+        .into_response(),
     }
 }
 

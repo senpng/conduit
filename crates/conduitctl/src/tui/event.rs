@@ -102,10 +102,14 @@ fn map_browse(tab: Tab, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('/') => Some(Action::StartFilter),
         KeyCode::Char('r') => Some(Action::Refresh),
         KeyCode::Char('a') => Some(Action::Add),
-        // Usage / Pricing have right-hand detail panes — no Enter modal there.
+        // Usage / Pricing / Keys have right-hand detail panes — no Enter modal.
         KeyCode::Char('e') if tab != Tab::Usage => Some(Action::Edit),
-        KeyCode::Enter if !matches!(tab, Tab::Usage | Tab::Pricing) => Some(Action::Edit),
+        KeyCode::Enter if !matches!(tab, Tab::Usage | Tab::Pricing | Tab::Keys) => {
+            Some(Action::Edit)
+        }
         KeyCode::Char('d') => Some(Action::Delete),
+        // Keys: reveal raw token in a modal (copy from there).
+        KeyCode::Char('v') if tab == Tab::Keys => Some(Action::ViewSecret),
         KeyCode::Char('[') if tab == Tab::Usage => Some(Action::PeriodPrev),
         KeyCode::Char(']') if tab == Tab::Usage => Some(Action::PeriodNext),
         KeyCode::Char('R') if tab == Tab::Pricing => Some(Action::PricingReload),
@@ -243,6 +247,31 @@ mod tests {
         assert_eq!(
             map_key(&Mode::Browse, Tab::Overview, key(KeyCode::Char('q'))),
             Some(Action::Quit)
+        );
+    }
+
+    #[test]
+    fn keys_enter_does_not_edit() {
+        // Detail pane shows the key; Enter no longer opens the edit modal.
+        assert_eq!(
+            map_key(&Mode::Browse, Tab::Keys, key(KeyCode::Enter)),
+            None
+        );
+    }
+
+    #[test]
+    fn keys_v_reveals_secret() {
+        assert_eq!(
+            map_key(&Mode::Browse, Tab::Keys, key(KeyCode::Char('v'))),
+            Some(Action::ViewSecret)
+        );
+    }
+
+    #[test]
+    fn keys_e_still_edits() {
+        assert_eq!(
+            map_key(&Mode::Browse, Tab::Keys, key(KeyCode::Char('e'))),
+            Some(Action::Edit)
         );
     }
 

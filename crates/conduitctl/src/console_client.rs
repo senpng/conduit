@@ -11,8 +11,8 @@ use thiserror::Error;
 
 use crate::dto::{
     CooldownListResponse, CreateKeyBody, CreateProviderBody, CreateRouteBody, HealthResponse,
-    KeyCreateResponse, KeyView, OAuthSessionView, PricingView, ProviderSecretView, ProviderView,
-    QuotaListResponse, RouteView, SetSecretBody, UpdateKeyBody, UpdateProviderBody,
+    KeyCreateResponse, KeySecretView, KeyView, OAuthSessionView, PricingView, ProviderSecretView,
+    ProviderView, QuotaListResponse, RouteView, SetSecretBody, UpdateKeyBody, UpdateProviderBody,
     UpsertPricingOverrideBody, UsageListResponse, UsageSummaryView,
 };
 
@@ -188,6 +188,12 @@ impl ConsoleClient {
 
     pub async fn list_keys_typed(&self) -> Result<Vec<KeyView>, ConsoleError> {
         let url = format!("{}/console/keys", self.base);
+        self.get_json(&url).await
+    }
+
+    /// Decrypt and return a downstream key's raw token (reveal endpoint).
+    pub async fn get_key_secret(&self, id: &str) -> Result<KeySecretView, ConsoleError> {
+        let url = format!("{}/console/keys/{}/secret", self.base, id);
         self.get_json(&url).await
     }
 

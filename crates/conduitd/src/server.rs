@@ -402,6 +402,10 @@ pub fn build_console_router(state: Arc<crate::state::DaemonState>) -> Router {
         .route("/console/keys", get(crate::console::list_keys))
         .route("/console/keys", post(crate::console::create_key))
         .route("/console/keys/{id}", get(crate::console::get_key))
+        .route(
+            "/console/keys/{id}/secret",
+            get(crate::console::get_key_secret),
+        )
         .route("/console/keys/{id}", put(crate::console::update_key))
         .route("/console/keys/{id}", delete(crate::console::delete_key))
         // Usage ledger / pricing
