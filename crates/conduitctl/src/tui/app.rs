@@ -203,6 +203,10 @@ pub struct App {
     /// Selection index into the **filtered** view for each tab.
     pub selected: [usize; 6],
 
+    /// Cached result of [`Self::compute_filtered`] for the current tab/filter.
+    /// Kept in sync via [`Self::refresh_filtered`] so `draw` never recomputes.
+    filtered: Vec<usize>,
+
     /// Monotonic load generation. Bumped whenever a load that *replaces* list
     /// data is issued (tab flip, refresh, page/sort/filter change). Data
     /// responses carry the generation they were spawned under; `apply_msg`
@@ -246,6 +250,7 @@ impl App {
             usage_sort: UsageSort::default(),
             usage_detail: UsageDetail::default(),
             selected: [0; 6],
+            filtered: Vec::new(),
             data_gen: 0,
             tx,
         }
@@ -383,6 +388,7 @@ impl App {
                 if matches!(self.mode, Mode::Filter) {
                     self.filter.push(c);
                     self.selected[self.tab.index()] = 0;
+                    self.refresh_filtered();
                 } else {
                     self.input_code(crossterm::event::KeyCode::Char(c));
                 }
@@ -391,6 +397,7 @@ impl App {
                 if matches!(self.mode, Mode::Filter) {
                     self.filter.pop();
                     self.selected[self.tab.index()] = 0;
+                    self.refresh_filtered();
                 } else {
                     self.input_code(crossterm::event::KeyCode::Backspace);
                 }
@@ -519,6 +526,8 @@ impl App {
                         PricingPane::Overrides => PricingPane::Merged,
                     };
                     self.selected[Tab::Pricing.index()] = 0;
+                    // Pane switch changes which list feeds the filter.
+                    self.refresh_filtered();
                     self.status = match self.pricing_pane {
                         PricingPane::Merged => "Pricing: merged table".into(),
                         PricingPane::Overrides => {
@@ -556,6 +565,8 @@ impl App {
                     self.usage_detail = self.usage_detail.next();
                     self.selected[Tab::Usage.index()] = 0;
                     self.status = format!("Usage detail: {}", self.usage_detail.label());
+                    // Detail switch changes which rollup list the filter applies to.
+                    self.refresh_filtered();
                     // Entering Recent with a filter (or stale page) → re-fetch server page.
                     if self.usage_detail == UsageDetail::Recent
                         && self.filter != self.usage_applied_filter
@@ -646,6 +657,9 @@ impl App {
         self.usage_applied_filter.clear();
         self.usage_offset = 0;
         self.tab = tab;
+        // Reflect the new tab immediately; the pending load will refresh again
+        // once its data arrives.
+        self.refresh_filtered();
         self.request_refresh();
     }
 
@@ -653,10 +667,26 @@ impl App {
         self.filtered_indices().len()
     }
 
-    /// Indices into the underlying data for the current tab after filter.
-    pub fn filtered_indices(&self) -> Vec<usize> {
+    /// Cached indices into the underlying data for the current tab after
+    /// filter. Recomputed by [`Self::refresh_filtered`] whenever an input
+    /// changes (filter text, tab, pane/detail, or the backing data); read
+    /// zero-cost every frame here.
+    pub fn filtered_indices(&self) -> &[usize] {
+        &self.filtered
+    }
+
+    /// Rebuild the filtered-index cache. Call after any change to filter text,
+    /// tab, pricing pane, usage detail, or the underlying lists.
+    pub fn refresh_filtered(&mut self) {
+        self.filtered = self.compute_filtered();
+    }
+
+    fn compute_filtered(&self) -> Vec<usize> {
+        // Lower-case the needle once; match case-insensitively without
+        // allocating a lowercased copy of every field (the old hot path
+        // called `to_lowercase()` per field, per row, per frame).
         let q = self.filter.to_lowercase();
-        let match_q = |s: &str| q.is_empty() || s.to_lowercase().contains(&q);
+        let match_q = |s: &str| q.is_empty() || ci_contains(s, &q);
 
         match self.tab {
             Tab::Overview => vec![],
@@ -1818,6 +1848,8 @@ impl App {
                         .get(self.selected_data_index().unwrap_or(usize::MAX))
                         .map(|p| (p.provider_kind.clone(), p.model_id.clone()));
                     self.pricing_overrides = v;
+                    // Data replaced → refresh cache before mapping data→view index.
+                    self.refresh_filtered();
                     if self.tab == Tab::Pricing && self.pricing_pane == PricingPane::Overrides {
                         if let Some((pk, mid)) = prefer {
                             if let Some(i) = self
@@ -1979,6 +2011,9 @@ impl App {
     }
 
     fn clamp_sel(&mut self, tab: Tab) {
+        // Data or tab changed → rebuild the filtered-index cache before we read
+        // its length below (and before the next frame reads it).
+        self.refresh_filtered();
         let n = match tab {
             Tab::Providers => self.providers.len(),
             Tab::Routes => self.routes.len(),
@@ -2021,6 +2056,17 @@ impl App {
             }
         }
     }
+}
+
+/// Case-insensitive substring test where `needle` is already lower-cased.
+/// Still lowercases `haystack` per call, but the filter result is now cached
+/// (see [`App::refresh_filtered`]) so this runs only when inputs change rather
+/// than on every frame.
+fn ci_contains(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.to_lowercase().contains(needle)
 }
 
 /// Primary credential string: API key or OAuth access_token.
@@ -2120,6 +2166,81 @@ fn format_provider_secret_modal(view: &crate::dto::ProviderSecretView) -> String
         lines.push("(no oauth payload)".into());
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod filter_cache_tests {
+    use super::*;
+    use crate::dto::ProviderView;
+
+    fn provider(id: &str, name: &str, kind: &str) -> ProviderView {
+        ProviderView {
+            id: id.into(),
+            name: name.into(),
+            kind: kind.into(),
+            base_url: String::new(),
+            upstream_key_ref: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn app_with_providers(ps: Vec<ProviderView>) -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new("http://localhost:0", tx);
+        app.tab = Tab::Providers;
+        // gen 0 is the mutation-exempt sentinel → never treated as stale.
+        app.apply_msg(Msg::Providers {
+            gen: 0,
+            result: Ok(ps),
+        });
+        app
+    }
+
+    #[test]
+    fn cache_populated_after_data_load() {
+        let app = app_with_providers(vec![
+            provider("p1", "OpenAI", "openai"),
+            provider("p2", "Claude", "anthropic"),
+        ]);
+        assert_eq!(app.filtered_indices(), &[0, 1]);
+        assert_eq!(app.list_len(), 2);
+    }
+
+    #[test]
+    fn filter_narrows_cached_view() {
+        let mut app = app_with_providers(vec![
+            provider("p1", "OpenAI", "openai"),
+            provider("p2", "Claude", "anthropic"),
+        ]);
+        app.mode = Mode::Filter;
+        // Case-insensitive substring on any of name/kind/id/base_url.
+        app.handle_action(Action::Char('c'));
+        app.handle_action(Action::Char('l'));
+        assert_eq!(app.filtered_indices(), &[1], "only Claude matches 'cl'");
+        assert_eq!(app.list_len(), 1);
+        // Backspacing restores the full view from cache.
+        app.handle_action(Action::Backspace);
+        app.handle_action(Action::Backspace);
+        assert_eq!(app.filtered_indices(), &[0, 1]);
+    }
+
+    #[test]
+    fn data_reload_refreshes_cache() {
+        let mut app = app_with_providers(vec![provider("p1", "OpenAI", "openai")]);
+        assert_eq!(app.list_len(), 1);
+        // A fresh load with more rows must be reflected in the cache.
+        app.apply_msg(Msg::Providers {
+            gen: 0,
+            result: Ok(vec![
+                provider("p1", "OpenAI", "openai"),
+                provider("p2", "Claude", "anthropic"),
+                provider("p3", "Grok", "xai"),
+            ]),
+        });
+        assert_eq!(app.list_len(), 3);
+        assert_eq!(app.filtered_indices(), &[0, 1, 2]);
+    }
 }
 
 
