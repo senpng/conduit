@@ -2610,16 +2610,21 @@ fn draw_provider_form(frame: &mut Frame, theme: &Theme, f: &super::forms::Provid
 }
 
 fn draw_key_form(frame: &mut Frame, theme: &Theme, f: &super::forms::KeyForm) {
-    let labels = super::forms::KeyForm::labels();
+    let labels = f.labels();
+    let hint = if f.is_edit() {
+        "Tab next · Enter on last = save · Ctrl-s save · Ctrl-k toggle enabled · Esc cancel"
+    } else {
+        "Tab next · Enter on last = save · Ctrl-s save · Esc cancel"
+    };
     form_modal(
         frame,
         theme,
-        "Create downstream key",
+        &f.title(),
         &labels,
         &f.fields,
         f.focus,
         f.error.as_deref(),
-        "Tab next · Enter on last = save · Esc cancel",
+        hint,
     );
 }
 

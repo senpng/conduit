@@ -525,6 +525,8 @@ impl App {
             Action::CycleKind => {
                 if let Mode::ProviderForm(f) = &mut self.mode {
                     f.cycle_kind();
+                } else if let Mode::KeyForm(f) = &mut self.mode {
+                    f.cycle_enabled();
                 } else if let Mode::OauthFlow(f) = &mut self.mode {
                     f.cycle_kind();
                 } else if let Mode::RouteWizard(w) = &mut self.mode {
@@ -923,7 +925,13 @@ impl App {
                 v.extend([("a", "add"), ("e", "edit"), ("d", "delete"), ("/", "filter")]);
             }
             Tab::Keys => {
-                v.extend([("a", "create"), ("d", "revoke"), ("/", "filter")]);
+                v.extend([
+                    ("a", "create"),
+                    ("e", "edit"),
+                    ("v", "show token"),
+                    ("d", "revoke"),
+                    ("/", "filter"),
+                ]);
             }
             Tab::Usage => {
                 v.extend([
@@ -1132,13 +1140,7 @@ impl App {
             }
             Tab::Keys => {
                 if let Some(k) = self.keys.get(idx) {
-                    self.mode = Mode::Alert {
-                        title: "Key detail".into(),
-                        body: format!(
-                            "id: {}\nname: {}\nrpm: {:?}\nenabled: {}\nwhitelist: {}",
-                            k.id, k.name, k.rate_limit_rpm, k.enabled, k.model_whitelist
-                        ),
-                    };
+                    self.mode = Mode::KeyForm(KeyForm::edit(k));
                 }
             }
             Tab::Pricing => {
@@ -1415,18 +1417,40 @@ impl App {
                     }
                 },
             },
-            Mode::KeyForm(f) => match f.to_body() {
-                Ok(body) => {
-                    self.status = "Creating key…".into();
-                    self.mode = Mode::Browse;
-                    net::spawn_create_key(self.client.clone(), body, self.tx.clone());
-                }
-                Err(e) => {
-                    if let Mode::KeyForm(f) = &mut self.mode {
-                        f.error = Some(e);
+            Mode::KeyForm(f) => {
+                if let Some(id) = f.edit_id.clone() {
+                    match f.to_update_body() {
+                        Ok(body) => {
+                            self.status = format!("Updating key {id}…");
+                            self.mode = Mode::Browse;
+                            net::spawn_update_key(
+                                self.client.clone(),
+                                id,
+                                body,
+                                self.tx.clone(),
+                            );
+                        }
+                        Err(e) => {
+                            if let Mode::KeyForm(f) = &mut self.mode {
+                                f.error = Some(e);
+                            }
+                        }
+                    }
+                } else {
+                    match f.to_create_body() {
+                        Ok(body) => {
+                            self.status = "Creating key…".into();
+                            self.mode = Mode::Browse;
+                            net::spawn_create_key(self.client.clone(), body, self.tx.clone());
+                        }
+                        Err(e) => {
+                            if let Mode::KeyForm(f) = &mut self.mode {
+                                f.error = Some(e);
+                            }
+                        }
                     }
                 }
-            },
+            }
             Mode::RouteWizard(w) => match w.to_body() {
                 Ok(body) => {
                     let edit_id = w.edit_id.clone();

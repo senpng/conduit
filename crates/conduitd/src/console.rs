@@ -649,6 +649,17 @@ pub async fn update_key(
     }
 
     let now = Utc::now().to_rfc3339();
+    // Full form updates (TUI edit) send name + model_whitelist together; in that
+    // case rate_limit_rpm is authoritative (None = unlimited). Partial updates
+    // that only touch rpm still use Some → set / None → keep.
+    let full_form = body.name.is_some() && body.model_whitelist.is_some();
+    let rate_limit_rpm = if full_form {
+        body.rate_limit_rpm
+    } else if body.rate_limit_rpm.is_some() {
+        body.rate_limit_rpm
+    } else {
+        existing.rate_limit_rpm
+    };
     let updated = DownstreamKeyRow {
         name: body.name.unwrap_or(existing.name),
         model_whitelist: body
@@ -656,11 +667,7 @@ pub async fn update_key(
             .map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "[]".to_string()))
             .unwrap_or(existing.model_whitelist),
         monthly_budget_usd: None,
-        rate_limit_rpm: if body.rate_limit_rpm.is_some() {
-            body.rate_limit_rpm
-        } else {
-            existing.rate_limit_rpm
-        },
+        rate_limit_rpm,
         enabled: body.enabled.unwrap_or(existing.enabled),
         updated_at: now,
         ..existing

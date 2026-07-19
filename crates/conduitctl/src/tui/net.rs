@@ -4,8 +4,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::console_client::ConsoleClient;
 use crate::dto::{
-    CreateKeyBody, CreateProviderBody, CreateRouteBody, SetSecretBody, UpdateProviderBody,
-    UsageListResponse,
+    CreateKeyBody, CreateProviderBody, CreateRouteBody, SetSecretBody, UpdateKeyBody,
+    UpdateProviderBody, UsageListResponse,
 };
 
 use super::app::USAGE_PAGE_SIZE;
@@ -541,6 +541,32 @@ pub fn spawn_create_key(client: ConsoleClient, body: CreateKeyBody, tx: Unbounde
     tokio::spawn(async move {
         let r = client.create_key(&body).await;
         let _ = tx.send(Msg::KeyCreated(r.map_err(|e| e.to_string())));
+    });
+}
+
+pub fn spawn_update_key(
+    client: ConsoleClient,
+    id: String,
+    body: UpdateKeyBody,
+    tx: UnboundedSender<Msg>,
+) {
+    tokio::spawn(async move {
+        let r = client.update_key(&id, &body).await;
+        let msg = match r {
+            Ok(_) => Msg::Mutated {
+                ok: true,
+                message: format!("Key {id} updated"),
+                refresh: RefreshKind::Keys,
+                secret: None,
+            },
+            Err(e) => Msg::Mutated {
+                ok: false,
+                message: e.to_string(),
+                refresh: RefreshKind::None,
+                secret: None,
+            },
+        };
+        let _ = tx.send(msg);
     });
 }
 

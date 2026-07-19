@@ -3,8 +3,8 @@
 use chrono::{Datelike, Utc};
 
 use crate::dto::{
-    CreateKeyBody, CreateProviderBody, CreateRouteBody, ProviderView, RouteTargetSpec, RouteView,
-    SetSecretBody, UpdateProviderBody,
+    CreateKeyBody, CreateProviderBody, CreateRouteBody, KeyView, ProviderView, RouteTargetSpec,
+    RouteView, SetSecretBody, UpdateKeyBody, UpdateProviderBody,
 };
 
 use super::input::InputField;
@@ -205,6 +205,8 @@ impl ProviderForm {
 
 #[derive(Debug, Clone)]
 pub struct KeyForm {
+    /// `None` = create; `Some(id)` = update existing key metadata.
+    pub edit_id: Option<String>,
     pub fields: Vec<InputField>,
     pub focus: usize,
     pub error: Option<String>,
@@ -213,6 +215,7 @@ pub struct KeyForm {
 impl KeyForm {
     pub fn create() -> Self {
         Self {
+            edit_id: None,
             fields: vec![
                 InputField::new(""),
                 InputField::new(""), // rpm optional
@@ -223,50 +226,155 @@ impl KeyForm {
         }
     }
 
-    pub fn labels() -> [&'static str; 3] {
-        ["Name", "Rate limit RPM (optional)", "Model whitelist (comma-separated, empty=all)"]
+    pub fn edit(k: &KeyView) -> Self {
+        let rpm = k
+            .rate_limit_rpm
+            .map(|r| r.to_string())
+            .unwrap_or_default();
+        let whitelist = whitelist_to_csv(&k.model_whitelist);
+        let enabled = if k.enabled { "true" } else { "false" };
+        Self {
+            edit_id: Some(k.id.clone()),
+            fields: vec![
+                InputField::new(&k.name),
+                InputField::new(rpm),
+                InputField::new(whitelist),
+                InputField::new(enabled),
+            ],
+            focus: 0,
+            error: None,
+        }
     }
 
-    pub fn to_body(&self) -> Result<CreateKeyBody, String> {
+    pub fn is_edit(&self) -> bool {
+        self.edit_id.is_some()
+    }
+
+    pub fn title(&self) -> String {
+        match &self.edit_id {
+            Some(id) => format!("Edit key {id}"),
+            None => "Create downstream key".into(),
+        }
+    }
+
+    pub fn labels(&self) -> Vec<&'static str> {
+        if self.is_edit() {
+            vec![
+                "Name",
+                "Rate limit RPM (empty=unlimited)",
+                "Model whitelist (comma-separated, empty=all)",
+                "Enabled (true/false · Ctrl-k toggle)",
+            ]
+        } else {
+            vec![
+                "Name",
+                "Rate limit RPM (optional)",
+                "Model whitelist (comma-separated, empty=all)",
+            ]
+        }
+    }
+
+    /// Toggle enabled field on edit forms (Ctrl-k).
+    pub fn cycle_enabled(&mut self) {
+        if !self.is_edit() {
+            return;
+        }
+        if let Some(f) = self.fields.get_mut(3) {
+            let on = parse_bool_loose(&f.value).unwrap_or(true);
+            let next = if on { "false" } else { "true" };
+            f.value = next.to_string();
+            f.cursor = next.chars().count();
+        }
+    }
+
+    fn parse_rpm(s: &str) -> Result<Option<i64>, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Ok(None);
+        }
+        let v = s
+            .parse::<i64>()
+            .map_err(|_| format!("invalid rpm: {s}"))?;
+        // Server stores this and later casts i64 → u32, so a negative
+        // value wraps to a huge limit (rate-limiting disabled) and 0
+        // rejects every request. Require a positive requests/minute.
+        if v < 1 {
+            return Err("rpm must be a positive number".into());
+        }
+        Ok(Some(v))
+    }
+
+    fn parse_whitelist(s: &str) -> Option<Vec<String>> {
+        let s = s.trim();
+        if s.is_empty() {
+            None
+        } else {
+            Some(
+                s.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect::<Vec<_>>(),
+            )
+        }
+    }
+
+    pub fn to_create_body(&self) -> Result<CreateKeyBody, String> {
         let name = self.fields[0].value.trim();
         if name.is_empty() {
             return Err("name is required".into());
         }
-        let rpm = {
-            let s = self.fields[1].value.trim();
-            if s.is_empty() {
-                None
-            } else {
-                let v = s
-                    .parse::<i64>()
-                    .map_err(|_| format!("invalid rpm: {s}"))?;
-                // Server stores this and later casts i64 → u32, so a negative
-                // value wraps to a huge limit (rate-limiting disabled) and 0
-                // rejects every request. Require a positive requests/minute.
-                if v < 1 {
-                    return Err("rpm must be a positive number".into());
-                }
-                Some(v)
-            }
-        };
-        let whitelist = {
-            let s = self.fields[2].value.trim();
-            if s.is_empty() {
-                None
-            } else {
-                Some(
-                    s.split(',')
-                        .map(|x| x.trim().to_string())
-                        .filter(|x| !x.is_empty())
-                        .collect::<Vec<_>>(),
-                )
-            }
-        };
         Ok(CreateKeyBody {
             name: name.to_string(),
-            model_whitelist: whitelist,
-            rate_limit_rpm: rpm,
+            model_whitelist: Self::parse_whitelist(&self.fields[2].value),
+            rate_limit_rpm: Self::parse_rpm(&self.fields[1].value)?,
         })
+    }
+
+    /// Full-field update: name + whitelist always sent; empty rpm → unlimited;
+    /// enabled from the 4th field.
+    pub fn to_update_body(&self) -> Result<UpdateKeyBody, String> {
+        let name = self.fields[0].value.trim();
+        if name.is_empty() {
+            return Err("name is required".into());
+        }
+        let enabled = {
+            let s = self
+                .fields
+                .get(3)
+                .map(|f| f.value.as_str())
+                .unwrap_or("true");
+            parse_bool_loose(s).ok_or_else(|| {
+                format!("enabled must be true/false (got {s:?})")
+            })?
+        };
+        // Always send whitelist (empty vec = allow all) so clears work.
+        let whitelist = Self::parse_whitelist(&self.fields[2].value).unwrap_or_default();
+        Ok(UpdateKeyBody {
+            name: Some(name.to_string()),
+            model_whitelist: Some(whitelist),
+            rate_limit_rpm: Self::parse_rpm(&self.fields[1].value)?,
+            enabled: Some(enabled),
+        })
+    }
+}
+
+fn whitelist_to_csv(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        serde_json::Value::String(s) => s.clone(),
+        _ => String::new(),
+    }
+}
+
+fn parse_bool_loose(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "t" | "yes" | "y" | "1" | "on" | "enabled" => Some(true),
+        "false" | "f" | "no" | "n" | "0" | "off" | "disabled" => Some(false),
+        _ => None,
     }
 }
 
@@ -1037,6 +1145,78 @@ mod tests {
         let body = f.to_update_body().unwrap();
         assert_eq!(body.name.as_deref(), Some("new"));
         assert_eq!(body.base_url.as_deref(), Some("https://new.example"));
+    }
+
+    fn kv(
+        id: &str,
+        name: &str,
+        rpm: Option<i64>,
+        whitelist: serde_json::Value,
+        enabled: bool,
+    ) -> KeyView {
+        KeyView {
+            id: id.into(),
+            name: name.into(),
+            model_whitelist: whitelist,
+            rate_limit_rpm: rpm,
+            enabled,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn key_form_create_body() {
+        let mut f = KeyForm::create();
+        assert!(!f.is_edit());
+        f.fields[0].value = "ops".into();
+        f.fields[1].value = "120".into();
+        f.fields[2].value = "gpt-4o, claude-sonnet".into();
+        let body = f.to_create_body().unwrap();
+        assert_eq!(body.name, "ops");
+        assert_eq!(body.rate_limit_rpm, Some(120));
+        assert_eq!(
+            body.model_whitelist.as_deref(),
+            Some(["gpt-4o".into(), "claude-sonnet".into()].as_slice())
+        );
+    }
+
+    #[test]
+    fn key_form_edit_prefills_and_updates() {
+        let k = kv(
+            "k1",
+            "old",
+            Some(60),
+            serde_json::json!(["gpt-4o"]),
+            true,
+        );
+        let mut f = KeyForm::edit(&k);
+        assert_eq!(f.edit_id.as_deref(), Some("k1"));
+        assert_eq!(f.fields.len(), 4);
+        assert_eq!(f.fields[0].value, "old");
+        assert_eq!(f.fields[1].value, "60");
+        assert_eq!(f.fields[2].value, "gpt-4o");
+        assert_eq!(f.fields[3].value, "true");
+
+        f.fields[0].value = "renamed".into();
+        f.fields[1].value = String::new(); // unlimited
+        f.fields[2].value = String::new(); // allow all
+        f.cycle_enabled();
+        assert_eq!(f.fields[3].value, "false");
+
+        let body = f.to_update_body().unwrap();
+        assert_eq!(body.name.as_deref(), Some("renamed"));
+        assert_eq!(body.rate_limit_rpm, None);
+        assert_eq!(body.model_whitelist.as_deref(), Some([].as_slice()));
+        assert_eq!(body.enabled, Some(false));
+    }
+
+    #[test]
+    fn key_form_rejects_non_positive_rpm() {
+        let mut f = KeyForm::create();
+        f.fields[0].value = "x".into();
+        f.fields[1].value = "0".into();
+        assert!(f.to_create_body().unwrap_err().contains("positive"));
     }
 
     #[test]
