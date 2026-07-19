@@ -10,6 +10,9 @@ use ratatui::Frame;
 use super::theme::Theme;
 
 pub fn fill_bg(frame: &mut Frame, area: Rect, theme: &Theme) {
+    // Clear symbols first — Block::style only patches colors and can leave
+    // leftover glyphs from a previous frame when the backend diffs poorly.
+    frame.render_widget(Clear, area);
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.background)),
         area,
@@ -25,11 +28,21 @@ pub fn panel_block<'a>(theme: &Theme, title: impl Into<String>, focused: bool) -
         } else {
             theme.border()
         })
-        .title(Span::styled(format!(" {title} "), theme.title()))
+        .title_top(Span::styled(format!(" {title} "), theme.title()))
         .style(theme.surface())
 }
 
 /// Equal-width metric cards across `area`.
+///
+/// Layout (recommended `Constraint::Length(3)`):
+/// ```text
+/// ┌ HEALTH ──┐
+/// │    ok    │
+/// └──────────┘
+/// ```
+/// Titles are forced to the **top** border via `title_top`. The inner area is
+/// cleared + surface-filled so under-drawn panels cannot ghost through empty
+/// rows when the strip is taller than 3.
 pub fn metric_strip(
     frame: &mut Frame,
     area: Rect,
@@ -39,26 +52,50 @@ pub fn metric_strip(
     if items.is_empty() || area.width < 8 {
         return;
     }
-    let constraints: Vec<Constraint> = items.iter().map(|_| Constraint::Ratio(1, items.len() as u32)).collect();
+    let constraints: Vec<Constraint> = items
+        .iter()
+        .map(|_| Constraint::Ratio(1, items.len() as u32))
+        .collect();
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(constraints)
         .split(area);
     for (i, (label, value, style)) in items.iter().enumerate() {
+        let cell = cols[i];
+        // Reset every cell so nothing from a lower panel / prior frame bleeds in.
+        frame.render_widget(Clear, cell);
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(theme.border())
-            .title(Span::styled(format!(" {label} "), theme.muted()))
+            // Explicit top — never inherit a bottom title_position.
+            .title_top(Span::styled(format!(" {label} "), theme.muted()))
             .style(theme.surface());
-        let inner = block.inner(cols[i]);
-        frame.render_widget(block, cols[i]);
+        let inner = block.inner(cell);
+        frame.render_widget(block, cell);
+
+        // Paint the full inner rectangle (Block only styles, does not blank
+        // symbols on rows the Paragraph does not touch).
+        frame.render_widget(Block::default().style(theme.surface()), inner);
+
+        // Vertically center a single-line value when the card is taller than 3.
+        let value_area = if inner.height > 1 {
+            Rect {
+                x: inner.x,
+                y: inner.y + (inner.height.saturating_sub(1)) / 2,
+                width: inner.width,
+                height: 1,
+            }
+        } else {
+            inner
+        };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 value.clone(),
                 style.add_modifier(Modifier::BOLD),
             )))
             .alignment(Alignment::Center),
-            inner,
+            value_area,
         );
     }
 }
@@ -122,7 +159,7 @@ pub fn modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .title(Span::styled(format!(" {title} "), theme.title()))
+        .title_top(Span::styled(format!(" {title} "), theme.title()))
         .style(theme.surface());
     let inner = block.inner(area);
     frame.render_widget(block, area);

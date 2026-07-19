@@ -218,7 +218,7 @@ fn draw_overview(frame: &mut Frame, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(3), // metric cards: title / value / bottom
             Constraint::Length(10),
             Constraint::Min(4),
         ])
@@ -966,7 +966,7 @@ fn draw_usage(frame: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(3), // metric cards: title / value / bottom
             Constraint::Length(9),
             Constraint::Min(5),
         ])
@@ -2198,7 +2198,7 @@ fn draw_provider_add_chooser(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.border_active())
-        .title(Span::styled(" Add provider ", theme.title()))
+        .title_top(Span::styled(" Add provider ", theme.title()))
         .style(theme.surface());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2343,7 +2343,7 @@ fn form_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.border_active())
-        .title(Span::styled(format!(" {title} "), theme.title()))
+        .title_top(Span::styled(format!(" {title} "), theme.title()))
         .style(theme.surface());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2452,7 +2452,7 @@ fn draw_route_wizard(frame: &mut Frame, theme: &Theme, w: &super::forms::RouteWi
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.border_active())
-        .title(Span::styled(format!(" {title} "), theme.title()))
+        .title_top(Span::styled(format!(" {title} "), theme.title()))
         .style(theme.surface());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2590,7 +2590,7 @@ fn draw_oauth_flow(frame: &mut Frame, theme: &Theme, f: &super::forms::OauthFlow
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.border_active())
-        .title(Span::styled(title, theme.title()))
+        .title_top(Span::styled(title, theme.title()))
         .style(theme.surface());
     let inner = block.inner(area);
     frame.render_widget(block, area);
