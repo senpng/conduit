@@ -73,8 +73,13 @@ async fn run_loop(
     app: &mut App,
     rx: &mut mpsc::UnboundedReceiver<msg::Msg>,
 ) -> Result<()> {
+    // Drives spinner animation + OAuth polling; input no longer rides on it.
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Async key/resize stream so input is handled the instant it arrives
+    // (previously keys were polled only on the 200ms tick → sluggish typing).
+    let mut events = EventStream::new();
 
     loop {
         terminal.draw(|f| draw::draw(f, app))?;
@@ -90,18 +95,24 @@ async fn run_loop(
                     app.apply_msg(msg);
                 }
             }
-            _ = tick.tick() => {
-                // Poll crossterm without blocking the async runtime too long.
-                while crossterm::event::poll(Duration::from_millis(0))? {
-                    if let Event::Key(key) = crossterm::event::read()? {
-                        if key.kind != KeyEventKind::Press {
-                            continue;
-                        }
-                        if let Some(action) = map_key(&app.mode, app.tab, key) {
-                            app.handle_action(action);
+            maybe_event = events.next() => {
+                match maybe_event {
+                    Some(Ok(Event::Key(key))) => {
+                        if key.kind == KeyEventKind::Press {
+                            if let Some(action) = map_key(&app.mode, app.tab, key) {
+                                app.handle_action(action);
+                            }
                         }
                     }
+                    // Resize / focus / paste / mouse: redraw happens next loop.
+                    Some(Ok(_)) => {}
+                    // Read error or stream end: stop the console.
+                    Some(Err(_)) | None => {
+                        app.should_quit = true;
+                    }
                 }
+            }
+            _ = tick.tick() => {
                 app.handle_action(action::Action::Tick);
             }
         }
