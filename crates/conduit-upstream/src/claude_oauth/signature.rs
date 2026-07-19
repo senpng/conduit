@@ -302,4 +302,77 @@ mod tests {
         assert_eq!(betas, vec!["foo-beta", "bar"]);
         assert!(out.get("betas").is_none());
     }
+
+    /// Claude Code may re-send assistant history that went through our SSE encoder.
+    /// That encoder stamps `gpt#conduit` on thinking blocks — which OAuth sanitize drops.
+    /// Edit/tool_use blocks in the same message must survive so multi-turn tool context stays.
+    #[test]
+    fn drops_gpt_conduit_thinking_but_keeps_edit_tool_use() {
+        let body = json!({
+            "messages": [
+                {"role": "assistant", "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "I will edit event.rs",
+                        "signature": "gpt#conduit"
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_edit1",
+                        "name": "Edit",
+                        "input": {
+                            "file_path": "crates/conduitctl/src/tui/event.rs",
+                            "old_string": "old",
+                            "new_string": "new"
+                        }
+                    }
+                ]},
+                {"role": "user", "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_edit1",
+                        "content": "Error editing file"
+                    }
+                ]}
+            ]
+        });
+        let out = sanitize_claude_messages_for_claude_upstream(body);
+        let assistant = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            assistant.len(),
+            1,
+            "gpt#conduit thinking should be dropped, Edit kept: {assistant:?}"
+        );
+        assert_eq!(assistant[0]["type"], "tool_use");
+        assert_eq!(assistant[0]["name"], "Edit");
+        assert_eq!(
+            assistant[0]["input"]["file_path"],
+            "crates/conduitctl/src/tui/event.rs"
+        );
+        // tool_result turn preserved
+        assert_eq!(out["messages"][1]["content"][0]["type"], "tool_result");
+    }
+
+    #[test]
+    fn drops_entire_assistant_turn_if_only_invalid_thinking() {
+        // If a turn was thinking-only and signature is gpt#conduit, the whole
+        // assistant message is removed — multi-turn context loses that step.
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "hmm", "signature": "gpt#conduit"}
+                ]},
+                {"role": "user", "content": "continue"}
+            ]
+        });
+        let out = sanitize_claude_messages_for_claude_upstream(body);
+        let roles: Vec<&str> = out["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, vec!["user", "user"]);
+    }
 }

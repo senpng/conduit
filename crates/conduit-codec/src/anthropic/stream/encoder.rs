@@ -38,6 +38,11 @@ pub struct AnthropicStreamEncoder {
     text_index: i32,
     thinking_started: bool,
     thinking_index: i32,
+    /// True once a `signature_delta` was emitted for the open thinking block
+    /// (Anthropic-native path). When set, closing the block must **not** stamp
+    /// [`GPT_THINKING_SIGNATURE`] — that would poison multi-turn OAuth history
+    /// (sanitize drops `gpt#conduit` thinking on the next request).
+    thinking_signature_emitted: bool,
     next_block_index: u32,
     /// OpenAI tool_calls index → Anthropic content block index.
     tool_block_indexes: BTreeMap<u32, u32>,
@@ -60,6 +65,7 @@ impl AnthropicStreamEncoder {
             text_index: -1,
             thinking_started: false,
             thinking_index: -1,
+            thinking_signature_emitted: false,
             next_block_index: 0,
             tool_block_indexes: BTreeMap::new(),
             tools: BTreeMap::new(),
@@ -154,10 +160,7 @@ impl AnthropicStreamEncoder {
                 self.text_started = false;
                 self.text_index = -1;
             } else if self.thinking_started && self.thinking_index == idx as i32 {
-                out.push(signature_delta(idx, GPT_THINKING_SIGNATURE));
-                out.push(content_block_stop(idx));
-                self.thinking_started = false;
-                self.thinking_index = -1;
+                self.emit_thinking_stop(idx, &mut out);
             } else if let Some((oi, acc)) = self
                 .tools
                 .iter_mut()
@@ -183,11 +186,14 @@ impl AnthropicStreamEncoder {
             }
         }
 
-        // Signature delta
+        // Signature delta (Anthropic-native thinking close path)
         if let Some(BlockDelta::SignatureDelta { signature }) = &chunk.delta {
             if self.thinking_started {
                 let idx = self.thinking_index.max(0) as u32;
-                out.push(signature_delta(idx, signature));
+                if !signature.is_empty() {
+                    out.push(signature_delta(idx, signature));
+                    self.thinking_signature_emitted = true;
+                }
             }
         }
 
@@ -430,6 +436,8 @@ impl AnthropicStreamEncoder {
         let idx = self.thinking_index as u32;
         out.push(thinking_block_start(idx));
         self.thinking_started = true;
+        // New thinking block — wait for a real signature or synthesize on stop.
+        self.thinking_signature_emitted = false;
     }
 
     fn stop_text(&mut self, out: &mut Vec<String>) {
@@ -441,15 +449,27 @@ impl AnthropicStreamEncoder {
         self.text_index = -1;
     }
 
+    /// Close an open thinking block.
+    ///
+    /// - Anthropic-native: a real `signature_delta` was already emitted → stop only.
+    /// - OpenAI-style reasoning: no provider signature → stamp
+    ///   [`GPT_THINKING_SIGNATURE`] so multi-turn re-encode can detect GPT provenance.
+    fn emit_thinking_stop(&mut self, idx: u32, out: &mut Vec<String>) {
+        if !self.thinking_signature_emitted {
+            out.push(signature_delta(idx, GPT_THINKING_SIGNATURE));
+        }
+        out.push(content_block_stop(idx));
+        self.thinking_started = false;
+        self.thinking_index = -1;
+        self.thinking_signature_emitted = false;
+    }
+
     fn stop_thinking(&mut self, out: &mut Vec<String>) {
         if !self.thinking_started {
             return;
         }
         let idx = self.thinking_index as u32;
-        out.push(signature_delta(idx, GPT_THINKING_SIGNATURE));
-        out.push(content_block_stop(idx));
-        self.thinking_started = false;
-        self.thinking_index = -1;
+        self.emit_thinking_stop(idx, out);
     }
 
     fn close_open_blocks(&mut self, out: &mut Vec<String>) {
@@ -829,8 +849,50 @@ mod tests {
             .collect();
         let joined = frames.join("");
         assert!(joined.contains("thinking_delta"));
+        // OpenAI-style reasoning has no provider signature → synthesize gpt#conduit.
         assert!(joined.contains("gpt#conduit"));
         assert!(joined.contains("text_delta"));
+    }
+
+    #[test]
+    fn anthropic_native_thinking_signature_not_overwritten_on_stop() {
+        let real_sig = "EAB4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg=";
+        let mut enc = AnthropicStreamEncoder::new("msg_1", "claude-sonnet-4");
+        let start = CanonicalChunk {
+            block_kind: Some(BlockKind::Thinking),
+            ..Default::default()
+        };
+        let delta = CanonicalChunk::thinking_delta("plan");
+        let sig = CanonicalChunk {
+            delta: Some(BlockDelta::SignatureDelta {
+                signature: real_sig.into(),
+            }),
+            ..Default::default()
+        };
+        let block_stop = CanonicalChunk::default();
+        let frames: Vec<_> = enc
+            .push(&start)
+            .into_iter()
+            .chain(enc.push(&delta))
+            .chain(enc.push(&sig))
+            .chain(enc.push(&block_stop))
+            .chain(enc.push(&finish(FinishReason::Stop)))
+            .collect();
+        let joined = frames.join("");
+        assert!(
+            joined.contains(real_sig),
+            "upstream signature must pass through:\n{joined}"
+        );
+        assert!(
+            !joined.contains("gpt#conduit"),
+            "must not stamp gpt#conduit after a real signature:\n{joined}"
+        );
+        // Only one signature_delta event type occurrence in SSE (plus JSON type field).
+        assert_eq!(
+            joined.matches("\"type\":\"signature_delta\"").count(),
+            1,
+            "expected single signature_delta:\n{joined}"
+        );
     }
 
     #[test]
