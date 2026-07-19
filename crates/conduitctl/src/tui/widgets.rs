@@ -21,9 +21,20 @@ pub fn fill_bg(frame: &mut Frame, area: Rect, theme: &Theme) {
 }
 
 pub fn panel_block<'a>(theme: &Theme, title: impl Into<String>, focused: bool) -> Block<'a> {
+    panel_block_borders(theme, title, focused, Borders::ALL)
+}
+
+/// Like [`panel_block`] but with selectable borders — use to join side-by-side
+/// panels without a double vertical line (left: ALL, right: TOP|RIGHT|BOTTOM).
+pub fn panel_block_borders<'a>(
+    theme: &Theme,
+    title: impl Into<String>,
+    focused: bool,
+    borders: Borders,
+) -> Block<'a> {
     let title = title.into();
     Block::default()
-        .borders(Borders::ALL)
+        .borders(borders)
         .border_style(if focused {
             theme.border_active()
         } else {
@@ -173,7 +184,7 @@ pub struct ContributionCell {
     pub date: String,
     pub request_count: u64,
     pub total_usd: f64,
-    /// 0.0..=1.0 relative to peak cost in the window.
+    /// 0.0..=1.0 relative to peak metric in the window (cost or tokens).
     pub intensity: f64,
 }
 
@@ -181,10 +192,12 @@ pub struct ContributionCell {
 ///
 /// Mirrors tokscale `build_contribution_graph_for_today`: start on the Sunday
 /// on or before (today − 364 days), fill every day through today (zeros when
-/// missing), intensity = cost / max_cost.
+/// missing). Intensity is relative to peak **tokens** when `heat_by_tokens`,
+/// otherwise peak **cost**.
 pub fn build_contribution_weeks(
     by_day: &[(String, u64, u64, f64)],
     today_ymd: &str,
+    heat_by_tokens: bool,
 ) -> Vec<[Option<ContributionCell>; 7]> {
     let Some(today) = parse_ymd(today_ymd) else {
         return Vec::new();
@@ -202,11 +215,19 @@ pub fn build_contribution_weeks(
     for (d, r, t, c) in by_day {
         map.insert(d.as_str(), (*r, *t, *c));
     }
-    let max_cost = by_day
-        .iter()
-        .map(|(_, _, _, c)| *c)
-        .fold(0.0_f64, f64::max)
-        .max(1e-12);
+    let max_metric = if heat_by_tokens {
+        by_day
+            .iter()
+            .map(|(_, _, t, _)| *t as f64)
+            .fold(0.0_f64, f64::max)
+            .max(1e-12)
+    } else {
+        by_day
+            .iter()
+            .map(|(_, _, _, c)| *c)
+            .fold(0.0_f64, f64::max)
+            .max(1e-12)
+    };
 
     let mut weeks: Vec<[Option<ContributionCell>; 7]> = Vec::new();
     let mut col = [const { None }; 7];
@@ -217,9 +238,10 @@ pub fn build_contribution_weeks(
 
     loop {
         let date = format!("{y:04}-{m:02}-{d:02}");
-        let (r, _t, c) = map.get(date.as_str()).copied().unwrap_or((0, 0, 0.0));
-        let intensity = if c > 0.0 {
-            (c / max_cost).clamp(0.0, 1.0)
+        let (r, t, c) = map.get(date.as_str()).copied().unwrap_or((0, 0, 0.0));
+        let metric = if heat_by_tokens { t as f64 } else { c };
+        let intensity = if metric > 0.0 {
+            (metric / max_metric).clamp(0.0, 1.0)
         } else {
             0.0
         };
@@ -705,7 +727,7 @@ mod heatmap_tests {
 
     #[test]
     fn contribution_weeks_cover_year() {
-        let weeks = build_contribution_weeks(&[], "2026-07-20");
+        let weeks = build_contribution_weeks(&[], "2026-07-20", false);
         // ~52–53 weeks from start Sunday through today.
         assert!(weeks.len() >= 52, "got {}", weeks.len());
         assert!(weeks.len() <= 54, "got {}", weeks.len());

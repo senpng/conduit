@@ -267,14 +267,16 @@ impl<'a> UsageRepo<'a> {
         })
     }
 
-    /// Aggregate spend by downstream key for a calendar period (`YYYY-MM`).
+    /// Aggregate spend by downstream key.
     ///
-    /// Period is matched on the ISO timestamp prefix (`ts LIKE 'YYYY-MM%'`).
+    /// * `period` = `YYYY-MM` — match ISO timestamp prefix (`ts LIKE 'YYYY-MM%'`).
+    /// * `period` = `"all"` — no time filter (lifetime totals).
     #[instrument(skip(self))]
     pub async fn summary_period(&self, period: &str) -> Result<Vec<UsageSummaryRow>, StoreError> {
-        let pattern = format!("{period}%");
-        let rows = sqlx::query(
-            r#"SELECT
+        let rows = match period_like(period) {
+            Some(pattern) => {
+                sqlx::query(
+                    r#"SELECT
                    COALESCE(downstream_key_id, '') AS downstream_key_id,
                    COUNT(*) AS request_count,
                    COALESCE(SUM(cost_usd), 0) AS total_usd,
@@ -285,10 +287,28 @@ impl<'a> UsageRepo<'a> {
                WHERE ts LIKE ?
                GROUP BY COALESCE(downstream_key_id, '')
                ORDER BY total_usd DESC"#,
-        )
-        .bind(&pattern)
-        .fetch_all(self.pool)
-        .await
+                )
+                .bind(&pattern)
+                .fetch_all(self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    r#"SELECT
+                   COALESCE(downstream_key_id, '') AS downstream_key_id,
+                   COUNT(*) AS request_count,
+                   COALESCE(SUM(cost_usd), 0) AS total_usd,
+                   COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                   COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                   COALESCE(SUM(total_tokens), 0) AS total_tokens
+               FROM usage_records
+               GROUP BY COALESCE(downstream_key_id, '')
+               ORDER BY total_usd DESC"#,
+                )
+                .fetch_all(self.pool)
+                .await
+            }
+        }
         .map_err(|e| StoreError::Sqlx(e.to_string()))?;
 
         Ok(rows
@@ -362,19 +382,18 @@ impl<'a> UsageRepo<'a> {
             .collect())
     }
 
-    /// Daily rollup for a calendar period (`YYYY-MM`), UTC day from `ts` prefix.
+    /// Daily rollup for a calendar period (`YYYY-MM`) or all-time (`"all"`).
     ///
-    /// Optional `key_id` scopes to one downstream key. Used by the Usage UI so
-    /// "Daily spend" is period-accurate (not limited to the recent-N records window).
+    /// UTC day from `ts` prefix. Optional `key_id` scopes to one downstream key.
     #[instrument(skip(self))]
     pub async fn summary_by_day(
         &self,
         period: &str,
         key_id: Option<&str>,
     ) -> Result<Vec<UsageDayRow>, StoreError> {
-        let pattern = format!("{period}%");
-        let rows = match key_id {
-            Some(kid) => {
+        let pattern = period_like(period);
+        let rows = match (pattern.as_deref(), key_id) {
+            (Some(pat), Some(kid)) => {
                 sqlx::query(
                     r#"SELECT
                        substr(ts, 1, 10) AS day,
@@ -386,12 +405,12 @@ impl<'a> UsageRepo<'a> {
                    GROUP BY substr(ts, 1, 10)
                    ORDER BY day ASC"#,
                 )
-                .bind(&pattern)
+                .bind(pat)
                 .bind(kid)
                 .fetch_all(self.pool)
                 .await
             }
-            None => {
+            (Some(pat), None) => {
                 sqlx::query(
                     r#"SELECT
                        substr(ts, 1, 10) AS day,
@@ -403,7 +422,37 @@ impl<'a> UsageRepo<'a> {
                    GROUP BY substr(ts, 1, 10)
                    ORDER BY day ASC"#,
                 )
-                .bind(&pattern)
+                .bind(pat)
+                .fetch_all(self.pool)
+                .await
+            }
+            (None, Some(kid)) => {
+                sqlx::query(
+                    r#"SELECT
+                       substr(ts, 1, 10) AS day,
+                       COUNT(*) AS request_count,
+                       COALESCE(SUM(cost_usd), 0) AS total_usd,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                   FROM usage_records
+                   WHERE downstream_key_id = ?
+                   GROUP BY substr(ts, 1, 10)
+                   ORDER BY day ASC"#,
+                )
+                .bind(kid)
+                .fetch_all(self.pool)
+                .await
+            }
+            (None, None) => {
+                sqlx::query(
+                    r#"SELECT
+                       substr(ts, 1, 10) AS day,
+                       COUNT(*) AS request_count,
+                       COALESCE(SUM(cost_usd), 0) AS total_usd,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                   FROM usage_records
+                   GROUP BY substr(ts, 1, 10)
+                   ORDER BY day ASC"#,
+                )
                 .fetch_all(self.pool)
                 .await
             }
@@ -421,16 +470,16 @@ impl<'a> UsageRepo<'a> {
             .collect())
     }
 
-    /// Model/alias rollup for a calendar period (`YYYY-MM`).
+    /// Model/alias rollup for a calendar period (`YYYY-MM`) or all-time (`"all"`).
     #[instrument(skip(self))]
     pub async fn summary_by_model(
         &self,
         period: &str,
         key_id: Option<&str>,
     ) -> Result<Vec<UsageModelRow>, StoreError> {
-        let pattern = format!("{period}%");
-        let rows = match key_id {
-            Some(kid) => {
+        let pattern = period_like(period);
+        let rows = match (pattern.as_deref(), key_id) {
+            (Some(pat), Some(kid)) => {
                 sqlx::query(
                     r#"SELECT
                        COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
@@ -444,12 +493,12 @@ impl<'a> UsageRepo<'a> {
                             provider_kind
                    ORDER BY total_usd DESC"#,
                 )
-                .bind(&pattern)
+                .bind(pat)
                 .bind(kid)
                 .fetch_all(self.pool)
                 .await
             }
-            None => {
+            (Some(pat), None) => {
                 sqlx::query(
                     r#"SELECT
                        COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
@@ -463,7 +512,41 @@ impl<'a> UsageRepo<'a> {
                             provider_kind
                    ORDER BY total_usd DESC"#,
                 )
-                .bind(&pattern)
+                .bind(pat)
+                .fetch_all(self.pool)
+                .await
+            }
+            (None, Some(kid)) => {
+                sqlx::query(
+                    r#"SELECT
+                       COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
+                       provider_kind,
+                       COUNT(*) AS request_count,
+                       COALESCE(SUM(cost_usd), 0) AS total_usd,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                   FROM usage_records
+                   WHERE downstream_key_id = ?
+                   GROUP BY COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
+                            provider_kind
+                   ORDER BY total_usd DESC"#,
+                )
+                .bind(kid)
+                .fetch_all(self.pool)
+                .await
+            }
+            (None, None) => {
+                sqlx::query(
+                    r#"SELECT
+                       COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
+                       provider_kind,
+                       COUNT(*) AS request_count,
+                       COALESCE(SUM(cost_usd), 0) AS total_usd,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                   FROM usage_records
+                   GROUP BY COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
+                            provider_kind
+                   ORDER BY total_usd DESC"#,
+                )
                 .fetch_all(self.pool)
                 .await
             }
@@ -482,15 +565,16 @@ impl<'a> UsageRepo<'a> {
             .collect())
     }
 
-    /// Model breakdown nested under each downstream key for a calendar period.
+    /// Model breakdown nested under each downstream key for a period / all-time.
     #[instrument(skip(self))]
     pub async fn summary_by_key_model(
         &self,
         period: &str,
     ) -> Result<Vec<UsageKeyModelRow>, StoreError> {
-        let pattern = format!("{period}%");
-        let rows = sqlx::query(
-            r#"SELECT
+        let rows = match period_like(period) {
+            Some(pattern) => {
+                sqlx::query(
+                    r#"SELECT
                    COALESCE(downstream_key_id, '') AS downstream_key_id,
                    COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
                    provider_kind,
@@ -503,10 +587,30 @@ impl<'a> UsageRepo<'a> {
                         COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
                         provider_kind
                ORDER BY total_usd DESC"#,
-        )
-        .bind(&pattern)
-        .fetch_all(self.pool)
-        .await
+                )
+                .bind(&pattern)
+                .fetch_all(self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    r#"SELECT
+                   COALESCE(downstream_key_id, '') AS downstream_key_id,
+                   COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
+                   provider_kind,
+                   COUNT(*) AS request_count,
+                   COALESCE(SUM(cost_usd), 0) AS total_usd,
+                   COALESCE(SUM(total_tokens), 0) AS total_tokens
+               FROM usage_records
+               GROUP BY COALESCE(downstream_key_id, ''),
+                        COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
+                        provider_kind
+               ORDER BY total_usd DESC"#,
+                )
+                .fetch_all(self.pool)
+                .await
+            }
+        }
         .map_err(|e| StoreError::Sqlx(e.to_string()))?;
 
         Ok(rows
@@ -522,15 +626,16 @@ impl<'a> UsageRepo<'a> {
             .collect())
     }
 
-    /// Model breakdown nested under each UTC day for a calendar period.
+    /// Model breakdown nested under each UTC day for a period / all-time.
     #[instrument(skip(self))]
     pub async fn summary_by_day_model(
         &self,
         period: &str,
     ) -> Result<Vec<UsageDayModelRow>, StoreError> {
-        let pattern = format!("{period}%");
-        let rows = sqlx::query(
-            r#"SELECT
+        let rows = match period_like(period) {
+            Some(pattern) => {
+                sqlx::query(
+                    r#"SELECT
                    substr(ts, 1, 10) AS day,
                    COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
                    provider_kind,
@@ -543,10 +648,30 @@ impl<'a> UsageRepo<'a> {
                         COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
                         provider_kind
                ORDER BY day ASC, total_usd DESC"#,
-        )
-        .bind(&pattern)
-        .fetch_all(self.pool)
-        .await
+                )
+                .bind(&pattern)
+                .fetch_all(self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    r#"SELECT
+                   substr(ts, 1, 10) AS day,
+                   COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
+                   provider_kind,
+                   COUNT(*) AS request_count,
+                   COALESCE(SUM(cost_usd), 0) AS total_usd,
+                   COALESCE(SUM(total_tokens), 0) AS total_tokens
+               FROM usage_records
+               GROUP BY substr(ts, 1, 10),
+                        COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
+                        provider_kind
+               ORDER BY day ASC, total_usd DESC"#,
+                )
+                .fetch_all(self.pool)
+                .await
+            }
+        }
         .map_err(|e| StoreError::Sqlx(e.to_string()))?;
 
         Ok(rows
@@ -562,16 +687,16 @@ impl<'a> UsageRepo<'a> {
             .collect())
     }
 
-    /// Period-level outcome / latency aggregates (success rate + avg TTFB).
+    /// Outcome / latency aggregates for a period or all-time (`"all"`).
     #[instrument(skip(self))]
     pub async fn summary_outcome(
         &self,
         period: &str,
         key_id: Option<&str>,
     ) -> Result<UsageOutcomeSummary, StoreError> {
-        let pattern = format!("{period}%");
-        let row = match key_id {
-            Some(kid) => {
+        let pattern = period_like(period);
+        let row = match (pattern.as_deref(), key_id) {
+            (Some(pat), Some(kid)) => {
                 sqlx::query(
                     r#"SELECT
                            COUNT(*) AS request_count,
@@ -582,12 +707,12 @@ impl<'a> UsageRepo<'a> {
                        FROM usage_records
                        WHERE ts LIKE ? AND downstream_key_id = ?"#,
                 )
-                .bind(&pattern)
+                .bind(pat)
                 .bind(kid)
                 .fetch_one(self.pool)
                 .await
             }
-            None => {
+            (Some(pat), None) => {
                 sqlx::query(
                     r#"SELECT
                            COUNT(*) AS request_count,
@@ -598,7 +723,35 @@ impl<'a> UsageRepo<'a> {
                        FROM usage_records
                        WHERE ts LIKE ?"#,
                 )
-                .bind(&pattern)
+                .bind(pat)
+                .fetch_one(self.pool)
+                .await
+            }
+            (None, Some(kid)) => {
+                sqlx::query(
+                    r#"SELECT
+                           COUNT(*) AS request_count,
+                           COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
+                               AS success_count,
+                           AVG(ttfb_ms) AS avg_ttfb_ms,
+                           AVG(duration_ms) AS avg_duration_ms
+                       FROM usage_records
+                       WHERE downstream_key_id = ?"#,
+                )
+                .bind(kid)
+                .fetch_one(self.pool)
+                .await
+            }
+            (None, None) => {
+                sqlx::query(
+                    r#"SELECT
+                           COUNT(*) AS request_count,
+                           COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
+                               AS success_count,
+                           AVG(ttfb_ms) AS avg_ttfb_ms,
+                           AVG(duration_ms) AS avg_duration_ms
+                       FROM usage_records"#,
+                )
                 .fetch_one(self.pool)
                 .await
             }
@@ -621,16 +774,16 @@ impl<'a> UsageRepo<'a> {
         })
     }
 
-    /// Provider health rollup for a calendar period.
+    /// Provider health rollup for a period or all-time (`"all"`).
     #[instrument(skip(self))]
     pub async fn summary_by_provider(
         &self,
         period: &str,
         key_id: Option<&str>,
     ) -> Result<Vec<UsageProviderRow>, StoreError> {
-        let pattern = format!("{period}%");
-        let rows = match key_id {
-            Some(kid) => {
+        let pattern = period_like(period);
+        let rows = match (pattern.as_deref(), key_id) {
+            (Some(pat), Some(kid)) => {
                 sqlx::query(
                     r#"SELECT
                        COALESCE(NULLIF(provider_id, ''), '(unknown)') AS provider_id,
@@ -640,18 +793,19 @@ impl<'a> UsageRepo<'a> {
                            AS success_count,
                        AVG(ttfb_ms) AS avg_ttfb_ms,
                        AVG(duration_ms) AS avg_duration_ms,
-                       COALESCE(SUM(cost_usd), 0) AS total_usd
+                       COALESCE(SUM(cost_usd), 0) AS total_usd,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens
                    FROM usage_records
                    WHERE ts LIKE ? AND downstream_key_id = ?
                    GROUP BY COALESCE(NULLIF(provider_id, ''), '(unknown)'), provider_kind
-                   ORDER BY request_count DESC"#,
+                   ORDER BY total_tokens DESC"#,
                 )
-                .bind(&pattern)
+                .bind(pat)
                 .bind(kid)
                 .fetch_all(self.pool)
                 .await
             }
-            None => {
+            (Some(pat), None) => {
                 sqlx::query(
                     r#"SELECT
                        COALESCE(NULLIF(provider_id, ''), '(unknown)') AS provider_id,
@@ -661,13 +815,54 @@ impl<'a> UsageRepo<'a> {
                            AS success_count,
                        AVG(ttfb_ms) AS avg_ttfb_ms,
                        AVG(duration_ms) AS avg_duration_ms,
-                       COALESCE(SUM(cost_usd), 0) AS total_usd
+                       COALESCE(SUM(cost_usd), 0) AS total_usd,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens
                    FROM usage_records
                    WHERE ts LIKE ?
                    GROUP BY COALESCE(NULLIF(provider_id, ''), '(unknown)'), provider_kind
-                   ORDER BY request_count DESC"#,
+                   ORDER BY total_tokens DESC"#,
                 )
-                .bind(&pattern)
+                .bind(pat)
+                .fetch_all(self.pool)
+                .await
+            }
+            (None, Some(kid)) => {
+                sqlx::query(
+                    r#"SELECT
+                       COALESCE(NULLIF(provider_id, ''), '(unknown)') AS provider_id,
+                       provider_kind,
+                       COUNT(*) AS request_count,
+                       COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
+                           AS success_count,
+                       AVG(ttfb_ms) AS avg_ttfb_ms,
+                       AVG(duration_ms) AS avg_duration_ms,
+                       COALESCE(SUM(cost_usd), 0) AS total_usd,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                   FROM usage_records
+                   WHERE downstream_key_id = ?
+                   GROUP BY COALESCE(NULLIF(provider_id, ''), '(unknown)'), provider_kind
+                   ORDER BY total_tokens DESC"#,
+                )
+                .bind(kid)
+                .fetch_all(self.pool)
+                .await
+            }
+            (None, None) => {
+                sqlx::query(
+                    r#"SELECT
+                       COALESCE(NULLIF(provider_id, ''), '(unknown)') AS provider_id,
+                       provider_kind,
+                       COUNT(*) AS request_count,
+                       COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
+                           AS success_count,
+                       AVG(ttfb_ms) AS avg_ttfb_ms,
+                       AVG(duration_ms) AS avg_duration_ms,
+                       COALESCE(SUM(cost_usd), 0) AS total_usd,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                   FROM usage_records
+                   GROUP BY COALESCE(NULLIF(provider_id, ''), '(unknown)'), provider_kind
+                   ORDER BY total_tokens DESC"#,
+                )
                 .fetch_all(self.pool)
                 .await
             }
@@ -693,9 +888,19 @@ impl<'a> UsageRepo<'a> {
                     avg_ttfb_ms: r.get::<Option<f64>, _>("avg_ttfb_ms"),
                     avg_duration_ms: r.get::<Option<f64>, _>("avg_duration_ms"),
                     total_usd: r.get("total_usd"),
+                    total_tokens: r.get::<i64, _>("total_tokens") as u64,
                 }
             })
             .collect())
+    }
+}
+
+/// `YYYY-MM%` for calendar months; `None` for all-time (`period == "all"`).
+fn period_like(period: &str) -> Option<String> {
+    if period.eq_ignore_ascii_case("all") {
+        None
+    } else {
+        Some(format!("{period}%"))
     }
 }
 
@@ -773,6 +978,7 @@ pub struct UsageProviderRow {
     pub avg_ttfb_ms: Option<f64>,
     pub avg_duration_ms: Option<f64>,
     pub total_usd: f64,
+    pub total_tokens: u64,
 }
 
 async fn insert_row_on<'e, E>(ex: E, row: &UsageRecordRow) -> Result<(), StoreError>
@@ -1290,6 +1496,14 @@ mod tests {
         let k2 = sum.iter().find(|s| s.downstream_key_id == "k2").unwrap();
         assert_eq!(k2.request_count, 1);
         assert!((k2.total_usd - 0.5).abs() < 1e-9);
+
+        // Lifetime includes the June outlier (k1 +$9).
+        let all = repo.summary_period("all").await.unwrap();
+        assert_eq!(all.len(), 2);
+        let k1_all = all.iter().find(|s| s.downstream_key_id == "k1").unwrap();
+        assert_eq!(k1_all.request_count, 3);
+        assert!((k1_all.total_usd - 12.5).abs() < 1e-9);
+        assert_eq!(k1_all.total_tokens, 7);
 
         let by_day = repo.summary_by_day("2026-07", None).await.unwrap();
         assert_eq!(by_day.len(), 3); // 01, 15, 20

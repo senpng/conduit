@@ -14,8 +14,8 @@ use super::theme::Theme;
 use super::widgets::{
     build_contribution_weeks, detail_kv, display_width, empty_state, fill_bg, format_local_time,
     format_local_time_short, format_tokens, format_usd, health_badge, heat_level, keybind_line,
-    modal, month_day_spends, pad_display, panel_block, ratio_bar, spinner, truncate,
-    ContributionCell, DaySpend,
+    modal, month_day_spends, pad_display, panel_block, panel_block_borders, ratio_bar, spinner,
+    truncate, ContributionCell, DaySpend,
 };
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -223,76 +223,198 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
 // ── Overview dashboard ──────────────────────────────────────────────────────
 
 fn draw_overview(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
-    let cols = Layout::default()
+    // Adaptive layout — month chart is the primary short-range signal, so it
+    // gets more vertical room than the rank lists (multi-row day bars).
+    let h = area.height;
+    let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // metric cards
-            // Heatmap (7 rows) + top models (2 lines/row) need vertical room.
-            Constraint::Length(12),
-            Constraint::Min(4),
-        ])
+        .constraints(if h >= 36 {
+            [
+                Constraint::Length(3),  // metrics
+                Constraint::Length(11), // contribution + top models
+                Constraint::Length(14), // month token bars (full width)
+                Constraint::Min(4),     // provider health
+            ]
+        } else if h >= 28 {
+            [
+                Constraint::Length(3),
+                Constraint::Length(10),
+                Constraint::Length(12),
+                Constraint::Min(3),
+            ]
+        } else {
+            [
+                Constraint::Length(3),
+                Constraint::Length(9),
+                Constraint::Length(10),
+                Constraint::Min(2),
+            ]
+        })
         .split(area);
 
-    // Metric strip
+    draw_overview_metrics(frame, rows[0], app);
+
+    // One horizontal split recipe for both chart rows so left edges line up
+    // and side-by-side panels share a single vertical border (no double line).
+    let pair = |area: Rect| {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(area)
+    };
+    let mid = pair(rows[1]);
+    draw_overview_contribution(frame, mid[0], app);
+    draw_overview_top_models(frame, mid[1], app);
+
+    // Same 58/42 split as the contribution row so the month chart frame
+    // lines up with the heatmap (model mix fills the right column).
+    let lower = pair(rows[2]);
+    draw_overview_month_spark(frame, lower[0], lower[1], app);
+
+    draw_overview_provider_health(frame, rows[3], app);
+}
+
+/// Left column of an overview pair.
+fn overview_left_block(theme: &Theme, title: impl Into<String>, focused: bool) -> Block<'static> {
+    panel_block_borders(theme, title, focused, Borders::ALL)
+}
+
+/// Right column of an overview pair (independent full border — avoids a
+/// missing shared edge when left-panel content paints up to the join).
+fn overview_right_block(theme: &Theme, title: impl Into<String>) -> Block<'static> {
+    panel_block_borders(theme, title, false, Borders::ALL)
+}
+
+/// Re-paint the right border column of a `Borders::ALL` panel after content.
+/// Long Paragraph lines can still clobber the border cell on some terminals;
+/// this forces the edge back on top.
+fn restore_right_border(frame: &mut Frame, area: Rect, border_style: Style) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let x = area.x + area.width - 1;
+    let buf = frame.buffer_mut();
+    let bottom = area.y + area.height - 1;
+    for y in area.y..=bottom {
+        let Some(cell) = buf.cell_mut((x, y)) else {
+            continue;
+        };
+        let sym = if y == area.y {
+            "┐"
+        } else if y == bottom {
+            "┘"
+        } else {
+            "│"
+        };
+        cell.set_symbol(sym);
+        cell.set_style(border_style);
+    }
+}
+
+fn draw_overview_metrics(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
     let health = app
         .health
         .as_ref()
         .map(|h| h.status.clone())
         .unwrap_or_else(|| "down".into());
-    let (cost, reqs, period, spend_style) = match app.usage_summary.as_ref() {
-        Some(s) => (
-            format_usd(s.total_usd),
-            s.request_count.to_string(),
-            s.period.clone(),
-            theme.success(),
-        ),
-        None => (
-            "…".into(),
-            "…".into(),
-            app.usage_period.clone(),
-            theme.muted(),
-        ),
-    };
+    let (cost, tokens, period_label, success, ttfb, latency, tok_style, spend_style, ok_style) =
+        match app.overview_summary.as_ref() {
+            Some(s) => {
+                let success = format!("{:.0}%", s.success_rate * 100.0);
+                let ttfb = s
+                    .avg_ttfb_ms
+                    .map(|ms| format!("{ms:.0}ms"))
+                    .unwrap_or_else(|| "—".into());
+                let latency = s
+                    .avg_duration_ms
+                    .map(|ms| {
+                        if ms >= 1000.0 {
+                            format!("{:.1}s", ms / 1000.0)
+                        } else {
+                            format!("{ms:.0}ms")
+                        }
+                    })
+                    .unwrap_or_else(|| "—".into());
+                let ok_style = if s.success_rate >= 0.99 {
+                    theme.success()
+                } else if s.success_rate >= 0.95 {
+                    theme.warning()
+                } else {
+                    theme.error()
+                };
+                let period_label = if s.period.eq_ignore_ascii_case("all") {
+                    "all-time".into()
+                } else {
+                    s.period.clone()
+                };
+                (
+                    format_usd(s.total_usd),
+                    format_tokens(summary_total_tokens(s)),
+                    period_label,
+                    success,
+                    ttfb,
+                    latency,
+                    theme.warning(),
+                    theme.success(),
+                    ok_style,
+                )
+            }
+            None => (
+                "…".into(),
+                "…".into(),
+                "all-time".into(),
+                "…".into(),
+                "…".into(),
+                "…".into(),
+                theme.muted(),
+                theme.muted(),
+                theme.muted(),
+            ),
+        };
 
+    // Tokens first among usage KPIs (lifetime); $ / latency stay secondary.
     super::widgets::metric_strip(
         frame,
-        cols[0],
+        area,
         theme,
         &[
-            ("HEALTH", health, if app.daemon_ok() { theme.success() } else { theme.error() }),
-            ("PROVIDERS", app.providers.len().to_string(), theme.accent_bold()),
-            ("ROUTES", app.routes.len().to_string(), theme.accent_bold()),
             (
-                "KEYS",
-                app.keys.len().to_string(),
-                theme.accent_bold(),
+                "HEALTH",
+                health,
+                if app.daemon_ok() {
+                    theme.success()
+                } else {
+                    theme.error()
+                },
             ),
-            ("SPEND", format!("{cost} · {period}"), spend_style),
-            ("REQS", reqs, theme.warning()),
+            (
+                "TOKENS",
+                format!("{tokens} · {period_label}"),
+                tok_style,
+            ),
+            ("SPEND", cost, spend_style),
+            ("SUCCESS", success, ok_style),
+            ("TTFB", ttfb, Style::default().fg(theme.chart[4])),
+            ("LAT", latency, Style::default().fg(theme.chart[2])),
         ],
     );
-
-    // Daily heatmap + top models — give models enough width for names.
-    let mid = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(cols[1]);
-
-    draw_overview_sparkline(frame, mid[0], app);
-    draw_overview_top_models(frame, mid[1], app);
-
-    // Quick start + resource list
-    draw_overview_quickstart(frame, cols[2], app);
 }
 
-fn draw_overview_sparkline(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_overview_contribution(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
-    let block = panel_block(theme, "Contribution graph  ·  last 52 weeks", true);
+    let block = overview_left_block(
+        theme,
+        "Contribution  ·  52 weeks  ·  tokens by day",
+        true,
+    );
+    let border_style = theme.border_active();
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    // Clear inner so long lines never ghost into the right border cell.
+    frame.render_widget(Clear, inner);
 
-    let rows = usage_trailing_tuples(app);
+    let rows = overview_trailing_tuples(app);
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -301,68 +423,611 @@ fn draw_overview_sparkline(frame: &mut Frame, area: Rect, app: &App) {
             )),
             inner,
         );
+        restore_right_border(frame, area, border_style);
         return;
     }
-    let lines = contribution_graph_lines(theme, &rows, None, "t · by-day");
+    let lines = contribution_graph_lines(theme, &rows, None, "", true);
     frame.render_widget(Paragraph::new(lines), inner);
+    restore_right_border(frame, area, border_style);
+}
+
+/// Current-month **token** chart + optional model mix (right column).
+///
+/// `chart_area` / `mix_area` share the same horizontal split as Contribution /
+/// Top models so the month chart frame matches the heatmap width.
+fn draw_overview_month_spark(frame: &mut Frame, chart_area: Rect, mix_area: Rect, app: &App) {
+    let theme = &app.theme;
+    let period = super::forms::current_period();
+    let model_mix = month_model_token_mix(app, &period);
+
+    draw_month_token_chart(frame, chart_area, app, &period);
+    if model_mix.is_empty() {
+        // Keep a right panel so the split still mirrors the row above.
+        let block = overview_right_block(theme, format!("Models  {period}  ·  no traffic"));
+        frame.render_widget(block, mix_area);
+    } else {
+        draw_month_model_mix(frame, mix_area, &model_mix, &period, theme);
+    }
+}
+
+fn draw_month_token_chart(frame: &mut Frame, area: Rect, app: &App, period: &str) {
+    let theme = &app.theme;
+    let block = panel_block(
+        theme,
+        format!("This month  {period}  ·  tokens by day"),
+        true,
+    );
+    let border_style = theme.border_active();
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Clear, inner);
+
+    let days = month_day_spends(period, &overview_by_day_tuples(app));
+    let month_tok: u64 = days.iter().map(|d| d.total_tokens).sum();
+    let active_n = days
+        .iter()
+        .filter(|d| d.total_tokens > 0 || d.request_count > 0)
+        .count();
+    let peak_day = days
+        .iter()
+        .max_by(|a, b| a.total_tokens.cmp(&b.total_tokens));
+    let peak_tok = peak_day.map(|d| d.total_tokens).unwrap_or(0);
+    let peak_idx = peak_day.and_then(|p| days.iter().position(|d| d.date == p.date));
+    let peak_share = if month_tok > 0 {
+        peak_tok as f64 / month_tok as f64 * 100.0
+    } else {
+        0.0
+    };
+    let avg_active = if active_n > 0 {
+        month_tok / active_n as u64
+    } else {
+        0
+    };
+
+    if active_n == 0 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "  no tokens this calendar month",
+                theme.subtle(),
+            )),
+            inner,
+        );
+        restore_right_border(frame, area, border_style);
+        return;
+    }
+
+    let show_callout = inner.height >= 5;
+    let header_h: u16 = if show_callout { 2 } else { 1 };
+    let body_h = inner.height.saturating_sub(header_h + 1).max(1); // + axis
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(header_h),
+            Constraint::Length(body_h),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let header_w = chunks[0].width as usize;
+    let line1 = format!(
+        "  tok {}  active {active_n}/{}  avg/active {}",
+        format_tokens(month_tok),
+        days.len(),
+        format_tokens(avg_active),
+    );
+    let mut header_lines = if display_width(&line1) <= header_w {
+        vec![Line::from(vec![
+            Span::styled("  tok ", theme.subtle()),
+            Span::styled(format!("{}  ", format_tokens(month_tok)), theme.warning()),
+            Span::styled(
+                format!("active {active_n}/{}  ", days.len()),
+                theme.accent_bold(),
+            ),
+            Span::styled(
+                format!("avg/active {}", format_tokens(avg_active)),
+                theme.subtle(),
+            ),
+        ])]
+    } else {
+        vec![Line::from(Span::styled(
+            truncate(&line1, header_w),
+            theme.subtle(),
+        ))]
+    };
+    if show_callout {
+        if let Some(p) = peak_day {
+            let dom = p.date.get(8..10).unwrap_or("??");
+            let req = if p.request_count > 0 {
+                format!("  · {} req", p.request_count)
+            } else {
+                String::new()
+            };
+            let line2 = format!(
+                "  peak day {dom}  {}  {peak_share:.0}% of month{req}",
+                format_tokens(p.total_tokens),
+            );
+            if display_width(&line2) <= header_w {
+                header_lines.push(Line::from(vec![
+                    Span::styled("  peak ", theme.subtle()),
+                    Span::styled(format!("day {dom}"), theme.accent_bold()),
+                    Span::styled(
+                        format!("  {}  ", format_tokens(p.total_tokens)),
+                        theme.muted(),
+                    ),
+                    Span::styled(
+                        format!("{peak_share:.0}% of month"),
+                        if peak_share >= 80.0 {
+                            theme.warning()
+                        } else {
+                            theme.subtle()
+                        },
+                    ),
+                    Span::styled(req, theme.subtle()),
+                ]));
+            } else {
+                header_lines.push(Line::from(Span::styled(
+                    truncate(&line2, header_w),
+                    theme.muted(),
+                )));
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(header_lines), chunks[0]);
+
+    let n = days.len().max(1);
+    // Keep a right gutter so baseline glyphs never sit on the border cell.
+    let chart_w = chunks[1].width as usize;
+    let label_w = 2usize;
+    let col_w = chart_w.saturating_sub(label_w + 1).max(1);
+    let toks: Vec<f64> = days.iter().map(|d| d.total_tokens as f64).collect();
+
+    draw_day_bar_panel(
+        frame,
+        chunks[1],
+        &toks,
+        n,
+        col_w,
+        "T",
+        theme.chart_color(1),
+        theme,
+        peak_idx,
+    );
+
+    if chunks[2].height > 0 {
+        let axis_w = (chunks[2].width as usize)
+            .saturating_sub(label_w + 1)
+            .max(1);
+        let axis = day_axis_line(n, axis_w.min(col_w), theme, peak_idx);
+        let mut spans = vec![Span::raw("  ")];
+        spans.extend(axis.spans);
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(theme.surface()),
+            chunks[2],
+        );
+    }
+
+    restore_right_border(frame, area, border_style);
+}
+
+/// Right-hand model token share for the calendar month.
+fn draw_month_model_mix(
+    frame: &mut Frame,
+    area: Rect,
+    mix: &[(String, u64)],
+    period: &str,
+    theme: &Theme,
+) {
+    let block = overview_right_block(theme, format!("Models  ·  {period}  ·  tokens"));
+    let border_style = theme.border();
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Clear, inner);
+
+    if mix.is_empty() || inner.width < 8 || inner.height == 0 {
+        frame.render_widget(
+            Paragraph::new(Span::styled("  no model split", theme.subtle())),
+            inner,
+        );
+        restore_right_border(frame, area, border_style);
+        return;
+    }
+
+    let total: u64 = mix.iter().map(|(_, t)| *t).sum::<u64>().max(1);
+    let n = (inner.height as usize).min(mix.len()).min(8);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(n);
+
+    for (i, (name, tok)) in mix.iter().take(n).enumerate() {
+        let pct = *tok as f64 / total as f64 * 100.0;
+        let pct_s = if pct >= 9.95 {
+            format!("{pct:.0}%")
+        } else if pct >= 0.05 {
+            format!("{pct:.1}%")
+        } else if pct > 0.0 {
+            "<0.1%".into()
+        } else {
+            "0%".into()
+        };
+        // Prefer: name  ████░  99%  1.19M
+        let w = inner.width as usize;
+        let tok_s = format_tokens(*tok);
+        let color = theme.chart_color(i);
+        // Budget: " " + name + " " + bar + " " + pct + " " + tok
+        let pct_w = display_width(&pct_s).max(3);
+        let tok_w = display_width(&tok_s).max(3);
+        let fixed = 1 + 1 + 1 + pct_w + 1 + tok_w; // spaces around bar/pct/tok
+        let name_w = w.saturating_sub(fixed + 4).clamp(4, 18);
+        let bar_w = w
+            .saturating_sub(1 + name_w + 1 + 1 + pct_w + 1 + tok_w)
+            .clamp(4, 16);
+        let line = format!(
+            " {} {} {} {}",
+            pad_display(&truncate(name, name_w), name_w),
+            ratio_bar(*tok as f64 / total as f64, bar_w),
+            pad_display(&pct_s, pct_w),
+            tok_s,
+        );
+        lines.push(Line::from(Span::styled(
+            truncate(&line, w),
+            Style::default().fg(color),
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+    restore_right_border(frame, area, border_style);
+}
+
+/// Aggregate model token totals for `YYYY-MM` from `by_day_model`.
+fn month_model_token_mix(app: &App, period: &str) -> Vec<(String, u64)> {
+    let Some(s) = app.overview_summary.as_ref() else {
+        return Vec::new();
+    };
+    let mut map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for m in &s.by_day_model {
+        if m.day.starts_with(period) && m.total_tokens > 0 {
+            *map.entry(m.label.clone()).or_default() += m.total_tokens;
+        }
+    }
+    // Fallback: when day×model rows are missing, use all-time by_model.
+    if map.is_empty() {
+        for m in &s.by_model {
+            if m.total_tokens > 0 {
+                *map.entry(m.label.clone()).or_default() += m.total_tokens;
+            }
+        }
+    }
+    let mut rows: Vec<(String, u64)> = map.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows
+}
+
+/// Multi-row column bars for one series (`$` or tokens), day-aligned.
+fn draw_day_bar_panel(
+    frame: &mut Frame,
+    area: Rect,
+    values: &[f64],
+    n_days: usize,
+    col_w: usize,
+    label: &str,
+    fg: ratatui::style::Color,
+    theme: &Theme,
+    peak_idx: Option<usize>,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let bar_h = area.height as usize;
+    let lines = day_bar_lines(values, col_w, n_days, bar_h, fg, theme, peak_idx);
+    let mut out: Vec<Line> = Vec::with_capacity(lines.len());
+    for (i, mut spark) in lines.into_iter().enumerate() {
+        let prefix = if i == 0 {
+            Span::styled(format!("{label} "), theme.subtle())
+        } else {
+            Span::raw("  ")
+        };
+        let mut spans = vec![prefix];
+        spans.append(&mut spark.spans);
+        out.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(out), area);
+}
+
+/// Inclusive column range `[start, end)` for a calendar day — spreads days
+/// evenly across the full panel width (so the chart looks wide, not left-packed).
+fn day_col_range(day_i: usize, n_days: usize, width: usize) -> (usize, usize) {
+    if n_days == 0 || width == 0 {
+        return (0, 0);
+    }
+    let start = day_i * width / n_days;
+    let end = ((day_i + 1) * width / n_days).max(start + 1).min(width);
+    (start, end)
+}
+
+/// Multi-line column chart: each day is a vertical stack of `█`,
+/// **stretched across the full width** (variable bar width per day).
+fn day_bar_lines(
+    values: &[f64],
+    width: usize,
+    n_days: usize,
+    height: usize,
+    fg: ratatui::style::Color,
+    theme: &Theme,
+    peak_idx: Option<usize>,
+) -> Vec<Line<'static>> {
+    if values.is_empty() || width == 0 || n_days == 0 || height == 0 {
+        return vec![Line::from(Span::styled("—".to_string(), theme.subtle()))];
+    }
+    let max = values.iter().copied().fold(0.0_f64, f64::max).max(1e-12);
+
+    let mut day_vals = vec![0.0_f64; n_days];
+    for (i, &v) in values.iter().enumerate().take(n_days) {
+        day_vals[i] = v;
+    }
+
+    let mut lines = Vec::with_capacity(height);
+    let peak_fg = theme.warning;
+    let base_style = Style::default().fg(fg);
+    let peak_style = Style::default().fg(peak_fg).add_modifier(Modifier::BOLD);
+    let quiet = Style::default().fg(theme.subtle);
+
+    for row in 0..height {
+        let threshold = (height - row) as f64;
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut buf = vec![' '; width];
+        let mut styles = vec![base_style; width];
+
+        for day_i in 0..n_days {
+            let (c0, c1) = day_col_range(day_i, n_days, width);
+            let v = day_vals[day_i];
+            let lv = if v <= 0.0 {
+                0.0
+            } else {
+                ((v / max) * height as f64).clamp(0.5, height as f64)
+            };
+            let is_peak = peak_idx == Some(day_i);
+            let style = if is_peak { peak_style } else { base_style };
+            // Baseline uses ASCII `-` (not box-drawing `┈`) so ambiguous-width
+            // terminals never advance two cells and punch through the right border.
+            let ch = if lv <= 0.0 {
+                if row + 1 == height {
+                    '-'
+                } else {
+                    ' '
+                }
+            } else if lv + 1e-9 >= threshold {
+                '█'
+            } else if lv + 1e-9 >= threshold - 0.5 {
+                '▄'
+            } else {
+                ' '
+            };
+            let st = if lv <= 0.0 && row + 1 == height {
+                quiet
+            } else {
+                style
+            };
+            // Fill the day's slot; leave a 1-col gutter between days when
+            // each day has ≥3 columns so bars read as separate columns.
+            let bar_end = if c1 - c0 >= 3 { c1 - 1 } else { c1 };
+            for x in c0..bar_end {
+                buf[x] = ch;
+                styles[x] = st;
+            }
+        }
+
+        let mut run = String::new();
+        let mut run_st = styles[0];
+        let flush = |run: &mut String, st: Style, out: &mut Vec<Span<'static>>| {
+            if !run.is_empty() {
+                out.push(Span::styled(std::mem::take(run), st));
+            }
+        };
+        for c in 0..width {
+            if styles[c] != run_st {
+                flush(&mut run, run_st, &mut spans);
+                run_st = styles[c];
+            }
+            run.push(buf[c]);
+        }
+        flush(&mut run, run_st, &mut spans);
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// Day numbers under the bars; peak day is emphasized when provided.
+fn day_axis_line(
+    n_days: usize,
+    width: usize,
+    theme: &Theme,
+    peak_idx: Option<usize>,
+) -> Line<'static> {
+    if n_days == 0 || width == 0 {
+        return Line::from("");
+    }
+    let mut buf = vec![' '; width];
+    let mut used = vec![false; width];
+    let mut peak_range: Option<(usize, usize)> = None;
+
+    let step = if width >= n_days * 2 {
+        5usize
+    } else if width >= 20 {
+        5
+    } else {
+        10
+    };
+    let mut ticks: Vec<usize> = (0..n_days)
+        .filter(|i| *i == 0 || (i + 1) % step == 0)
+        .collect();
+    if n_days > 1 {
+        let last = n_days - 1;
+        if !ticks.contains(&last) {
+            ticks.push(last);
+        }
+    }
+    if let Some(p) = peak_idx {
+        if p < n_days && !ticks.contains(&p) {
+            ticks.push(p);
+        }
+    }
+    ticks.sort_by(|a, b| {
+        let rank = |i: usize| {
+            if Some(i) == peak_idx {
+                0
+            } else if i + 1 == n_days {
+                1
+            } else if i == 0 {
+                2
+            } else {
+                3
+            }
+        };
+        rank(*a).cmp(&rank(*b)).then(a.cmp(b))
+    });
+
+    for day_i in ticks {
+        let label = format!("{}", day_i + 1);
+        let (c0, c1) = day_col_range(day_i, n_days, width);
+        let slot = c1 - c0;
+        // Center label in the day's slot when it fits.
+        let start = if label.len() <= slot {
+            c0 + (slot - label.len()) / 2
+        } else {
+            c0.min(width.saturating_sub(label.len()))
+        };
+        let end = start + label.len();
+        if end > width || used[start..end].iter().any(|&u| u) {
+            continue;
+        }
+        for (k, ch) in label.chars().enumerate() {
+            buf[start + k] = ch;
+            used[start + k] = true;
+        }
+        if Some(day_i) == peak_idx {
+            peak_range = Some((start, end));
+        }
+    }
+
+    if let Some((s, e)) = peak_range {
+        let mut spans = Vec::new();
+        if s > 0 {
+            spans.push(Span::styled(
+                buf[..s].iter().collect::<String>(),
+                theme.subtle(),
+            ));
+        }
+        spans.push(Span::styled(
+            buf[s..e].iter().collect::<String>(),
+            theme.accent_bold(),
+        ));
+        if e < width {
+            spans.push(Span::styled(
+                buf[e..].iter().collect::<String>(),
+                theme.subtle(),
+            ));
+        }
+        Line::from(spans)
+    } else {
+        Line::from(Span::styled(
+            buf.into_iter().collect::<String>(),
+            theme.subtle(),
+        ))
+    }
 }
 
 fn draw_overview_top_models(frame: &mut Frame, area: Rect, app: &App) {
+    let mut rows: Vec<(String, f64)> = app
+        .overview_summary
+        .as_ref()
+        .map(|s| {
+            s.by_model
+                .iter()
+                .map(|m| (m.label.clone(), m.total_tokens as f64))
+                .collect()
+        })
+        .unwrap_or_default();
+    rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    draw_overview_rank_bars(
+        frame,
+        area,
+        app,
+        "Top models  ·  tokens  ·  all-time",
+        &rows,
+        "no model tokens",
+        true,
+        true,
+    );
+}
+
+/// Shared name + bar + value layout used by Top models.
+///
+/// When `as_tokens` is true, values are rendered with [`format_tokens`].
+fn draw_overview_rank_bars(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    title: &str,
+    rows: &[(String, f64)],
+    empty_hint: &str,
+    join_left: bool,
+    as_tokens: bool,
+) {
     let theme = &app.theme;
-    let block = panel_block(theme, "Top models", false);
+    let block = if join_left {
+        overview_right_block(theme, title)
+    } else {
+        panel_block(theme, title, false)
+    };
+    let border_style = theme.border();
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    frame.render_widget(Clear, inner);
 
-    let mut models: Vec<&crate::dto::UsageModelEntry> = app
-        .usage_summary
-        .as_ref()
-        .map(|s| s.by_model.iter().collect())
-        .unwrap_or_default();
-    if models.is_empty() {
+    if rows.is_empty() {
         frame.render_widget(
-            Paragraph::new(Span::styled("  —", theme.subtle())),
+            Paragraph::new(Span::styled(format!("  {empty_hint}"), theme.subtle())),
             inner,
         );
+        restore_right_border(frame, area, border_style);
         return;
     }
-    // Highest spend first.
-    models.sort_by(|a, b| {
-        b.total_usd
-            .partial_cmp(&a.total_usd)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
 
-    let max = models
+    let max = rows
         .iter()
-        .map(|m| m.total_usd)
+        .map(|(_, c)| *c)
         .fold(0.0_f64, f64::max)
         .max(1e-9);
 
-    // Each model = name + bar (2 rows) + 1 blank gap. Cost sits in a right
-    // column vertically centered against the name/bar pair.
-    let row_h: u16 = 3;
-    let n = ((inner.height / row_h) as usize).max(1).min(models.len());
+    // Compact: one line per row when short; two-line (name/bar) when tall.
+    let two_line = inner.height >= 8;
+    let row_h: u16 = if two_line { 2 } else { 1 };
+    let n = ((inner.height / row_h) as usize).max(1).min(rows.len()).min(6);
 
-    // Widest cost string among visible rows → fixed right column.
-    let cost_strings: Vec<String> = models
+    let value_strings: Vec<String> = rows
         .iter()
         .take(n)
-        .map(|m| format_usd(m.total_usd))
+        .map(|(_, c)| {
+            if as_tokens {
+                format_tokens(c.round().max(0.0) as u64)
+            } else {
+                format_usd(*c)
+            }
+        })
         .collect();
-    let cost_col = cost_strings
+    let value_col = value_strings
         .iter()
         .map(|s| display_width(s))
         .max()
         .unwrap_or(6)
-        .saturating_add(1) // leading gap before amount
+        .saturating_add(1)
         .clamp(7, 14) as u16;
 
-    for (i, m) in models.iter().take(n).enumerate() {
+    for (i, (name, value)) in rows.iter().take(n).enumerate() {
         let y = inner.y + (i as u16) * row_h;
         if y >= inner.y + inner.height {
             break;
         }
-        let block_h = 2u16.min(inner.y + inner.height - y);
+        let block_h = row_h.min(inner.y + inner.height - y);
         let row = Rect {
             x: inner.x,
             y,
@@ -371,93 +1036,222 @@ fn draw_overview_top_models(frame: &mut Frame, area: Rect, app: &App) {
         };
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(8), Constraint::Length(cost_col)])
+            .constraints([Constraint::Min(8), Constraint::Length(value_col)])
             .split(row);
         let (left, right) = (cols[0], cols[1]);
-
         let color = theme.chart_color(i);
-        let name_w = (left.width as usize).saturating_sub(1).max(4);
-        let name = truncate(&m.label, name_w);
-        let bar_w = (left.width as usize).saturating_sub(1).clamp(4, 48);
 
-        // Left: name on top, bar below.
-        let mut left_lines = vec![Line::from(vec![
-            Span::raw(" "),
-            Span::styled(name, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-        ])];
-        if block_h >= 2 {
-            left_lines.push(Line::from(vec![
+        if two_line && block_h >= 2 {
+            let name_w = (left.width as usize).saturating_sub(1).max(4);
+            let bar_w = (left.width as usize).saturating_sub(1).clamp(4, 48);
+            let left_lines = vec![
+                Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(
+                        truncate(name, name_w),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(
+                        ratio_bar(value / max, bar_w),
+                        Style::default().fg(color),
+                    ),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(left_lines), left);
+            let value_y = right.y + right.height / 2;
+            let value_y = value_y.min(right.y + right.height.saturating_sub(1));
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    value_strings[i].clone(),
+                    theme.muted(),
+                )))
+                .alignment(Alignment::Right),
+                Rect {
+                    x: right.x,
+                    y: value_y,
+                    width: right.width,
+                    height: 1,
+                },
+            );
+        } else {
+            // Single-line: name ··· bar  value
+            let value_s = &value_strings[i];
+            let value_w = display_width(value_s);
+            let budget = (left.width as usize).saturating_sub(2).max(6);
+            let bar_w = (budget / 3).clamp(4, 16);
+            let name_w = budget.saturating_sub(bar_w + 1).max(4);
+            let line = Line::from(vec![
                 Span::raw(" "),
                 Span::styled(
-                    ratio_bar(m.total_usd / max, bar_w),
+                    pad_display(&truncate(name, name_w), name_w),
                     Style::default().fg(color),
                 ),
-            ]));
+                Span::raw(" "),
+                Span::styled(
+                    ratio_bar(value / max, bar_w),
+                    Style::default().fg(color),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), left);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(value_s.clone(), theme.muted())))
+                    .alignment(Alignment::Right),
+                right,
+            );
+            let _ = value_w;
         }
-        frame.render_widget(Paragraph::new(left_lines), left);
-
-        // Right: amount vertically centered against the name+bar block.
-        // For height 2, (h-1)/2 floors to the name row; use rounded-half so the
-        // dollar sits on the optical mid-line (bar row) of the pair.
-        let cost = &cost_strings[i];
-        let cost_y = right.y + (right.height as u16) / 2;
-        let cost_y = cost_y.min(right.y + right.height.saturating_sub(1));
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(cost.clone(), theme.muted())))
-                .alignment(Alignment::Right),
-            Rect {
-                x: right.x,
-                y: cost_y,
-                width: right.width,
-                height: 1,
-            },
-        );
     }
+    restore_right_border(frame, area, border_style);
 }
 
-fn draw_overview_quickstart(frame: &mut Frame, area: Rect, app: &App) {
+/// Provider health strip: success bar + TTFB + token volume (all-time).
+///
+/// Layout (adaptive width):
+/// ```text
+///  name            kind        ████████  99%   42ms   3.4M
+/// ```
+fn draw_overview_provider_health(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
-    let block = panel_block(theme, "Operator path", false);
+    let block = panel_block(
+        theme,
+        "Provider health  ·  all-time  ·  tokens  ·  5 Usage → by provider",
+        false,
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let text = vec![
-        Line::from(vec![
-            Span::styled("  1. ", theme.accent_bold()),
-            Span::raw("Providers  "),
-            Span::styled("a", theme.key_hint()),
-            Span::styled(" add via API key or OAuth (Claude / Codex / Grok)", theme.muted()),
-        ]),
-        Line::from(vec![
-            Span::styled("  2. ", theme.accent_bold()),
-            Span::raw("Routes     "),
-            Span::styled("a", theme.key_hint()),
-            Span::styled(" wizard maps client model → upstream", theme.muted()),
-        ]),
-        Line::from(vec![
-            Span::styled("  3. ", theme.accent_bold()),
-            Span::raw("Keys       "),
-            Span::styled("a", theme.key_hint()),
-            Span::styled(" issue downstream bearer for clients", theme.muted()),
-        ]),
-        Line::from(vec![
-            Span::styled("  4. ", theme.accent_bold()),
-            Span::raw("Usage      "),
-            Span::styled("watch spend · ", theme.muted()),
-            Span::styled("6", theme.key_hint()),
-            Span::styled(" Pricing overrides", theme.muted()),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            format!(
-                "  {} providers · {} routes · {} keys · filter lists with /",
-                app.providers.len(),
-                app.routes.len(),
-                app.keys.len()
+
+    let mut providers: Vec<&crate::dto::UsageProviderEntry> = app
+        .overview_summary
+        .as_ref()
+        .map(|s| s.by_provider.iter().collect())
+        .unwrap_or_default();
+
+    if providers.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("  tip  ", theme.accent_bold()),
+                Span::styled(
+                    "2 add provider · 3 route · 4 key · 5 usage  ·  ? help  ·  T theme",
+                    theme.muted(),
+                ),
+            ])),
+            inner,
+        );
+        return;
+    }
+
+    // Health-first: worst success rate, then slowest TTFB, then most tokens
+    // (so a low-traffic flaky provider still surfaces before a healthy giant).
+    providers.sort_by(|a, b| {
+        a.success_rate
+            .partial_cmp(&b.success_rate)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                let ta = a.avg_ttfb_ms.unwrap_or(f64::MAX);
+                let tb = b.avg_ttfb_ms.unwrap_or(f64::MAX);
+                tb.partial_cmp(&ta).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| b.total_tokens.cmp(&a.total_tokens))
+    });
+
+    let width = inner.width as usize;
+    // Fixed-ish columns; name absorbs leftover.
+    // "  name…  kind  ████████  99%  120ms  3.45M"
+    let kind_w = 10usize;
+    let bar_w = if width >= 72 {
+        12
+    } else if width >= 56 {
+        8
+    } else {
+        6
+    };
+    let pct_w = 5usize; // " 99%"
+    let ttfb_w = 6usize; // "120ms"
+    let tok_w = 7usize; // " 3.45M"
+    let fixed = 1 + kind_w + 1 + bar_w + 1 + pct_w + 1 + ttfb_w + 1 + tok_w + 1;
+    let name_w = width.saturating_sub(fixed).clamp(8, 22);
+
+    let show_header = inner.height >= 3 && width >= 48;
+    let body_h = if show_header {
+        inner.height.saturating_sub(1)
+    } else {
+        inner.height
+    };
+    let n = (body_h as usize).max(1).min(providers.len()).min(8);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(n + 1);
+    if show_header {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(pad_display("name", name_w), theme.muted()),
+            Span::raw(" "),
+            Span::styled(pad_display("kind", kind_w), theme.muted()),
+            Span::raw(" "),
+            Span::styled(pad_display("success", bar_w + 1 + pct_w), theme.muted()),
+            Span::raw(" "),
+            Span::styled(pad_display("ttfb", ttfb_w), theme.muted()),
+            Span::raw(" "),
+            Span::styled(
+                pad_display(&truncate("tokens", tok_w), tok_w),
+                theme.muted(),
             ),
-            theme.subtle(),
-        )),
-    ];
-    frame.render_widget(Paragraph::new(text), inner);
+        ]));
+    }
+
+    for p in providers.iter().take(n) {
+        let name = resolve_provider_name(&app.providers, &p.provider_id);
+        let kind = if p.provider_kind.is_empty() {
+            "—"
+        } else {
+            p.provider_kind.as_str()
+        };
+        let rate = p.success_rate.clamp(0.0, 1.0);
+        let rate_style = if rate >= 0.99 {
+            theme.success()
+        } else if rate >= 0.95 {
+            theme.warning()
+        } else {
+            theme.error()
+        };
+        let ttfb = p
+            .avg_ttfb_ms
+            .map(|ms| {
+                if ms >= 1000.0 {
+                    format!("{:.1}s", ms / 1000.0)
+                } else {
+                    format!("{ms:.0}ms")
+                }
+            })
+            .unwrap_or_else(|| "—".into());
+        let tok = format_tokens(p.total_tokens);
+        let bar = ratio_bar(rate, bar_w);
+        let pct = format!("{:>3.0}%", rate * 100.0);
+
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                pad_display(&truncate(&name, name_w), name_w),
+                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(pad_display(&truncate(kind, kind_w), kind_w), theme.subtle()),
+            Span::raw(" "),
+            Span::styled(bar, rate_style),
+            Span::raw(" "),
+            Span::styled(pad_display(&pct, pct_w), rate_style),
+            Span::raw(" "),
+            Span::styled(pad_display(&truncate(&ttfb, ttfb_w), ttfb_w), theme.muted()),
+            Span::raw(" "),
+            Span::styled(
+                pad_display(&truncate(&tok, tok_w), tok_w),
+                theme.warning(),
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 // ── Master / detail lists ───────────────────────────────────────────────────
@@ -1036,6 +1830,18 @@ fn draw_master_detail_keys(frame: &mut Frame, area: Rect, app: &App) {
 
 // ── Usage dashboard ─────────────────────────────────────────────────────────
 
+/// Period token total for KPI cards. Prefer top-level `total_tokens`; fall back
+/// to day/entry sums for older daemons that omit the field.
+fn summary_total_tokens(s: &crate::dto::UsageSummaryView) -> u64 {
+    if s.total_tokens > 0 {
+        s.total_tokens
+    } else if !s.by_day.is_empty() {
+        s.by_day.iter().map(|d| d.total_tokens).sum()
+    } else {
+        s.entries.iter().map(|e| e.total_tokens).sum()
+    }
+}
+
 fn draw_usage(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     // Heatmap needs ~10 rows (legend + 7 weekdays + pad); give it room.
@@ -1048,7 +1854,7 @@ fn draw_usage(frame: &mut Frame, area: Rect, app: &App) {
         ])
         .split(area);
 
-    let (period, total_usd, requests, success_pct, avg_ttfb) =
+    let (period, total_usd, tokens, success_pct, avg_ttfb) =
         if let Some(s) = &app.usage_summary {
             let ttfb = s
                 .avg_ttfb_ms
@@ -1057,12 +1863,18 @@ fn draw_usage(frame: &mut Frame, area: Rect, app: &App) {
             (
                 s.period.clone(),
                 s.total_usd,
-                s.request_count,
+                format_tokens(summary_total_tokens(s)),
                 format!("{:.0}%", s.success_rate * 100.0),
                 ttfb,
             )
         } else {
-            (app.usage_period.clone(), 0.0, 0, "—".into(), "—".into())
+            (
+                app.usage_period.clone(),
+                0.0,
+                "…".into(),
+                "—".into(),
+                "—".into(),
+            )
         };
 
     super::widgets::metric_strip(
@@ -1072,7 +1884,7 @@ fn draw_usage(frame: &mut Frame, area: Rect, app: &App) {
         &[
             ("PERIOD", period, theme.accent_bold()),
             ("COST", format_usd(total_usd), theme.success()),
-            ("REQUESTS", requests.to_string(), theme.warning()),
+            ("TOKENS", tokens, theme.warning()),
             ("SUCCESS", success_pct, theme.success()),
             ("TTFB", avg_ttfb, Style::default().fg(theme.chart[4])),
         ],
@@ -1082,22 +1894,54 @@ fn draw_usage(frame: &mut Frame, area: Rect, app: &App) {
     draw_usage_detail(frame, chunks[2], app);
 }
 
+fn day_tuples_from_summary(
+    s: &crate::dto::UsageSummaryView,
+) -> Vec<(String, u64, u64, f64)> {
+    s.by_day
+        .iter()
+        .map(|d| {
+            (
+                d.day.clone(),
+                d.request_count,
+                d.total_tokens,
+                d.total_usd,
+            )
+        })
+        .collect()
+}
+
+fn trailing_tuples_from_summary(
+    s: &crate::dto::UsageSummaryView,
+) -> Vec<(String, u64, u64, f64)> {
+    let src = if s.by_day_trailing.is_empty() {
+        s.by_day.as_slice()
+    } else {
+        s.by_day_trailing.as_slice()
+    };
+    src.iter()
+        .map(|d| {
+            (
+                d.day.clone(),
+                d.request_count,
+                d.total_tokens,
+                d.total_usd,
+            )
+        })
+        .collect()
+}
+
 fn usage_by_day_tuples(app: &App) -> Vec<(String, u64, u64, f64)> {
     app.usage_summary
         .as_ref()
-        .map(|s| {
-            s.by_day
-                .iter()
-                .map(|d| {
-                    (
-                        d.day.clone(),
-                        d.request_count,
-                        d.total_tokens,
-                        d.total_usd,
-                    )
-                })
-                .collect()
-        })
+        .map(day_tuples_from_summary)
+        .unwrap_or_default()
+}
+
+/// Overview daily rows (`period=all` includes full history; month chart filters).
+fn overview_by_day_tuples(app: &App) -> Vec<(String, u64, u64, f64)> {
+    app.overview_summary
+        .as_ref()
+        .map(day_tuples_from_summary)
         .unwrap_or_default()
 }
 
@@ -1105,23 +1949,14 @@ fn usage_by_day_tuples(app: &App) -> Vec<(String, u64, u64, f64)> {
 fn usage_trailing_tuples(app: &App) -> Vec<(String, u64, u64, f64)> {
     app.usage_summary
         .as_ref()
-        .map(|s| {
-            let src = if s.by_day_trailing.is_empty() {
-                s.by_day.as_slice()
-            } else {
-                s.by_day_trailing.as_slice()
-            };
-            src.iter()
-                .map(|d| {
-                    (
-                        d.day.clone(),
-                        d.request_count,
-                        d.total_tokens,
-                        d.total_usd,
-                    )
-                })
-                .collect()
-        })
+        .map(trailing_tuples_from_summary)
+        .unwrap_or_default()
+}
+
+fn overview_trailing_tuples(app: &App) -> Vec<(String, u64, u64, f64)> {
+    app.overview_summary
+        .as_ref()
+        .map(trailing_tuples_from_summary)
         .unwrap_or_default()
 }
 
@@ -1151,7 +1986,7 @@ fn draw_usage_heatmap(frame: &mut Frame, area: Rect, app: &App) {
 
     let block = panel_block(
         theme,
-        format!("Contribution graph  ·  52 weeks  ·  period cards: {period}"),
+        format!("Contribution graph  ·  52 weeks  ·  tokens  ·  period cards: {period}"),
         true,
     );
     let inner = block.inner(area);
@@ -1170,7 +2005,7 @@ fn draw_usage_heatmap(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "t · by-day".into()
     };
-    let lines = contribution_graph_lines(theme, &rows, selected_date.as_deref(), &idle);
+    let lines = contribution_graph_lines(theme, &rows, selected_date.as_deref(), &idle, true);
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -1183,14 +2018,18 @@ fn draw_usage_heatmap(frame: &mut Frame, area: Rect, app: &App) {
 ///   Fri …
 ///   Less · ██ ██ ██ ██ More
 /// ```
+///
+/// When `heat_by_tokens` is true, cell intensity follows daily tokens;
+/// otherwise it follows daily spend.
 fn contribution_graph_lines(
     theme: &Theme,
     by_day: &[(String, u64, u64, f64)],
     selected_date: Option<&str>,
     idle_hint: &str,
+    heat_by_tokens: bool,
 ) -> Vec<Line<'static>> {
     let today = today_ymd();
-    let weeks = build_contribution_weeks(by_day, &today);
+    let weeks = build_contribution_weeks(by_day, &today, heat_by_tokens);
     if weeks.is_empty() {
         return vec![Line::from(Span::styled("  (no graph)", theme.subtle()))];
     }
@@ -1348,13 +2187,25 @@ fn draw_usage_detail(frame: &mut Frame, area: Rect, app: &App) {
         .map(|s| s.total_usd)
         .unwrap_or(0.0)
         .max(1e-12);
+    let period_tokens = app
+        .usage_summary
+        .as_ref()
+        .map(summary_total_tokens)
+        .unwrap_or(0)
+        .max(1);
 
     match app.usage_detail {
         UsageDetail::Recent => draw_usage_recent(frame, area, app, sel),
-        UsageDetail::ByModel => draw_usage_by_model(frame, area, app, sel, period_total),
-        UsageDetail::ByKey => draw_usage_by_key(frame, area, app, sel, period_total),
+        UsageDetail::ByModel => {
+            draw_usage_by_model(frame, area, app, sel, period_total, period_tokens)
+        }
+        UsageDetail::ByKey => {
+            draw_usage_by_key(frame, area, app, sel, period_total, period_tokens)
+        }
         UsageDetail::ByDay => draw_usage_by_day(frame, area, app, sel, period_total),
-        UsageDetail::ByProvider => draw_usage_by_provider(frame, area, app, sel),
+        UsageDetail::ByProvider => {
+            draw_usage_by_provider(frame, area, app, sel, period_tokens)
+        }
     }
 }
 
@@ -1466,6 +2317,7 @@ fn draw_usage_by_model(
     app: &App,
     sel: usize,
     period_total: f64,
+    period_tokens: u64,
 ) {
     let theme = &app.theme;
     let filtered = app.filtered_indices();
@@ -1502,23 +2354,31 @@ fn draw_usage_by_model(
     sort_usage_items(&mut items, app.usage_sort);
     let sel = sel.min(items.len().saturating_sub(1));
     let (list_area, detail_area, show_detail) = usage_master_detail(area);
+    let max_tok = items.iter().map(|x| x.4).max().unwrap_or(1).max(1) as f64;
     let max_cost = items
         .iter()
         .map(|x| x.3)
         .fold(0.0_f64, f64::max)
         .max(1e-9);
+    // Token-first list: reserve room for bar + tokens + cost + reqs.
     let label_w = (list_area.width as usize)
-        .saturating_sub(28)
-        .clamp(12, 36);
+        .saturating_sub(36)
+        .clamp(10, 32);
     let bar_w = (list_area.width as usize)
-        .saturating_sub(label_w + 22)
-        .clamp(6, 24);
+        .saturating_sub(label_w + 28)
+        .clamp(6, 20);
 
+    let bar_by_cost = matches!(app.usage_sort, super::app::UsageSort::Cost);
     let lines: Vec<Line> = items
         .iter()
         .enumerate()
-        .map(|(i, (_, label, _, cost, _tok, req))| {
+        .map(|(i, (_, label, _, cost, tok, req))| {
             let mark = if i == sel { "▶ " } else { "  " };
+            let ratio = if bar_by_cost {
+                *cost / max_cost
+            } else {
+                *tok as f64 / max_tok
+            };
             Line::from(vec![
                 Span::styled(
                     format!("{mark}{}", pad_display(label, label_w)),
@@ -1529,18 +2389,26 @@ fn draw_usage_by_model(
                     },
                 ),
                 Span::styled(
-                    ratio_bar(cost / max_cost, bar_w),
+                    ratio_bar(ratio, bar_w),
                     Style::default().fg(theme.chart_color(i)),
                 ),
                 Span::styled(
-                    format!(" {}  {}r", format_usd(*cost), req),
+                    format!(" {:>6}", format_tokens(*tok)),
+                    theme.warning(),
+                ),
+                Span::styled(
+                    format!("  {}  {}r", format_usd(*cost), req),
                     theme.muted(),
                 ),
             ])
         })
         .collect();
     frame.render_widget(
-        Paragraph::new(lines).block(panel_block(theme, "By model", true)),
+        Paragraph::new(lines).block(panel_block(
+            theme,
+            format!("By model  ·  tokens  ·  sort={}", app.usage_sort.label()),
+            true,
+        )),
         list_area,
     );
 
@@ -1552,7 +2420,8 @@ fn draw_usage_by_model(
             items[sel].4,
             items[sel].5,
         );
-        let share = (cost / period_total) * 100.0;
+        let cost_share = (cost / period_total) * 100.0;
+        let tok_share = tok as f64 / period_tokens as f64 * 100.0;
         draw_usage_rollup_detail(
             frame,
             detail_area,
@@ -1569,18 +2438,26 @@ fn draw_usage_by_model(
                         provider.clone()
                     },
                 ),
-                ("requests", req.to_string()),
                 ("tokens", format_tokens(tok)),
+                ("tok share", format!("{tok_share:.1}% of period")),
+                ("requests", req.to_string()),
                 ("cost", format_usd(cost)),
-                ("share", format!("{share:.1}% of period")),
+                ("$ share", format!("{cost_share:.1}% of period")),
             ],
-            cost / max_cost,
+            tok as f64 / max_tok,
             &[], // model pane is already the list
         );
     }
 }
 
-fn draw_usage_by_key(frame: &mut Frame, area: Rect, app: &App, sel: usize, period_total: f64) {
+fn draw_usage_by_key(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    sel: usize,
+    period_total: f64,
+    period_tokens: u64,
+) {
     let theme = &app.theme;
     let filtered = app.filtered_indices();
     // (display_name, key_id, cost, tokens, reqs, prompt, completion)
@@ -1629,23 +2506,30 @@ fn draw_usage_by_key(frame: &mut Frame, area: Rect, app: &App, sel: usize, perio
     }
     let sel = sel.min(items.len().saturating_sub(1));
     let (list_area, detail_area, show_detail) = usage_master_detail(area);
+    let max_tok = items.iter().map(|x| x.3).max().unwrap_or(1).max(1) as f64;
     let max_cost = items
         .iter()
         .map(|x| x.2)
         .fold(0.0_f64, f64::max)
         .max(1e-9);
     let label_w = (list_area.width as usize)
-        .saturating_sub(28)
-        .clamp(12, 40);
+        .saturating_sub(36)
+        .clamp(10, 36);
     let bar_w = (list_area.width as usize)
-        .saturating_sub(label_w + 22)
-        .clamp(6, 24);
+        .saturating_sub(label_w + 28)
+        .clamp(6, 20);
 
+    let bar_by_cost = matches!(app.usage_sort, super::app::UsageSort::Cost);
     let lines: Vec<Line> = items
         .iter()
         .enumerate()
-        .map(|(i, (name, _id, cost, _, req, _, _))| {
+        .map(|(i, (name, _id, cost, tok, req, _, _))| {
             let mark = if i == sel { "▶ " } else { "  " };
+            let ratio = if bar_by_cost {
+                *cost / max_cost
+            } else {
+                *tok as f64 / max_tok
+            };
             Line::from(vec![
                 Span::styled(
                     format!("{mark}{}", pad_display(name, label_w)),
@@ -1656,18 +2540,26 @@ fn draw_usage_by_key(frame: &mut Frame, area: Rect, app: &App, sel: usize, perio
                     },
                 ),
                 Span::styled(
-                    ratio_bar(cost / max_cost, bar_w),
+                    ratio_bar(ratio, bar_w),
                     Style::default().fg(theme.chart_color(i)),
                 ),
                 Span::styled(
-                    format!(" {}  {}r", format_usd(*cost), req),
+                    format!(" {:>6}", format_tokens(*tok)),
+                    theme.warning(),
+                ),
+                Span::styled(
+                    format!("  {}  {}r", format_usd(*cost), req),
                     theme.muted(),
                 ),
             ])
         })
         .collect();
     frame.render_widget(
-        Paragraph::new(lines).block(panel_block(theme, "By key", true)),
+        Paragraph::new(lines).block(panel_block(
+            theme,
+            format!("By key  ·  tokens  ·  sort={}", app.usage_sort.label()),
+            true,
+        )),
         list_area,
     );
 
@@ -1681,14 +2573,9 @@ fn draw_usage_by_key(frame: &mut Frame, area: Rect, app: &App, sel: usize, perio
             items[sel].5,
             items[sel].6,
         );
-        let share = (cost / period_total) * 100.0;
-        let heading = if id.is_empty() {
-            name.clone()
-        } else if name == id || name.starts_with("(deleted)") {
-            name.clone()
-        } else {
-            name.clone()
-        };
+        let cost_share = (cost / period_total) * 100.0;
+        let tok_share = tok as f64 / period_tokens as f64 * 100.0;
+        let heading = name.clone();
         let models = models_for_key(app, id);
         draw_usage_rollup_detail(
             frame,
@@ -1706,14 +2593,15 @@ fn draw_usage_by_key(frame: &mut Frame, area: Rect, app: &App, sel: usize, perio
                         id.clone()
                     },
                 ),
-                ("requests", req.to_string()),
-                ("prompt tok", prompt.to_string()),
-                ("completion", completion.to_string()),
                 ("total tok", format_tokens(tok)),
+                ("tok share", format!("{tok_share:.1}% of period")),
+                ("prompt tok", format_tokens(prompt)),
+                ("completion", format_tokens(completion)),
+                ("requests", req.to_string()),
                 ("cost", format_usd(cost)),
-                ("share", format!("{share:.1}% of period")),
+                ("$ share", format!("{cost_share:.1}% of period")),
             ],
-            cost / max_cost,
+            tok as f64 / max_tok,
             &models,
         );
     }
@@ -1800,12 +2688,18 @@ fn resolve_provider_name(providers: &[crate::dto::ProviderView], id: &str) -> St
     }
 }
 
-/// Provider health pane: success rate + TTFB (not cost-only).
-fn draw_usage_by_provider(frame: &mut Frame, area: Rect, app: &App, sel: usize) {
+/// Provider pane: health (success / TTFB) **plus** token volume.
+fn draw_usage_by_provider(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    sel: usize,
+    period_tokens: u64,
+) {
     let theme = &app.theme;
     let filtered = app.filtered_indices();
-    // (display_name, provider_id, kind, reqs, success_rate, ttfb, cost)
-    let mut rows_data: Vec<(String, String, String, u64, f64, Option<f64>, f64)> = app
+    // (name, id, kind, reqs, success_rate, ttfb, cost, tokens)
+    let mut rows_data: Vec<(String, String, String, u64, f64, Option<f64>, f64, u64)> = app
         .usage_summary
         .as_ref()
         .map(|s| {
@@ -1821,6 +2715,7 @@ fn draw_usage_by_provider(frame: &mut Frame, area: Rect, app: &App, sel: usize) 
                             p.success_rate,
                             p.avg_ttfb_ms,
                             p.total_usd,
+                            p.total_tokens,
                         )
                     })
                 })
@@ -1836,14 +2731,12 @@ fn draw_usage_by_provider(frame: &mut Frame, area: Rect, app: &App, sel: usize) 
         empty_state(frame, area, theme, "By provider", hint);
         return;
     }
-    // Prefer success rate / TTFB ordering for health; cost sort still available.
     match app.usage_sort {
         super::app::UsageSort::Cost => {
             rows_data.sort_by(|a, b| b.6.partial_cmp(&a.6).unwrap_or(std::cmp::Ordering::Equal))
         }
         super::app::UsageSort::Tokens => {
-            // Reuse tokens sort key as request volume for this pane.
-            rows_data.sort_by(|a, b| b.3.cmp(&a.3))
+            rows_data.sort_by(|a, b| b.7.cmp(&a.7))
         }
         super::app::UsageSort::Date => {
             // Default health view: worst success rate first, then slowest TTFB.
@@ -1855,27 +2748,29 @@ fn draw_usage_by_provider(frame: &mut Frame, area: Rect, app: &App, sel: usize) 
                         let tb = b.5.unwrap_or(f64::MAX);
                         tb.partial_cmp(&ta).unwrap_or(std::cmp::Ordering::Equal)
                     })
+                    .then_with(|| b.7.cmp(&a.7))
             })
         }
     }
     let sel = sel.min(rows_data.len().saturating_sub(1));
     let (list_area, detail_area, show_detail) = usage_master_detail(area);
 
-    // Name column takes remaining width; kind gets room for "claude-oauth".
+    // name · kind · tokens · reqs · success · ttfb
     let name_w = (list_area.width as usize)
-        .saturating_sub(6 + 8 + 8 + 14 + 4)
-        .clamp(12, 36);
+        .saturating_sub(12 + 8 + 6 + 8 + 8 + 6)
+        .clamp(10, 28);
 
     let rows: Vec<Row> = rows_data
         .iter()
         .enumerate()
-        .map(|(i, (name, _id, kind, req, rate, ttfb, _cost))| {
+        .map(|(i, (name, _id, kind, req, rate, ttfb, _cost, tok))| {
             let ttfb_s = ttfb
                 .map(|ms| format!("{ms:.0}ms"))
                 .unwrap_or_else(|| "—".into());
             let row = Row::new(vec![
                 Cell::from(truncate(name, name_w)),
                 Cell::from(truncate(kind, 12)),
+                Cell::from(format_tokens(*tok)),
                 Cell::from(req.to_string()),
                 Cell::from(format!("{:.0}%", rate * 100.0)),
                 Cell::from(ttfb_s),
@@ -1892,19 +2787,21 @@ fn draw_usage_by_provider(frame: &mut Frame, area: Rect, app: &App, sel: usize) 
         [
             Constraint::Min(name_w as u16),
             Constraint::Length(12),
+            Constraint::Length(8),
             Constraint::Length(6),
             Constraint::Length(8),
             Constraint::Length(8),
         ],
     )
     .header(
-        Row::new(vec!["name", "kind", "reqs", "success", "ttfb"]).style(theme.header_cell()),
+        Row::new(vec!["name", "kind", "tokens", "reqs", "success", "ttfb"])
+            .style(theme.header_cell()),
     )
     .block(panel_block(
         theme,
         &format!(
-            "Provider health  [{}]  t cycle · c sort",
-            app.usage_detail.label()
+            "By provider  ·  tokens  ·  sort={}  ·  t cycle",
+            app.usage_sort.label()
         ),
         true,
     ))
@@ -1912,26 +2809,30 @@ fn draw_usage_by_provider(frame: &mut Frame, area: Rect, app: &App, sel: usize) 
     frame.render_widget(table, list_area);
 
     if show_detail {
-        if let Some((name, id, kind, req, rate, ttfb, cost)) = rows_data.get(sel) {
+        if let Some((name, id, kind, req, rate, ttfb, cost, tok)) = rows_data.get(sel) {
             let ttfb_s = ttfb
                 .map(|ms| format!("{ms:.0}ms"))
                 .unwrap_or_else(|| "—".into());
+            let tok_share = *tok as f64 / period_tokens.max(1) as f64 * 100.0;
+            let max_tok = rows_data.iter().map(|r| r.7).max().unwrap_or(1).max(1) as f64;
             draw_usage_rollup_detail(
                 frame,
                 detail_area,
                 theme,
-                "Provider health",
+                "Provider detail",
                 name,
                 &[
                     ("name", name.clone()),
                     ("id", id.clone()),
                     ("kind", kind.clone()),
+                    ("tokens", format_tokens(*tok)),
+                    ("tok share", format!("{tok_share:.1}% of period")),
+                    ("requests", req.to_string()),
                     ("success", format!("{:.1}%", rate * 100.0)),
                     ("avg ttfb", ttfb_s),
-                    ("requests", req.to_string()),
                     ("cost", format_usd(*cost)),
                 ],
-                *rate,
+                *tok as f64 / max_tok,
                 &[],
             );
         }
@@ -1985,7 +2886,7 @@ fn draw_usage_by_day(frame: &mut Frame, area: Rect, app: &App, sel: usize, perio
         frame.render_widget(block, list_chunks[0]);
         let sel_date = cal_idx.and_then(|i| calendar.get(i).map(|d| d.date.as_str()));
         let lines =
-            contribution_graph_lines(theme, &usage_trailing_tuples(app), sel_date, "");
+            contribution_graph_lines(theme, &usage_trailing_tuples(app), sel_date, "", true);
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -2117,9 +3018,9 @@ fn draw_usage_rollup_detail(
     ];
     lines.extend(detail_kv(theme, rows));
 
-    // Per-model breakdown for this key/day.
+    // Per-model breakdown for this key/day — token-first.
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("  Models", theme.title())));
+    lines.push(Line::from(Span::styled("  Models (by tokens)", theme.title())));
     if models.is_empty() {
         lines.push(Line::from(Span::styled(
             "    (no model breakdown)",
@@ -2128,16 +3029,20 @@ fn draw_usage_rollup_detail(
     } else {
         let max_m = models
             .iter()
-            .map(|m| m.total_usd)
-            .fold(0.0_f64, f64::max)
-            .max(1e-9);
+            .map(|m| m.total_tokens)
+            .max()
+            .unwrap_or(1)
+            .max(1) as f64;
         let bar_w = (area.width as usize).saturating_sub(20).clamp(6, 16);
-        // Cap rows so the panel stays scannable; sort by cost desc.
         let mut ordered: Vec<&ModelBreakRow> = models.iter().collect();
         ordered.sort_by(|a, b| {
-            b.total_usd
-                .partial_cmp(&a.total_usd)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.total_tokens
+                .cmp(&a.total_tokens)
+                .then_with(|| {
+                    b.total_usd
+                        .partial_cmp(&a.total_usd)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
         });
         let max_rows = (area.height as usize).saturating_sub(14).max(3);
         for (i, m) in ordered.iter().take(max_rows).enumerate() {
@@ -2152,16 +3057,18 @@ fn draw_usage_rollup_detail(
             )));
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("  {}", ratio_bar(m.total_usd / max_m, bar_w)),
+                    format!(
+                        "  {}",
+                        ratio_bar(m.total_tokens as f64 / max_m, bar_w)
+                    ),
                     Style::default().fg(theme.chart_color(i)),
                 ),
                 Span::styled(
-                    format!(
-                        " {}  {}r  {}{prov}",
-                        format_usd(m.total_usd),
-                        m.request_count,
-                        format_tokens(m.total_tokens),
-                    ),
+                    format!(" {}", format_tokens(m.total_tokens)),
+                    theme.warning(),
+                ),
+                Span::styled(
+                    format!("  {}  {}r{prov}", format_usd(m.total_usd), m.request_count),
                     theme.muted(),
                 ),
             ]));

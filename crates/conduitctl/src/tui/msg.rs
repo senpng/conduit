@@ -31,6 +31,12 @@ pub enum Msg {
         summary: Option<Result<UsageSummaryView, String>>,
         recent: Option<Result<UsageListResponse, String>>,
     },
+    /// Lifetime usage rollup for Overview KPIs / rankings (`period=all`).
+    /// Kept separate from [`Msg::Usage`] so Usage-tab month flips don't clobber home.
+    OverviewSummary {
+        gen: u64,
+        result: Result<UsageSummaryView, String>,
+    },
     Pricing {
         gen: u64,
         result: Result<Vec<PricingView>, String>,

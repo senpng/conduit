@@ -198,6 +198,8 @@ pub struct App {
     /// Decrypted secrets keyed by provider id (multi-`v`; each toggles independently).
     pub provider_secrets: HashMap<String, ProviderSecretView>,
     pub usage_summary: Option<UsageSummaryView>,
+    /// Lifetime rollup for Overview (`period=all`). Not shared with Usage month.
+    pub overview_summary: Option<UsageSummaryView>,
     pub usage_recent: Vec<UsageRecordView>,
     pub usage_period: String,
     /// Server-side pagination for Usage → recent.
@@ -258,6 +260,7 @@ impl App {
             cooldowns: Vec::new(),
             provider_secrets: HashMap::new(),
             usage_summary: None,
+            overview_summary: None,
             usage_recent: Vec::new(),
             usage_period: current_period(),
             usage_offset: 0,
@@ -1922,6 +1925,18 @@ impl App {
                     Err(e) => {
                         self.error = Some(e);
                         self.status = "Failed to reveal key".into();
+                    }
+                }
+            }
+            Msg::OverviewSummary { gen, result } => {
+                if self.is_stale(gen) {
+                    return;
+                }
+                self.loading = false;
+                match result {
+                    Ok(s) => self.overview_summary = Some(s),
+                    Err(e) => {
+                        self.status = format!("overview usage unavailable: {e}");
                     }
                 }
             }

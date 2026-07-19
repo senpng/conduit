@@ -1009,22 +1009,27 @@ pub async fn list_usage(
 
 #[derive(Debug, Deserialize)]
 pub struct UsageSummaryQuery {
-    /// `YYYY-MM`; defaults to current UTC month.
+    /// `YYYY-MM` calendar month, or `all` for lifetime totals.
+    /// Defaults to the current UTC month.
     pub period: Option<String>,
     /// Optional downstream key scope for `by_day` / `by_model` rollups.
     pub key_id: Option<String>,
 }
 
-/// GET /console/usage/summary — aggregate spend by key / day / model for a calendar month.
+/// GET /console/usage/summary — aggregate spend by key / day / model.
+///
+/// `period=YYYY-MM` scopes to a calendar month; `period=all` is lifetime.
 pub async fn usage_summary(
     State(state): State<Arc<DaemonState>>,
     Query(q): Query<UsageSummaryQuery>,
 ) -> impl IntoResponse {
     use chrono::Datelike;
     let now = Utc::now();
-    let period = q
-        .period
-        .unwrap_or_else(|| format!("{:04}-{:02}", now.year(), now.month()));
+    let period = match q.period.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) if p.eq_ignore_ascii_case("all") => "all".to_string(),
+        Some(p) => p.to_string(),
+        None => format!("{:04}-{:02}", now.year(), now.month()),
+    };
     let key_id = q.key_id.as_deref().filter(|s| !s.is_empty());
     let repo = UsageRepo::new(&state.pool);
 
@@ -1076,6 +1081,7 @@ pub async fn usage_summary(
         None => entries.iter().collect(),
     };
     let total_usd: f64 = scoped_entries.iter().map(|e| e.total_usd).sum();
+    let total_tokens: u64 = scoped_entries.iter().map(|e| e.total_tokens).sum();
     // Prefer outcome request_count (includes zero-token / error rows) when present.
     let request_count: u64 = if outcome.request_count > 0 {
         outcome.request_count
@@ -1088,6 +1094,7 @@ pub async fn usage_summary(
         Json(json!({
             "period": period,
             "total_usd": total_usd,
+            "total_tokens": total_tokens,
             "request_count": request_count,
             "success_rate": outcome.success_rate,
             "avg_ttfb_ms": outcome.avg_ttfb_ms,
@@ -1145,6 +1152,7 @@ pub async fn usage_summary(
                 "avg_ttfb_ms": p.avg_ttfb_ms,
                 "avg_duration_ms": p.avg_duration_ms,
                 "total_usd": p.total_usd,
+                "total_tokens": p.total_tokens,
             })).collect::<Vec<_>>(),
         })),
     )

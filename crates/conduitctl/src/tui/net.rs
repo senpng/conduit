@@ -53,15 +53,14 @@ pub fn spawn_overview(client: ConsoleClient, gen: u64, tx: UnboundedSender<Msg>)
         let _ = tx.send(Msg::Routes { gen, result: routes });
         let keys = client.list_keys_typed().await.map_err(|e| e.to_string());
         let _ = tx.send(Msg::Keys { gen, result: keys });
-        // Current-month spend / sparkline / top models (defaults to UTC month on server).
+        // Lifetime totals for Overview KPIs / rankings (separate from Usage month).
         let summary = client
-            .usage_summary_typed(None)
+            .usage_summary_typed(Some("all"))
             .await
             .map_err(|e| e.to_string());
-        let _ = tx.send(Msg::Usage {
+        let _ = tx.send(Msg::OverviewSummary {
             gen,
-            summary: Some(summary),
-            recent: Some(Ok(empty_usage_page())),
+            result: summary,
         });
     });
 }

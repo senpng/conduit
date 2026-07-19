@@ -361,7 +361,7 @@ pub struct UsageDayModelEntry {
     pub total_tokens: u64,
 }
 
-/// Provider health rollup (success rate + TTFB) from `by_provider`.
+/// Provider health rollup (success rate + TTFB + tokens) from `by_provider`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct UsageProviderEntry {
     #[serde(default)]
@@ -378,6 +378,8 @@ pub struct UsageProviderEntry {
     pub avg_duration_ms: Option<f64>,
     #[serde(default)]
     pub total_usd: f64,
+    #[serde(default)]
+    pub total_tokens: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -386,6 +388,8 @@ pub struct UsageSummaryView {
     pub period: String,
     #[serde(default)]
     pub total_usd: f64,
+    #[serde(default)]
+    pub total_tokens: u64,
     #[serde(default)]
     pub request_count: u64,
     /// Fraction of requests with `status = ok` in the period.
