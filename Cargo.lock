@@ -840,6 +840,7 @@ name = "conduit-ir"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "chrono",
  "serde",
  "serde_json",
@@ -886,7 +887,6 @@ dependencies = [
  "conduit-oauth",
  "conduit-quota",
  "conduit-router",
- "conduit-trace",
  "conduit-upstream",
  "futures",
  "secrecy",
@@ -907,7 +907,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "conduit-ir",
- "conduit-trace",
  "futures",
  "proptest",
  "serde",
@@ -971,27 +970,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "conduit-trace"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "chrono",
- "conduit-ir",
- "futures",
- "serde",
- "serde_json",
- "sqlx",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "ulid",
- "zstd",
-]
-
-[[package]]
 name = "conduit-upstream"
 version = "0.1.0"
 dependencies = [
@@ -1028,8 +1006,6 @@ dependencies = [
  "chrono",
  "clap",
  "conduit-ir",
- "conduit-trace",
- "futures",
  "reqwest",
  "serde",
  "serde_json",
@@ -1059,7 +1035,6 @@ dependencies = [
  "conduit-router",
  "conduit-secret",
  "conduit-store",
- "conduit-trace",
  "conduit-upstream",
  "futures",
  "hex",
@@ -1071,7 +1046,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-stream",
  "toml",
  "tower",
  "tower-http",

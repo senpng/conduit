@@ -19,9 +19,7 @@ use super::{
     options::ClaudeOAuthRelayOptions,
     tools::{reverse_remap_response, reverse_remap_stream_payload},
 };
-use crate::provider::{
-    apply_request_overrides, header_pairs_to_json, ChatResult, StreamResult, UpstreamHeaders,
-};
+use crate::provider::{apply_request_overrides, ChatResult, StreamResult};
 
 fn map_status(status: u16, body: &str) -> ProviderError {
     match status {
@@ -70,15 +68,6 @@ fn apply_headers(
         builder = builder.header(key, value);
     }
     builder
-}
-
-fn response_headers_to_json(headers: &wreq::header::HeaderMap) -> Value {
-    header_pairs_to_json(headers.iter().map(|(name, value)| {
-        (
-            name.as_str().to_owned(),
-            value.to_str().unwrap_or("<non-utf8>").to_owned(),
-        )
-    }))
 }
 
 fn apply_upstream_model(mut body: Value, upstream_model: &str) -> Value {
@@ -130,7 +119,6 @@ pub async fn chat_oauth<C: WireCodec + 'static>(
     })?;
 
     let status = resp.status().as_u16();
-    let response_headers = response_headers_to_json(resp.headers());
     if !(200..300).contains(&status) {
         let text = resp.text().await.unwrap_or_default();
         return Err(map_status(status, &text));
@@ -146,14 +134,7 @@ pub async fn chat_oauth<C: WireCodec + 'static>(
         .map_err(|e| ProviderError::Serialization(e.to_string()))?;
     let mut combined = encode_loss;
     combined.merge(decode_loss);
-    Ok((
-        response,
-        combined,
-        UpstreamHeaders {
-            request: header_pairs_to_json(request_headers),
-            response: response_headers,
-        },
-    ))
+    Ok((response, combined))
 }
 
 /// Streaming Claude OAuth Messages call (Chrome TLS + identity Accept-Encoding).
@@ -179,9 +160,7 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
     let prepared = prepare_oauth_body(body, model_for_cloak, secret.expose_secret(), opts);
     let tool_reverse: HashMap<String, String> = prepared.tool_reverse_map;
 
-    let builder = chrome_client()
-        .post(&url)
-        .json(&prepared.body);
+    let builder = chrome_client().post(&url).json(&prepared.body);
     let request_headers =
         oauth_request_headers(secret.expose_secret(), true, &prepared.extra_betas, opts);
     let builder = apply_headers(builder, &request_headers);
@@ -195,7 +174,6 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
     })?;
 
     let status = resp.status().as_u16();
-    let response_headers = response_headers_to_json(resp.headers());
     if !(200..300).contains(&status) {
         let text = resp.text().await.unwrap_or_default();
         return Err(map_status(status, &text));
@@ -244,12 +222,5 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
         })
         .flat_map(futures::stream::iter);
 
-    Ok((
-        Box::pin(stream),
-        encode_loss,
-        UpstreamHeaders {
-            request: header_pairs_to_json(request_headers),
-            response: response_headers,
-        },
-    ))
+    Ok((Box::pin(stream), encode_loss))
 }

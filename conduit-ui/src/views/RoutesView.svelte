@@ -6,6 +6,22 @@
   import { fmtDate, providerDisplayName } from "../lib/format";
   import JsonView from "../components/JsonView.svelte";
   import RouteWizard from "./RouteWizard.svelte";
+  import Card from "../components/app/Card.svelte";
+  import PageHeader from "../components/app/PageHeader.svelte";
+  import Spinner from "../components/app/Spinner.svelte";
+  import Button from "../components/ui/button.svelte";
+  import Badge from "../components/ui/badge.svelte";
+  import {
+    tableWrapClass,
+    tableClass,
+    thClass,
+    tdClass,
+    monoClass,
+    dimClass,
+    trClickClass,
+  } from "$lib/ui";
+  import { cn } from "$lib/utils";
+  import { Plus, Pencil, Trash2 } from "@lucide/svelte";
 
   let list = $state<Route[]>([]);
   let providers = $state<Provider[]>([]);
@@ -53,7 +69,6 @@
     }
   }
 
-  /** Targets with provider_id resolved to display name for the expand panel. */
   function displayTargets(r: Route): unknown {
     const raw = parsedTargets(r);
     if (!Array.isArray(raw)) return raw;
@@ -94,89 +109,105 @@
   }
 </script>
 
-<div class="panel">
-  <div class="row-between">
-    <span class="panel-title">Model alias routes</span>
-    <button class="btn-primary" onclick={() => (wizardFor = "new")}>＋ Add route</button>
-  </div>
+<Card>
+  <PageHeader title="Model alias routes" description="Map client model names to upstream targets.">
+    {#snippet actions()}
+      <Button onclick={() => (wizardFor = "new")}>
+        <Plus class="h-4 w-4" />
+        Add route
+      </Button>
+    {/snippet}
+  </PageHeader>
 
   {#if loading && list.length === 0}
-    <div class="loader"><span class="spinner"></span></div>
+    <Spinner />
   {:else}
-    <div class="table-wrap">
-      <table class="table">
+    <div class={tableWrapClass}>
+      <table class={tableClass}>
         <thead>
           <tr>
-            <th>Alias</th>
-            <th>Strategy</th>
-            <th>Targets</th>
-            <th>Status</th>
-            <th>Created</th>
-            <th></th>
+            <th class={thClass}>Alias</th>
+            <th class={thClass}>Strategy</th>
+            <th class={thClass}>Targets</th>
+            <th class={thClass}>Status</th>
+            <th class={thClass}>Created</th>
+            <th class={thClass}></th>
           </tr>
         </thead>
         <tbody>
           {#each list as r (r.id)}
             <tr
-              class="clickable"
+              class={trClickClass}
               onclick={() => (expandedId = expandedId === r.id ? null : r.id)}
             >
-              <td class="mono">{r.match_alias}</td>
-              <td><span class="badge accent">{r.strategy}</span></td>
-              <td class="mono dim">{targetCount(r)}</td>
-              <td>
+              <td class={cn(tdClass, monoClass)}>{r.match_alias}</td>
+              <td class={tdClass}><Badge>{r.strategy}</Badge></td>
+              <td class={cn(tdClass, monoClass, dimClass)}>{targetCount(r)}</td>
+              <td class={tdClass}>
                 <button
-                  class="pill"
-                  class:on={r.enabled}
-                  class:off={!r.enabled}
-                  style="border:none; cursor:pointer"
+                  type="button"
+                  class="cursor-pointer border-0 bg-transparent p-0"
                   title="Toggle enabled"
                   onclick={(e) => {
                     e.stopPropagation();
                     void toggleEnabled(r);
                   }}
                 >
-                  {r.enabled ? "enabled" : "disabled"}
+                  <Badge variant={r.enabled ? "success" : "secondary"}>
+                    {r.enabled ? "enabled" : "disabled"}
+                  </Badge>
                 </button>
               </td>
-              <td class="dim small">{fmtDate(r.created_at)}</td>
-              <td class="actions">
-                <button
-                  class="btn-icon"
-                  title="Edit"
-                  onclick={(e) => {
-                    e.stopPropagation();
-                    wizardFor = r;
-                  }}>✎</button
-                >
-                <button
-                  class="btn-icon danger"
-                  title="Delete"
-                  onclick={(e) => {
-                    e.stopPropagation();
-                    void remove(r);
-                  }}>✕</button
-                >
+              <td class={cn(tdClass, dimClass, "text-xs")}>{fmtDate(r.created_at)}</td>
+              <td class={cn(tdClass, "w-px")}>
+                <div class="flex items-center gap-0.5">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    title="Edit"
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      wizardFor = r;
+                    }}
+                  >
+                    <Pencil class="h-4 w-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    title="Delete"
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      void remove(r);
+                    }}
+                  >
+                    <Trash2 class="h-4 w-4 text-[var(--danger)]" />
+                  </Button>
+                </div>
               </td>
             </tr>
             {#if expandedId === r.id}
               <tr>
-                <td colspan="6" style="background:var(--surface-2)">
-                  <div class="small dim" style="margin-bottom:6px">
-                    targets · route <span class="mono">{r.match_alias}</span>
+                <td class={cn(tdClass, "bg-[var(--surface-muted)]")} colspan="6">
+                  <div class="mb-1.5 text-xs text-[var(--text-secondary)]">
+                    targets · route <span class={monoClass}>{r.match_alias}</span>
                   </div>
                   <JsonView data={displayTargets(r)} />
                 </td>
               </tr>
             {/if}
           {:else}
-            <tr><td colspan="6" class="empty">No routes configured.</td></tr>
+            <tr>
+              <td class={cn(tdClass, "py-8 text-center text-[var(--text-muted)]")} colspan="6">
+                No routes configured.
+              </td>
+            </tr>
           {/each}
         </tbody>
       </table>
     </div>
   {/if}
-</div>
+</Card>
 
 {#if wizardFor === "new"}
   <RouteWizard

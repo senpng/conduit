@@ -4,14 +4,13 @@
  * navigation across all screens. Catches Svelte runes misuse, broken imports,
  * and mount-time crashes that `vite build` (esbuild, no typecheck) and the
  * pure-logic unit tests cannot see. No daemon is required — failed health
- * polls and SSE reconnect loops are part of the exercised paths.
+ * polls are part of the exercised paths.
  */
 
 import { describe, it, expect, afterEach } from "vitest";
 import { mount, unmount, flushSync } from "svelte";
 import App from "../App.svelte";
 import { app, SCREENS } from "../state/app.svelte";
-import { live } from "../state/live.svelte";
 
 describe("App smoke", () => {
   let instance: Record<string, unknown> | null = null;
@@ -44,29 +43,12 @@ describe("App smoke", () => {
     for (const s of SCREENS) {
       app.goto(s.id);
       flushSync();
-      // Let microtasks (failed fetches) settle.
       await new Promise((r) => setTimeout(r, 0));
       expect(document.querySelector(".page-title")?.textContent).toBe(s.label);
     }
-    // Back to a stable screen; live SSE loop is stopped by leaving the view.
     app.goto("dashboard");
     flushSync();
-    expect(live.sse).toBe("idle");
-  });
-
-  it("opens and closes the command palette", () => {
-    const target = document.createElement("div");
-    document.body.appendChild(target);
-    instance = mount(App, { target }) as Record<string, unknown>;
-    flushSync();
-
-    app.paletteOpen = true;
-    flushSync();
-    expect(document.querySelector(".palette")).toBeTruthy();
-
-    app.paletteOpen = false;
-    flushSync();
-    expect(document.querySelector(".palette")).toBeNull();
+    expect(app.screen).toBe("dashboard");
   });
 
   it("shows confirm dialog via promise API and settles", async () => {

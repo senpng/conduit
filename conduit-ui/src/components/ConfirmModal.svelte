@@ -1,45 +1,34 @@
 <script lang="ts">
   import { app } from "../state/app.svelte";
   import Modal from "./Modal.svelte";
+  import Button from "./ui/button.svelte";
 
   let cancelBtn: HTMLButtonElement | undefined = $state();
 
-  // Default focus = Cancel (design doc R-7).
   $effect(() => {
     if (app.confirm) {
       queueMicrotask(() => cancelBtn?.focus());
     }
   });
-
-  function onKeydown(e: KeyboardEvent) {
-    if (!app.confirm) return;
-    if (e.key === "y" || e.key === "Y") {
-      e.preventDefault();
-      e.stopPropagation();
-      app.settleConfirm(true);
-    } else if (e.key === "n" || e.key === "N") {
-      e.preventDefault();
-      e.stopPropagation();
-      app.settleConfirm(false);
-    }
-  }
 </script>
 
-<svelte:window onkeydown={onKeydown} />
-
 {#if app.confirm}
-  <Modal onclose={() => app.settleConfirm(false)}>
-    <h3>{app.confirm.title}</h3>
-    <p class="modal-hint">{app.confirm.body}</p>
-    <div class="form-actions">
-      <button
-        class={app.confirm.danger ? "btn-danger" : "btn-primary"}
+  <Modal onclose={() => app.settleConfirm(false)} title={app.confirm.title}>
+    <p class="mb-4 text-sm text-[var(--text-secondary)]">{app.confirm.body}</p>
+    <div class="flex justify-end gap-2">
+      <Button
+        variant={app.confirm.danger ? "destructive" : "default"}
         onclick={() => app.settleConfirm(true)}
       >
-        {app.confirm.confirmLabel} <span class="kbd">y</span>
-      </button>
-      <button class="btn-ghost" bind:this={cancelBtn} onclick={() => app.settleConfirm(false)}>
-        Cancel <span class="kbd">n</span>
+        {app.confirm.confirmLabel}
+      </Button>
+      <button
+        type="button"
+        class="inline-flex h-9 cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3.5 text-sm font-medium text-[var(--text)] hover:bg-[var(--surface-muted)]"
+        bind:this={cancelBtn}
+        onclick={() => app.settleConfirm(false)}
+      >
+        Cancel
       </button>
     </div>
   </Modal>

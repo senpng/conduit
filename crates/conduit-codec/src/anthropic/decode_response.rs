@@ -11,7 +11,7 @@ use serde_json::Value;
 ///
 /// The returned [`LossReport`] records any response content that could not be
 /// represented in the IR (e.g. unknown content block types that were skipped),
-/// so the audit trail reflects what was dropped rather than silently losing it.
+/// so LossReport reflects what was dropped rather than silently losing it.
 pub fn decode_response(
     body: Value,
     alias: &str,

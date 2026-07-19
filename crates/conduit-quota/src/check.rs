@@ -30,10 +30,10 @@ pub struct QuotaCheckRequest {
 
 /// Input for [`QuotaEngine::record`] — one completed request's consumption.
 ///
-/// Written to the durable usage ledger by the daemon; independent of traces.
+/// Written to the durable usage ledger by the daemon.
 #[derive(Debug, Clone)]
 pub struct QuotaRecordRequest {
-    /// Stable request id (pipeline `trace_id` / correlation id).
+    /// Stable request id (pipeline request correlation id).
     pub request_id: String,
     /// Opaque identifier for the downstream API key.
     pub downstream_key_id: String,

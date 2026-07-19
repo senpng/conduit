@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS downstream_keys (
 CREATE INDEX IF NOT EXISTS idx_downstream_keys_hash
     ON downstream_keys(key_hash);
 
--- Per-request consumption ledger (not dependent on traces).
+-- Per-request consumption ledger.
 CREATE TABLE IF NOT EXISTS usage_records (
     id                   TEXT PRIMARY KEY,
     ts                   TEXT NOT NULL,
@@ -96,9 +96,9 @@ CREATE TABLE IF NOT EXISTS app_events (
 CREATE INDEX IF NOT EXISTS idx_events_ts
     ON app_events(ts DESC);
 
--- Short-lived Responses API compatibility state.  This is intentionally kept
--- separate from traces: it contains only tool-call metadata required to turn
--- a `previous_response_id` + tool output into a complete upstream request.
+-- Short-lived Responses API compatibility state. Contains only tool-call
+-- metadata required to turn a `previous_response_id` + tool output into a
+-- complete upstream request.
 CREATE TABLE IF NOT EXISTS response_continuations (
     response_id              TEXT NOT NULL,
     key_scope                TEXT NOT NULL,

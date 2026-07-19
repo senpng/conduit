@@ -1,10 +1,13 @@
 <script lang="ts">
+  import { cn } from "$lib/utils";
+
   interface Props {
     data: unknown;
     /** Truncation threshold in chars (design doc: 256KB). */
     maxChars?: number;
+    class?: string;
   }
-  let { data, maxChars = 256 * 1024 }: Props = $props();
+  let { data, maxChars = 256 * 1024, class: className = "" }: Props = $props();
 
   const rendered = $derived.by(() => {
     let text: string;
@@ -20,12 +23,15 @@
   });
 </script>
 
-<div>
-  <pre class="json-view">{rendered.text}</pre>
+<div class={className}>
+  <pre
+    class={cn(
+      "max-h-[60vh] overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] p-3 font-mono text-xs leading-relaxed text-[var(--text)] whitespace-pre-wrap break-words",
+    )}>{rendered.text}</pre>
   {#if rendered.truncated}
-    <div class="json-truncated">
+    <div class="mt-1 text-[11px] text-[var(--text-muted)]">
       … truncated at {maxChars.toLocaleString()} / {rendered.total.toLocaleString()} chars —
-      inspect with <span class="mono">conduitctl trace get</span>
+      truncated in the UI or fetch via the console API
     </div>
   {/if}
 </div>

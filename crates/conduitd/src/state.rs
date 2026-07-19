@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use arc_swap::ArcSwap;
@@ -12,10 +12,8 @@ use conduit_pipeline::{egress::ModelPricing, handle::PipelineHandle};
 use conduit_router::table::RoutingTable;
 use conduit_secret::SecretBackend;
 use conduit_store::{PricingRepo, StorePool};
-use conduit_trace::{sink::TraceSink, TraceStore};
-use tokio::sync::broadcast;
 
-use crate::{config::RuntimeSettings, oauth::OAuthRuntime};
+use crate::oauth::OAuthRuntime;
 
 /// In-memory pricing map: (provider_kind, model_id) → rates.
 /// Hot-reloaded via [`ArcSwap::store`]; pipeline lookups are pure sync.
@@ -31,15 +29,6 @@ pub struct DaemonState {
 
     /// Shared pipeline handle (built once at startup).
     pub pipeline: Arc<PipelineHandle>,
-
-    /// Async trace event sink.
-    pub trace_sink: Arc<TraceSink>,
-
-    /// On-disk trace store (query / get_full / replay).
-    pub trace_store: Arc<TraceStore>,
-
-    /// Live trace event fan-out for console SSE (`GET /console/traces/stream`).
-    pub trace_broadcast: broadcast::Sender<conduit_ir::trace::TraceEvent>,
 
     /// SQLite pool — used directly by console API handlers.
     pub pool: StorePool,
@@ -61,12 +50,6 @@ pub struct DaemonState {
 
     /// Daemon version string.
     pub version: &'static str,
-
-    /// Startup defaults from `conduit.toml` `[trace]` (segment sizes, etc.).
-    pub trace_config: crate::config::TraceConfig,
-
-    /// Runtime overlay (`settings.toml`); guarded for console PUT persistence.
-    pub runtime_settings: Mutex<RuntimeSettings>,
 }
 
 /// Build a pricing map from all rows currently in the pricing repo.

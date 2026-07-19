@@ -13,70 +13,8 @@ pub struct HealthResponse {
     pub status: String,
     #[serde(default)]
     pub version: String,
-    /// Whether new traces are being recorded (when present).
-    #[serde(default)]
-    pub trace_enabled: Option<bool>,
 }
 
-// ── Settings ────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SettingsResponse {
-    pub trace: TraceSettingsDto,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TraceSettingsDto {
-    pub enabled: bool,
-    #[serde(default)]
-    pub config_default: Option<bool>,
-    #[serde(default)]
-    pub runtime_override: Option<bool>,
-    #[serde(default)]
-    pub max_segment_mb: Option<u64>,
-    #[serde(default)]
-    pub max_db_size_mb: Option<u64>,
-    #[serde(default)]
-    pub retention_days: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct UpdateSettingsBody {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub trace: Option<UpdateTraceSettingsBody>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct UpdateTraceSettingsBody {
-    pub enabled: bool,
-}
-
-// ── Traces ──────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TraceListResponse {
-    #[serde(default)]
-    pub traces: Vec<TraceIndexRowDto>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TraceIndexRowDto {
-    pub id: String,
-    #[serde(default)]
-    pub trace_id: String,
-    #[serde(default)]
-    pub kind: String,
-    #[serde(default)]
-    pub alias: String,
-    #[serde(default)]
-    pub status_code: i64,
-    #[serde(default)]
-    pub latency_ms: i64,
-    #[serde(default)]
-    pub cost_usd: f64,
-    pub provider_id: Option<String>,
-    pub model_id: Option<String>,
-}
 
 // ── Providers ───────────────────────────────────────────────────────────────
 
@@ -197,27 +135,10 @@ mod tests {
     }
 
     #[test]
-    fn trace_list_response_unwraps_traces_wrapper() {
-        let raw = r#"{"traces":[{"id":"01A","alias":"gpt","status_code":200,"latency_ms":12,"cost_usd":0.01}]}"#;
-        let parsed: TraceListResponse = serde_json::from_str(raw).unwrap();
-        assert_eq!(parsed.traces.len(), 1);
-        assert_eq!(parsed.traces[0].id, "01A");
-        assert_eq!(parsed.traces[0].alias, "gpt");
-    }
-
-    #[test]
     fn health_response_deserializes() {
         let raw = r#"{"status":"ok","version":"0.1.0"}"#;
         let h: HealthResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(h.status, "ok");
         assert_eq!(h.version, "0.1.0");
-        assert_eq!(h.trace_enabled, None);
-    }
-
-    #[test]
-    fn health_response_with_trace_enabled() {
-        let raw = r#"{"status":"ok","version":"0.1.0","trace_enabled":false}"#;
-        let h: HealthResponse = serde_json::from_str(raw).unwrap();
-        assert_eq!(h.trace_enabled, Some(false));
     }
 }

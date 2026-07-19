@@ -9,7 +9,6 @@
   import type {
     UsageSummaryResponse,
     UsageRecord,
-    UsageSummaryEntry,
   } from "../lib/consoleClient";
   import {
     fmtUsd,
@@ -20,6 +19,34 @@
     shortId,
     providerNameMap,
   } from "../lib/format";
+  import PricingView from "./PricingView.svelte";
+  import Card from "../components/app/Card.svelte";
+  import PageHeader from "../components/app/PageHeader.svelte";
+  import StatCard from "../components/app/StatCard.svelte";
+  import Spinner from "../components/app/Spinner.svelte";
+  import EmptyState from "../components/app/EmptyState.svelte";
+  import Button from "../components/ui/button.svelte";
+  import Badge from "../components/ui/badge.svelte";
+  import {
+    selectClass,
+    tableWrapClass,
+    tableClass,
+    thClass,
+    tdClass,
+    monoClass,
+    dimClass,
+    mutedClass,
+    trClickClass,
+    trSelectedClass,
+    segmentGroupClass,
+    segmentBtnClass,
+    segmentBtnActiveClass,
+  } from "$lib/ui";
+  import { cn } from "$lib/utils";
+  import { X } from "@lucide/svelte";
+
+  type UsageTab = "usage" | "pricing";
+  let tab = $state<UsageTab>("usage");
 
   let summary = $state<UsageSummaryResponse | null>(null);
   let records = $state<UsageRecord[]>([]);
@@ -43,8 +70,6 @@
   async function load(): Promise<void> {
     try {
       const key = keyFilter || undefined;
-      // Summary carries period-accurate by_day / by_model (scoped when a key is selected).
-      // Records list remains a recent window for the ledger table only.
       const [s, r] = await Promise.all([
         usageApi.summary(undefined, key),
         usageApi.list(limit, key),
@@ -66,8 +91,6 @@
   });
   onDestroy(() => unregister?.());
 
-  // ── Totals (summary is period-accurate; cards respect the key filter) ────
-
   const summaryEntries = $derived(summary?.entries ?? []);
   const filteredEntries = $derived(
     keyFilter
@@ -88,8 +111,6 @@
     if (!id) return "(anonymous)";
     return keyNames.get(id) ?? shortId(id, 8);
   }
-
-  // ── By day (period-accurate from summary.by_day, UTC) ────────────────────
 
   interface DayRow {
     day: string;
@@ -118,14 +139,11 @@
       : "",
   );
 
-  /** Sparse x labels: at most ~7 ticks. */
   function showDayLabel(i: number, n: number): boolean {
     if (n <= 8) return true;
     const step = Math.ceil(n / 7);
     return i % step === 0;
   }
-
-  // ── By model / alias (period-accurate from summary.by_model) ──────────────
 
   interface ModelRow {
     label: string;
@@ -157,7 +175,6 @@
     return top;
   });
 
-  /** Period model total (for share bars) — not the recent-N ledger window. */
   const modelCostTotal = $derived(byModel.reduce((s, m) => s + m.cost, 0));
 
   function share(cost: number, total: number): number {
@@ -178,87 +195,91 @@
   }
 </script>
 
-{#if initialLoading}
-  <div class="loader"><span class="spinner"></span></div>
+<div class={cn(segmentGroupClass, "mb-4")}>
+  <button
+    type="button"
+    class={cn(segmentBtnClass, "cursor-pointer border-0 bg-transparent", tab === "usage" && segmentBtnActiveClass)}
+    onclick={() => (tab = "usage")}
+  >
+    Usage
+  </button>
+  <button
+    type="button"
+    class={cn(segmentBtnClass, "cursor-pointer border-0 bg-transparent", tab === "pricing" && segmentBtnActiveClass)}
+    onclick={() => (tab = "pricing")}
+  >
+    Pricing
+  </button>
+</div>
+
+{#if tab === "pricing"}
+  <PricingView />
+{:else if initialLoading}
+  <Spinner />
 {:else}
-  <!-- Filter row scopes everything below. -->
-  <div class="panel">
-    <div class="row-between">
-      <div class="row-gap">
-        <label style="flex-direction:row; align-items:center; gap:8px">
-          <span class="dim small">Key</span>
-          <select style="width:auto" bind:value={keyFilter} onchange={() => void load()}>
+  <Card class="mb-4">
+    <div class="flex flex-wrap items-center justify-between gap-3">
+      <div class="flex flex-wrap items-center gap-3">
+        <label class="flex items-center gap-2 text-xs text-[var(--text-secondary)]">
+          Key
+          <select class={cn(selectClass, "w-auto")} bind:value={keyFilter} onchange={() => void load()}>
             <option value="">All keys</option>
             {#each summaryEntries as e (e.downstream_key_id)}
               <option value={e.downstream_key_id}>{keyLabel(e.downstream_key_id)}</option>
             {/each}
           </select>
         </label>
-        <label style="flex-direction:row; align-items:center; gap:8px">
-          <span class="dim small">Records</span>
-          <select
-            style="width:auto"
-            bind:value={limit}
-            onchange={() => void load()}
-          >
+        <label class="flex items-center gap-2 text-xs text-[var(--text-secondary)]">
+          Records
+          <select class={cn(selectClass, "w-auto")} bind:value={limit} onchange={() => void load()}>
             <option value={100}>100</option>
             <option value={500}>500</option>
             <option value={1000}>1000</option>
           </select>
         </label>
         {#if keyFilter}
-          <button class="btn-ghost btn-sm" onclick={() => selectKey("")}>
-            ✕ {keyLabel(keyFilter)}
-          </button>
+          <Button variant="outline" size="sm" onclick={() => selectKey(keyFilter)}>
+            <X class="h-3.5 w-3.5" />
+            {keyLabel(keyFilter)}
+          </Button>
         {/if}
       </div>
-      <span class="dim small mono">{summary?.period ?? ""} (UTC)</span>
+      <span class={cn(dimClass, monoClass, "text-xs")}>{summary?.period ?? ""} (UTC)</span>
     </div>
+  </Card>
+
+  <div class="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
+    <StatCard
+      label="Spend"
+      value={fmtUsd2(totals.usd)}
+      sub={`${keyFilter ? keyLabel(keyFilter) : "all keys"} · current month`}
+    />
+    <StatCard label="Requests" value={totals.req.toLocaleString()} sub="completed with usage" />
+    <StatCard label="Tokens" value={fmtTokens(totals.tok)} sub="prompt + completion" />
+    <StatCard label="Avg cost / request" value={fmtUsd(totals.avg)} sub="this period" />
   </div>
 
-  <!-- Stat cards: period-accurate from summary -->
-  <div class="card-grid">
-    <div class="stat-card">
-      <span class="stat-label">Spend</span>
-      <span class="stat-value">{fmtUsd2(totals.usd)}</span>
-      <span class="stat-sub">{keyFilter ? keyLabel(keyFilter) : "all keys"} · current month</span>
-    </div>
-    <div class="stat-card">
-      <span class="stat-label">Requests</span>
-      <span class="stat-value">{totals.req.toLocaleString()}</span>
-      <span class="stat-sub">completed with usage</span>
-    </div>
-    <div class="stat-card">
-      <span class="stat-label">Tokens</span>
-      <span class="stat-value">{fmtTokens(totals.tok)}</span>
-      <span class="stat-sub">prompt + completion</span>
-    </div>
-    <div class="stat-card">
-      <span class="stat-label">Avg cost / request</span>
-      <span class="stat-value">{fmtUsd(totals.avg)}</span>
-      <span class="stat-sub">this period</span>
-    </div>
-  </div>
-
-  <!-- Daily spend chart (period-accurate SQL rollup) -->
-  <div class="panel">
-    <div class="row-between">
-      <span class="panel-title">Daily spend</span>
-      <span class="muted tiny">
-        {dayWindow || "no data"}
-        {#if keyFilter} · {keyLabel(keyFilter)}{/if}
-      </span>
-    </div>
+  <Card class="mb-4">
+    <PageHeader title="Daily spend">
+      {#snippet actions()}
+        <span class={cn(mutedClass, "text-[11px]")}>
+          {dayWindow || "no data"}
+          {#if keyFilter} · {keyLabel(keyFilter)}{/if}
+        </span>
+      {/snippet}
+    </PageHeader>
     {#if byDay.length === 0}
-      <p class="empty">No usage this period.</p>
+      <EmptyState title="No usage this period." />
     {:else}
-      <div class="chart" role="img" aria-label="Daily spend bar chart">
+      <div
+        class="mb-2 flex h-36 items-end gap-1"
+        role="img"
+        aria-label="Daily spend bar chart"
+      >
         {#each byDay as d (d.day)}
-          <!-- Columns are real buttons: keyboard focus/Enter pins the same
-               tooltip hover shows; values also in the Daily table below. -->
           <button
             type="button"
-            class="chart-col"
+            class="group relative flex h-full min-w-0 flex-1 flex-col items-center justify-end border-0 bg-transparent p-0"
             aria-label="{fmtDay(d.day)}: {fmtUsd(d.cost)} across {d.requests} requests"
             onmouseenter={() => (hoveredDay = d.day)}
             onmouseleave={() => (hoveredDay = null)}
@@ -267,197 +288,217 @@
             onclick={() => (hoveredDay = hoveredDay === d.day ? null : d.day)}
           >
             {#if d === peakDay}
-              <span class="chart-peak">{fmtUsd2(d.cost)}</span>
+              <span class="mb-1 text-[10px] font-medium text-[var(--accent)]">{fmtUsd2(d.cost)}</span>
             {/if}
             {#if hoveredDay === d.day}
-              <div class="chart-tip">
-                <strong>{fmtUsd(d.cost)}</strong>
-                <span>{fmtDay(d.day)} · {d.requests} reqs · {fmtTokens(d.tokens)} tok</span>
+              <div
+                class="absolute bottom-full z-10 mb-1 rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-left text-[11px] shadow-sm"
+              >
+                <strong class="text-[var(--text)]">{fmtUsd(d.cost)}</strong>
+                <div class="text-[var(--text-muted)]">
+                  {fmtDay(d.day)} · {d.requests} reqs · {fmtTokens(d.tokens)} tok
+                </div>
               </div>
             {/if}
             <div
-              class="chart-bar"
+              class="w-full max-w-[28px] rounded-t-sm bg-[var(--accent)]/80 transition-colors group-hover:bg-[var(--accent)]"
               style:height="{Math.max(2, (d.cost / dayMax) * 100)}%"
             ></div>
           </button>
         {/each}
       </div>
-      <div class="chart-x">
+      <div class="mb-3 flex gap-1 text-[10px] text-[var(--text-muted)]">
         {#each byDay as d, i (d.day)}
-          <span>{showDayLabel(i, byDay.length) ? fmtDay(d.day) : ""}</span>
+          <span class="min-w-0 flex-1 text-center truncate">
+            {showDayLabel(i, byDay.length) ? fmtDay(d.day) : ""}
+          </span>
         {/each}
       </div>
       <details>
-        <summary class="dim small" style="cursor:pointer">Daily table</summary>
-        <table class="table" style="margin-top:8px">
-          <thead>
-            <tr><th>Day</th><th style="text-align:right">Requests</th><th style="text-align:right">Tokens</th><th style="text-align:right">Spend</th></tr>
-          </thead>
-          <tbody>
-            {#each [...byDay].reverse() as d (d.day)}
+        <summary class={cn("cursor-pointer text-xs", dimClass)}>Daily table</summary>
+        <div class={cn(tableWrapClass, "mt-2")}>
+          <table class={tableClass}>
+            <thead>
               <tr>
-                <td class="mono small">{fmtDay(d.day)}</td>
-                <td class="mono" style="text-align:right">{d.requests}</td>
-                <td class="mono" style="text-align:right">{fmtTokens(d.tokens)}</td>
-                <td class="mono" style="text-align:right">{fmtUsd(d.cost)}</td>
+                <th class={thClass}>Day</th>
+                <th class={cn(thClass, "text-right")}>Requests</th>
+                <th class={cn(thClass, "text-right")}>Tokens</th>
+                <th class={cn(thClass, "text-right")}>Spend</th>
               </tr>
-            {/each}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {#each [...byDay].reverse() as d (d.day)}
+                <tr class="hover:bg-[var(--surface-muted)]/80">
+                  <td class={cn(tdClass, monoClass, "text-xs")}>{fmtDay(d.day)}</td>
+                  <td class={cn(tdClass, monoClass, "text-right")}>{d.requests}</td>
+                  <td class={cn(tdClass, monoClass, "text-right")}>{fmtTokens(d.tokens)}</td>
+                  <td class={cn(tdClass, monoClass, "text-right")}>{fmtUsd(d.cost)}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
       </details>
     {/if}
-  </div>
+  </Card>
 
-  <div class="split">
-    <!-- By downstream key (period-accurate summary) -->
-    <div class="panel">
-      <span class="panel-title">By key — this period</span>
+  <div class="mb-4 grid gap-4 lg:grid-cols-2">
+    <Card>
+      <PageHeader title="By key — this period" />
       {#if filteredEntries.length === 0}
-        <p class="empty">No usage this period.</p>
+        <EmptyState title="No usage this period." />
       {:else}
-        <table class="table">
-          <thead>
-            <tr>
-              <th>Key</th>
-              <th style="text-align:right">Reqs</th>
-              <th style="text-align:right">Tokens</th>
-              <th style="text-align:right">Spend</th>
-              <th style="width:26%">Share</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each filteredEntries as e (e.downstream_key_id)}
-              <tr
-                class="clickable"
-                class:selected={keyFilter === e.downstream_key_id}
-                title="Filter ledger to this key"
-                onclick={() => selectKey(e.downstream_key_id)}
-              >
-                <td>
-                  <div>{keyLabel(e.downstream_key_id)}</div>
-                  <div class="muted tiny mono">{shortId(e.downstream_key_id, 8)}</div>
-                </td>
-                <td class="mono" style="text-align:right">{e.request_count}</td>
-                <td class="mono dim" style="text-align:right">
-                  {fmtTokens((e.prompt_tokens ?? 0) + (e.completion_tokens ?? 0))}
-                </td>
-                <td class="mono" style="text-align:right">{fmtUsd(e.total_usd)}</td>
-                <td>
-                  <div class="row-gap" style="flex-wrap:nowrap; gap:6px">
-                    <div class="meter" style="flex:1">
-                      <div
-                        class="meter-fill"
-                        style:width="{share(e.total_usd, totals.usd)}%"
-                      ></div>
-                    </div>
-                    <span class="muted tiny mono" style="width:38px; text-align:right">
-                      {share(e.total_usd, totals.usd)}%
-                    </span>
-                  </div>
-                </td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      {/if}
-    </div>
-
-    <!-- By model / alias (period-accurate) -->
-    <div class="panel">
-      <span class="panel-title">By model / alias — this period</span>
-      {#if byModel.length === 0}
-        <p class="empty">No usage this period.</p>
-      {:else}
-        <table class="table">
-          <thead>
-            <tr>
-              <th>Alias</th>
-              <th style="text-align:right">Reqs</th>
-              <th style="text-align:right">Tokens</th>
-              <th style="text-align:right">Cost</th>
-              <th style="width:26%">Share</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each byModel as m (m.label)}
+        <div class={tableWrapClass}>
+          <table class={tableClass}>
+            <thead>
               <tr>
-                <td>
-                  <span class="mono small">{m.label}</span>
-                  {#if m.kind}<span class="badge" style="margin-left:6px">{m.kind}</span>{/if}
-                </td>
-                <td class="mono" style="text-align:right">{m.requests}</td>
-                <td class="mono dim" style="text-align:right">{fmtTokens(m.tokens)}</td>
-                <td class="mono" style="text-align:right">{fmtUsd(m.cost)}</td>
-                <td>
-                  <div class="row-gap" style="flex-wrap:nowrap; gap:6px">
-                    <div class="meter" style="flex:1">
-                      <div
-                        class="meter-fill"
-                        style:width="{share(m.cost, modelCostTotal)}%"
-                      ></div>
-                    </div>
-                    <span class="muted tiny mono" style="width:38px; text-align:right">
-                      {share(m.cost, modelCostTotal)}%
-                    </span>
-                  </div>
-                </td>
+                <th class={thClass}>Key</th>
+                <th class={cn(thClass, "text-right")}>Reqs</th>
+                <th class={cn(thClass, "text-right")}>Tokens</th>
+                <th class={cn(thClass, "text-right")}>Spend</th>
+                <th class={cn(thClass, "w-[26%]")}>Share</th>
               </tr>
-            {/each}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {#each filteredEntries as e (e.downstream_key_id)}
+                <tr
+                  class={cn(trClickClass, keyFilter === e.downstream_key_id && trSelectedClass)}
+                  title="Filter ledger to this key"
+                  onclick={() => selectKey(e.downstream_key_id)}
+                >
+                  <td class={tdClass}>
+                    <div>{keyLabel(e.downstream_key_id)}</div>
+                    <div class={cn(mutedClass, monoClass, "text-[11px]")}>
+                      {shortId(e.downstream_key_id, 8)}
+                    </div>
+                  </td>
+                  <td class={cn(tdClass, monoClass, "text-right")}>{e.request_count}</td>
+                  <td class={cn(tdClass, monoClass, dimClass, "text-right")}>
+                    {fmtTokens((e.prompt_tokens ?? 0) + (e.completion_tokens ?? 0))}
+                  </td>
+                  <td class={cn(tdClass, monoClass, "text-right")}>{fmtUsd(e.total_usd)}</td>
+                  <td class={tdClass}>
+                    <div class="flex items-center gap-1.5">
+                      <div class="h-1.5 flex-1 overflow-hidden rounded-full bg-[var(--surface-muted)]">
+                        <div
+                          class="h-full rounded-full bg-[var(--accent)]"
+                          style:width="{share(e.total_usd, totals.usd)}%"
+                        ></div>
+                      </div>
+                      <span class={cn(mutedClass, monoClass, "w-9 text-right text-[11px]")}>
+                        {share(e.total_usd, totals.usd)}%
+                      </span>
+                    </div>
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
       {/if}
-    </div>
+    </Card>
+
+    <Card>
+      <PageHeader title="By model / alias — this period" />
+      {#if byModel.length === 0}
+        <EmptyState title="No usage this period." />
+      {:else}
+        <div class={tableWrapClass}>
+          <table class={tableClass}>
+            <thead>
+              <tr>
+                <th class={thClass}>Alias</th>
+                <th class={cn(thClass, "text-right")}>Reqs</th>
+                <th class={cn(thClass, "text-right")}>Tokens</th>
+                <th class={cn(thClass, "text-right")}>Cost</th>
+                <th class={cn(thClass, "w-[26%]")}>Share</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each byModel as m (m.label)}
+                <tr class="hover:bg-[var(--surface-muted)]/80">
+                  <td class={tdClass}>
+                    <span class={cn(monoClass, "text-xs")}>{m.label}</span>
+                    {#if m.kind}
+                      <Badge variant="secondary" class="ml-1.5">{m.kind}</Badge>
+                    {/if}
+                  </td>
+                  <td class={cn(tdClass, monoClass, "text-right")}>{m.requests}</td>
+                  <td class={cn(tdClass, monoClass, dimClass, "text-right")}>{fmtTokens(m.tokens)}</td>
+                  <td class={cn(tdClass, monoClass, "text-right")}>{fmtUsd(m.cost)}</td>
+                  <td class={tdClass}>
+                    <div class="flex items-center gap-1.5">
+                      <div class="h-1.5 flex-1 overflow-hidden rounded-full bg-[var(--surface-muted)]">
+                        <div
+                          class="h-full rounded-full bg-[var(--accent)]"
+                          style:width="{share(m.cost, modelCostTotal)}%"
+                        ></div>
+                      </div>
+                      <span class={cn(mutedClass, monoClass, "w-9 text-right text-[11px]")}>
+                        {share(m.cost, modelCostTotal)}%
+                      </span>
+                    </div>
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
+    </Card>
   </div>
 
-  <!-- Per-request ledger -->
-  <div class="panel">
-    <div class="row-between">
-      <span class="panel-title">Request ledger</span>
-      <span class="muted tiny">
-        latest {records.length} records{keyFilter ? ` · ${keyLabel(keyFilter)}` : ""} ·
-        click a row for the audit trail
-      </span>
-    </div>
+  <Card>
+    <PageHeader title="Request ledger">
+      {#snippet actions()}
+        <span class={cn(mutedClass, "text-[11px]")}>
+          latest {records.length} records{keyFilter ? ` · ${keyLabel(keyFilter)}` : ""}
+        </span>
+      {/snippet}
+    </PageHeader>
     {#if records.length === 0}
-      <p class="empty">No usage records yet.</p>
+      <EmptyState title="No usage records yet." />
     {:else}
-      <div class="table-wrap" style="max-height:480px; overflow-y:auto">
-        <table class="table">
+      <div class={cn(tableWrapClass, "max-h-[480px]")}>
+        <table class={tableClass}>
           <thead>
             <tr>
-              <th>Time</th>
-              <th>Alias</th>
-              <th>Provider / Model</th>
-              <th>Key</th>
-              <th style="text-align:right">Tokens</th>
-              <th style="text-align:right">Cost</th>
-              <th></th>
+              <th class={thClass}>Time</th>
+              <th class={thClass}>Alias</th>
+              <th class={thClass}>Provider / Model</th>
+              <th class={thClass}>Key</th>
+              <th class={cn(thClass, "text-right")}>Tokens</th>
+              <th class={cn(thClass, "text-right")}>Cost</th>
+              <th class={thClass}></th>
             </tr>
           </thead>
           <tbody>
             {#each records as r (r.id)}
-              <tr
-                class="clickable"
-                title="Open audit trail {shortId(r.request_id, 10)}"
-                onclick={() => app.openTrace(r.request_id)}
-              >
-                <td class="dim small" style="white-space:nowrap" title={r.ts}>{fmtAgo(r.ts)}</td>
-                <td class="mono">{r.alias ?? "—"}</td>
-                <td class="dim small">
+              <tr title="Request {shortId(r.request_id, 10)}">
+                <td class={cn(tdClass, dimClass, "text-xs whitespace-nowrap")} title={r.ts}>
+                  {fmtAgo(r.ts)}
+                </td>
+                <td class={cn(tdClass, monoClass)}>{r.alias ?? "—"}</td>
+                <td class={cn(tdClass, dimClass, "text-xs")}>
                   {#if r.provider_id}
-                    <span title={r.provider_id}>{providerNames.get(r.provider_id) ?? r.provider_id}</span>
-                    {#if r.model_id}<span class="muted mono"> / {r.model_id}</span>{/if}
+                    <span title={r.provider_id}>
+                      {providerNames.get(r.provider_id) ?? r.provider_id}
+                    </span>
+                    {#if r.model_id}<span class={cn(mutedClass, monoClass)}> / {r.model_id}</span>{/if}
                   {:else}
                     —
                   {/if}
                 </td>
-                <td class="small">{keyLabel(r.downstream_key_id)}</td>
-                <td class="mono dim small" style="text-align:right" title={tokenTitle(r)}>
+                <td class={cn(tdClass, "text-xs")}>{keyLabel(r.downstream_key_id)}</td>
+                <td
+                  class={cn(tdClass, monoClass, dimClass, "text-right text-xs")}
+                  title={tokenTitle(r)}
+                >
                   {r.prompt_tokens}→{r.completion_tokens}
                 </td>
-                <td class="mono" style="text-align:right">{fmtUsd(r.cost_usd)}</td>
-                <td style="width:1%">
-                  {#if r.stream}<span class="badge" title="streamed">sse</span>{/if}
+                <td class={cn(tdClass, monoClass, "text-right")}>{fmtUsd(r.cost_usd)}</td>
+                <td class={cn(tdClass, "w-px")}>
+                  {#if r.stream}<Badge variant="secondary" title="streamed">sse</Badge>{/if}
                 </td>
               </tr>
             {/each}
@@ -465,5 +506,5 @@
         </table>
       </div>
     {/if}
-  </div>
+  </Card>
 {/if}

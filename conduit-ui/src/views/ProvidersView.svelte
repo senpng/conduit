@@ -6,6 +6,25 @@
   import { fmtDate } from "../lib/format";
   import Modal from "../components/Modal.svelte";
   import OAuthPanel from "./OAuthPanel.svelte";
+  import Card from "../components/app/Card.svelte";
+  import PageHeader from "../components/app/PageHeader.svelte";
+  import Spinner from "../components/app/Spinner.svelte";
+  import Field from "../components/app/Field.svelte";
+  import Button from "../components/ui/button.svelte";
+  import Badge from "../components/ui/badge.svelte";
+  import {
+    controlClass,
+    selectClass,
+    tableWrapClass,
+    tableClass,
+    thClass,
+    tdClass,
+    monoClass,
+    dimClass,
+    mutedClass,
+  } from "$lib/ui";
+  import { cn } from "$lib/utils";
+  import { Plus, Pencil, KeyRound, Trash2 } from "@lucide/svelte";
 
   let list = $state<Provider[]>([]);
   let loading = $state(true);
@@ -133,99 +152,108 @@
   }
 </script>
 
-<div class="panel">
-  <div class="row-between">
-    <span class="panel-title">Upstream providers</span>
-    <div class="row-gap">
-      <button class="btn-ghost" onclick={() => (showOAuth = true)}>OAuth login</button>
-      <button class="btn-primary" onclick={() => (showForm = !showForm)}>
-        {showForm ? "Close form" : "＋ Add provider"}
-      </button>
-    </div>
-  </div>
+<Card>
+  <PageHeader title="Upstream providers" description="API-key and OAuth upstream accounts.">
+    {#snippet actions()}
+      <Button variant="outline" onclick={() => (showOAuth = true)}>OAuth login</Button>
+      <Button onclick={() => (showForm = !showForm)}>
+        <Plus class="h-4 w-4" />
+        {showForm ? "Close form" : "Add provider"}
+      </Button>
+    {/snippet}
+  </PageHeader>
 
   {#if showForm}
-    <div class="form-card">
-      <h3>New provider (API key)</h3>
-      <div class="form-grid">
-        <label>
-          Name
-          <input bind:value={form.name} placeholder="My OpenAI account" />
-        </label>
-        <label>
-          Kind
-          <select bind:value={form.kind} onchange={onKindChange}>
+    <div class="mb-4 rounded-lg border border-[var(--border)] bg-[var(--surface-muted)]/60 p-4">
+      <h3 class="mb-3 text-sm font-semibold text-[var(--text)]">New provider (API key)</h3>
+      <div class="grid gap-3 sm:grid-cols-2">
+        <Field label="Name">
+          <input class={controlClass} bind:value={form.name} placeholder="My OpenAI account" />
+        </Field>
+        <Field label="Kind">
+          <select class={selectClass} bind:value={form.kind} onchange={onKindChange}>
             <option value="openai">OpenAI</option>
             <option value="anthropic">Anthropic</option>
             <option value="other">Other (OpenAI-compatible)</option>
           </select>
-        </label>
-        <label>
-          Base URL
-          <input bind:value={form.base_url} placeholder="https://api.openai.com" />
-        </label>
-        <label>
-          API key (optional)
+        </Field>
+        <Field label="Base URL">
+          <input class={controlClass} bind:value={form.base_url} placeholder="https://api.openai.com" />
+        </Field>
+        <Field label="API key (optional)" hint="Stored in OS keychain / master-password store.">
           <input
+            class={controlClass}
             type="password"
             bind:value={form.api_key}
-            placeholder="sk-… stored in secret backend"
+            placeholder="sk-…"
             autocomplete="off"
           />
-          <span class="field-hint">Sent as <code>api_key</code>; held by the OS keychain / master-password store.</span>
-        </label>
+        </Field>
       </div>
-      <div class="form-actions">
-        <button class="btn-primary" onclick={create}>Create</button>
-        <button class="btn-ghost" onclick={() => (showForm = false)}>Cancel</button>
+      <div class="mt-3 flex gap-2">
+        <Button onclick={create}>Create</Button>
+        <Button variant="outline" onclick={() => (showForm = false)}>Cancel</Button>
       </div>
     </div>
   {/if}
 
   {#if loading && list.length === 0}
-    <div class="loader"><span class="spinner"></span></div>
+    <Spinner />
   {:else}
-    <div class="table-wrap">
-      <table class="table">
+    <div class={tableWrapClass}>
+      <table class={tableClass}>
         <thead>
           <tr>
-            <th>Name</th>
-            <th>Kind</th>
-            <th>Base URL</th>
-            <th>Key ref</th>
-            <th>Created</th>
-            <th></th>
+            <th class={thClass}>Name</th>
+            <th class={thClass}>Kind</th>
+            <th class={thClass}>Base URL</th>
+            <th class={thClass}>Key ref</th>
+            <th class={thClass}>Created</th>
+            <th class={thClass}></th>
           </tr>
         </thead>
         <tbody>
           {#each list as p (p.id)}
-            <tr>
-              <td>{p.name}</td>
-              <td><span class="badge accent">{p.kind}</span></td>
-              <td class="mono dim small">{p.base_url}</td>
-              <td class="mono muted tiny">{p.upstream_key_ref}</td>
-              <td class="dim small">{fmtDate(p.created_at)}</td>
-              <td class="actions">
-                <button class="btn-icon" title="Edit name / base URL" onclick={() => startEdit(p)}>✎</button>
-                <button
-                  class="btn-icon"
-                  title="Rotate API key"
-                  onclick={() => {
-                    secretFor = p;
-                    secretValue = "";
-                  }}>⚿</button
-                >
-                <button class="btn-icon danger" title="Delete" onclick={() => void remove(p)}>✕</button>
+            <tr class="hover:bg-[var(--surface-muted)]/80">
+              <td class={tdClass}>{p.name}</td>
+              <td class={tdClass}><Badge>{p.kind}</Badge></td>
+              <td class={cn(tdClass, monoClass, dimClass, "text-xs")}>{p.base_url}</td>
+              <td class={cn(tdClass, monoClass, mutedClass, "text-[11px]")}>{p.upstream_key_ref}</td>
+              <td class={cn(tdClass, dimClass, "text-xs")}>{fmtDate(p.created_at)}</td>
+              <td class={cn(tdClass, "w-px")}>
+                <div class="flex items-center gap-0.5">
+                  <Button variant="ghost" size="icon" title="Edit" onclick={() => startEdit(p)}>
+                    <Pencil class="h-4 w-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    title="Rotate API key"
+                    onclick={() => {
+                      secretFor = p;
+                      secretValue = "";
+                    }}
+                  >
+                    <KeyRound class="h-4 w-4" />
+                  </Button>
+                  <Button variant="ghost" size="icon" title="Delete" onclick={() => void remove(p)}>
+                    <Trash2 class="h-4 w-4 text-[var(--danger)]" />
+                  </Button>
+                </div>
               </td>
             </tr>
           {:else}
-            <tr><td colspan="6" class="empty">No providers yet — add one or use OAuth login.</td></tr>
+            <tr>
+              <td class={cn(tdClass, "py-8 text-center text-[var(--text-muted)]")} colspan="6">
+                No providers yet — add one or use OAuth login.
+              </td>
+            </tr>
           {/each}
         </tbody>
       </table>
     </div>
   {/if}
-</div>
+</Card>
 
 {#if showOAuth}
   <OAuthPanel
@@ -237,37 +265,39 @@
 {/if}
 
 {#if secretFor}
-  <Modal onclose={() => (secretFor = null)}>
-    <h3>Rotate API key — {secretFor.name}</h3>
-    <p class="modal-hint">
-      Stored via the secret backend. Body field is <code>api_key</code> (daemon
-      contract). Overwrite requires confirmation.
+  <Modal onclose={() => (secretFor = null)} title={`Rotate API key — ${secretFor.name}`}>
+    <p class="mb-3 text-sm text-[var(--text-secondary)]">
+      Stored via the secret backend. Overwrite requires confirmation.
     </p>
     <input
+      class={cn(controlClass, "mb-4")}
       type="password"
       bind:value={secretValue}
       placeholder="sk-…"
       autocomplete="off"
     />
-    <div class="form-actions">
-      <button class="btn-danger" disabled={!secretValue.trim()} onclick={saveSecret}>
+    <div class="flex justify-end gap-2">
+      <Button variant="destructive" disabled={!secretValue.trim()} onclick={saveSecret}>
         Overwrite secret
-      </button>
-      <button class="btn-ghost" onclick={() => (secretFor = null)}>Cancel</button>
+      </Button>
+      <Button variant="outline" onclick={() => (secretFor = null)}>Cancel</Button>
     </div>
   </Modal>
 {/if}
 
 {#if editing}
-  <Modal onclose={() => (editing = null)}>
-    <h3>Edit provider — {editing.name}</h3>
-    <div class="form-grid">
-      <label>Name <input bind:value={editForm.name} /></label>
-      <label>Base URL <input bind:value={editForm.base_url} /></label>
+  <Modal onclose={() => (editing = null)} title={`Edit provider — ${editing.name}`}>
+    <div class="mb-4 grid gap-3">
+      <Field label="Name">
+        <input class={controlClass} bind:value={editForm.name} />
+      </Field>
+      <Field label="Base URL">
+        <input class={controlClass} bind:value={editForm.base_url} />
+      </Field>
     </div>
-    <div class="form-actions">
-      <button class="btn-primary" onclick={saveEdit}>Save</button>
-      <button class="btn-ghost" onclick={() => (editing = null)}>Cancel</button>
+    <div class="flex justify-end gap-2">
+      <Button onclick={saveEdit}>Save</Button>
+      <Button variant="outline" onclick={() => (editing = null)}>Cancel</Button>
     </div>
   </Modal>
 {/if}

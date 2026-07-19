@@ -29,8 +29,6 @@ pub struct Args {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Show traces
-    Trace(cmd::trace::TraceArgs),
     /// Request usage / cost ledger
     Usage(cmd::usage::UsageArgs),
     /// Model pricing (list / reload / sync from LiteLLM)
@@ -45,8 +43,6 @@ pub enum Command {
     OAuth(cmd::oauth::OAuthArgs),
     /// Check daemon health
     Status,
-    /// Runtime settings (trace enable/disable, …)
-    Settings(cmd::settings::SettingsArgs),
 }
 
 #[tokio::main]
@@ -58,7 +54,6 @@ async fn main() -> Result<()> {
         .init();
 
     match args.command {
-        Command::Trace(a) => cmd::trace::run(&args.console_addr, a, &args.output).await,
         Command::Usage(a) => cmd::usage::run(&args.console_addr, a, &args.output).await,
         Command::Pricing(a) => cmd::pricing::run(&args.console_addr, a, &args.output).await,
         Command::Provider(a) => cmd::provider::run(&args.console_addr, a, &args.output).await,
@@ -66,6 +61,5 @@ async fn main() -> Result<()> {
         Command::Key(a) => cmd::key::run(&args.console_addr, a, &args.output).await,
         Command::OAuth(a) => cmd::oauth::run(&args.console_addr, a, &args.output).await,
         Command::Status => cmd::status::run(&args.console_addr).await,
-        Command::Settings(a) => cmd::settings::run(&args.console_addr, a, &args.output).await,
     }
 }

@@ -1,7 +1,6 @@
 /// Records semantic losses that occurred while translating a request or response
-/// through a codec. Attached to traces so callers can audit what was silently
-/// changed (e.g. `ToolChoice::AnyOf` degraded to `Required` because the target
-/// provider does not support `AnyOf`).
+/// through a codec (e.g. `ToolChoice::AnyOf` degraded to `Required` because the
+/// target provider does not support `AnyOf`).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LossReport {
     pub warnings: Vec<LossWarning>,

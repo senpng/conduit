@@ -6,8 +6,7 @@
 //!   L3 Router         — pure function routing decision (see stage.rs)
 //!   L4 Codec          — IR ↔ wire translation (conduit-codec)
 //!   L5 Upstream       — provider HTTP call (conduit-upstream)
-//!   L6 Egress Filter  — finalize, compute cost, emit trace events
-//!   L7 Sink           — event bus → trace store
+//!   L6 Egress Filter  — cost calculation + usage ledger
 
 pub mod context;
 pub mod egress;

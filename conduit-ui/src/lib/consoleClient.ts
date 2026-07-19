@@ -225,65 +225,8 @@ export interface PricingRow {
 export interface HealthResponse {
   status: string;
   version: string;
-  /** Present when daemon supports the trace switch. */
-  trace_enabled?: boolean;
 }
 
-export interface SettingsResponse {
-  trace: {
-    enabled: boolean;
-    config_default?: boolean;
-    runtime_override?: boolean | null;
-    max_segment_mb?: number;
-    max_db_size_mb?: number;
-    retention_days?: number;
-  };
-}
-
-export interface TraceIndexRow {
-  id: string;
-  /** Shared request audit id (all events of one call). */
-  trace_id?: string;
-  kind?: string;
-  ts?: string;
-  alias?: string;
-  provider_id?: string | null;
-  model_id?: string | null;
-  status_code?: number;
-  latency_ms?: number;
-  cost_usd?: number;
-  error_kind?: string | null;
-}
-
-/** Complete audit bundle from GET /console/traces/{id}. */
-export interface TraceAuditBundle {
-  trace_id: string;
-  events: unknown[];
-  request?: unknown;
-  request_ir?: unknown;
-  request_headers?: Record<string, string | string[]> | null;
-  response?: unknown;
-  response_headers?: Record<string, string | string[]> | null;
-  wire_format?: string | null;
-  stream?: boolean;
-  stream_frames?: string[] | null;
-}
-
-export interface TraceListResponse {
-  traces: TraceIndexRow[];
-}
-
-export interface ReplayPlan {
-  dry_run: boolean;
-  trace_id: string;
-  event_kind?: string;
-  request_summary?: unknown;
-  intended_target?: unknown;
-  routing_error?: string | null;
-  upstream_called?: boolean;
-  billed?: boolean;
-  note?: string;
-}
 
 export interface OAuthProviderMeta {
   kind: string;
@@ -320,15 +263,6 @@ export function createConsoleApi(fetchImpl?: FetchLike) {
       check: () => consoleRequest<HealthResponse>("/health", opts()),
     },
 
-    settings: {
-      get: () => consoleRequest<SettingsResponse>("/console/settings", opts()),
-      update: (body: { trace?: { enabled?: boolean } }) =>
-        consoleRequest<SettingsResponse>("/console/settings", {
-          ...opts(),
-          method: "PUT",
-          body: JSON.stringify(body),
-        }),
-    },
 
     providers: {
       list: () => consoleRequest<Provider[]>("/console/providers", opts()),
@@ -472,26 +406,6 @@ export function createConsoleApi(fetchImpl?: FetchLike) {
         }),
     },
 
-    traces: {
-      /** Default list is one row per request; `all=true` lists every event. */
-      list: (limit = 20, all = false) =>
-        consoleRequest<TraceListResponse>(
-          `/console/traces?limit=${encodeURIComponent(String(limit))}${all ? "&all=true" : ""}`,
-          opts(),
-        ),
-      get: (id: string) =>
-        consoleRequest<unknown>(`/console/traces/${encodeURIComponent(id)}`, opts()),
-      /** Default dry-run; live execute is not supported by daemon. */
-      replay: (id: string, dryRun = true) =>
-        consoleRequest<ReplayPlan>(
-          `/console/traces/${encodeURIComponent(id)}/replay?dry_run=${dryRun}`,
-          {
-            ...opts(),
-            method: "POST",
-          },
-        ),
-      streamUrl: () => consoleUrl("/console/traces/stream"),
-    },
 
     oauth: {
       listProviders: () =>
@@ -535,11 +449,9 @@ export const api = createConsoleApi();
 
 // Back-compat named exports used by views
 export const health = api.health;
-export const settings = api.settings;
 export const providers = api.providers;
 export const routes = api.routes;
 export const keys = api.keys;
 export const usage = api.usage;
 export const pricing = api.pricing;
-export const traces = api.traces;
 export const oauth = api.oauth;

@@ -15,7 +15,7 @@ use crate::check::{QuotaCheckRequest, QuotaRecordRequest, RecordFn};
 ///
 /// * **`check`** — may reject the request before it reaches the upstream (RPM).
 /// * **`record`** — called *after* a successful response to persist consumption
-///   (tokens + cost). Must not depend on the trace log.
+///   (tokens + cost).
 ///
 /// Implementations must be `Send + Sync` so they can be shared across async
 /// tasks via `Arc<dyn QuotaEngine>`.

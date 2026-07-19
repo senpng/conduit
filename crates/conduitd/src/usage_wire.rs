@@ -1,7 +1,7 @@
 //! Usage ledger wiring used by the daemon quota engine.
 //!
 //! Records every request's token + cost consumption into `usage_records`.
-//! Independent of the trace log so spend survives when tracing is disabled.
+//! Writes completed-request spend into the usage ledger.
 
 use std::sync::Arc;
 

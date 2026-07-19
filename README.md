@@ -1,26 +1,25 @@
 # Conduit
 
-Local-first LLM gateway with routing, protocol translation, usage accounting, and a complete audit trail.
+Local-first LLM gateway with routing, protocol translation, and usage accounting.
 
-Conduit exposes OpenAI- and Anthropic-compatible endpoints, forwards requests to configured providers, and keeps operational data on your machine. It consists of a Rust daemon (`conduitd`), a scriptable CLI (`conduitctl`), and an optional Tauri + Svelte desktop console (`conduit-ui`).
+Conduit exposes OpenAI-compatible (Chat Completions and Responses) and Anthropic Messages endpoints, forwards requests to configured providers, and keeps operational data on your machine. It consists of a Rust daemon (`conduitd`), a scriptable CLI (`conduitctl`), and an optional Tauri + Svelte desktop console (`conduit-ui`).
 
 > [!WARNING]
 > Conduit is pre-release software under active development. Configuration and storage formats may change without migration support. There are no official binary releases yet; build from source for development and evaluation.
 
 ## Why Conduit?
 
-- **Local-first operation**: configuration, secrets, traces, and usage records remain on the host running Conduit.
+- **Local-first operation**: configuration, secrets, and usage records remain on the host running Conduit.
 - **Compatible ingress APIs**: supports OpenAI Chat Completions, OpenAI Responses, and native Anthropic Messages requests, including streaming.
 - **Multi-provider routing**: fixed, weighted, and ordered fallback strategies with retry handling.
-- **Faithful protocol translation**: codec losses are explicit and attached to request traces instead of being silently discarded.
-- **Complete audit trail**: records the original wire request, routing decision, upstream response, SSE frames, usage, cost, and errors.
-- **Independent usage ledger**: usage and cost remain available when request tracing is disabled.
+- **Faithful protocol translation**: codec losses are explicit (`LossReport`) instead of being silently discarded.
+- **Usage ledger**: per-request tokens and cost for operator spend queries.
 - **Operator tooling**: inspect and configure the gateway through a desktop console or automate common operations with `conduitctl`.
 - **OAuth provider support**: includes Claude, Codex, and Grok subscription-account flows in addition to API-key providers.
 
 ## Project Status
 
-The core gateway path, provider and route management, streaming, tracing, usage accounting, pricing, and operator console are implemented. The project is not yet production-ready: release automation, versioned database migrations, end-to-end test coverage, and several community files are still in progress. See [Tasks.md](Tasks.md) for the current implementation status and roadmap.
+The core gateway path, provider and route management, streaming, usage accounting, pricing, and operator console are implemented. The project is not yet production-ready: release automation, versioned database migrations, end-to-end test coverage, and several community files are still in progress.
 
 ## Architecture
 
@@ -37,29 +36,27 @@ flowchart LR
   subgraph Daemon[conduitd]
     direction TB
     Gateway[Gateway API<br/>127.0.0.1:4000]
-    Pipeline[L1-L7 pipeline<br/>Auth · Route · Codec · Upstream]
+    Pipeline[L1-L6 pipeline<br/>Auth · Route · Codec · Upstream]
     Console[Console API<br/>127.0.0.1:4001]
-    Trace[Trace sink<br/>Append-only log + SQLite index]
     Store[Configuration and usage<br/>SQLite]
 
     Gateway --> Pipeline
-    Pipeline --> Trace
     Pipeline --> Store
-    Console --> Trace
     Console --> Store
-    Console -. Reload routes and settings .-> Pipeline
+    Console -. Reload routes .-> Pipeline
   end
 
   Providers[LLM providers<br/>API keys or OAuth]
 
   OpenAI -->|POST /v1/chat/completions| Gateway
+  OpenAI -->|POST /v1/responses| Gateway
   Anthropic -->|POST /v1/messages| Gateway
   UI --> Console
   CLI --> Console
   Pipeline --> Providers
 ```
 
-Requests pass through a seven-layer pipeline: transport, ingress filters, routing, codec translation, upstream transport, egress accounting, and the trace sink. The routing decision is pure and deterministic; trace events are written to an append-only segmented log with a SQLite index, while configuration and usage records use SQLite.
+Requests pass through a layered pipeline: transport, ingress filters, routing, codec translation, upstream transport, and egress accounting (usage/cost ledger). The routing decision is pure and deterministic; configuration and usage records use SQLite.
 
 For crate boundaries, storage details, security trade-offs, and codec contracts, read [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -67,24 +64,26 @@ For crate boundaries, storage details, security trade-offs, and codec contracts,
 
 ### Ingress APIs
 
-| API | Endpoint | Streaming |
-| --- | --- | --- |
-| OpenAI Chat Completions | `POST /v1/chat/completions` | Yes |
-| OpenAI Responses | `POST /v1/responses` | Yes |
-| Anthropic Messages | `POST /v1/messages` | Yes |
-| OpenAI Models | `GET /v1/models` | N/A |
+| API | Endpoint | Streaming | Notes |
+| --- | --- | --- | --- |
+| OpenAI Chat Completions | `POST /v1/chat/completions` | Yes | Classic chat `messages` shape |
+| OpenAI Responses | `POST /v1/responses` | Yes | First-class ingress; local `previous_response_id` continuation when `store` is enabled |
+| Anthropic Messages | `POST /v1/messages` | Yes | Native Anthropic wire format |
+| OpenAI Models | `GET /v1/models` | N/A | Lists configured route aliases |
+
+Clients can speak Chat Completions or Responses on the gateway; Conduit translates to the selected upstream protocol (including Responses-native providers such as Codex and Grok chat-proxy).
 
 ### Provider kinds
 
-| Kind | Authentication | Notes |
-| --- | --- | --- |
-| `openai` | API key | OpenAI-compatible upstreams |
-| `anthropic` | API key | Anthropic Messages upstreams |
-| `claude-oauth` | OAuth + PKCE | Claude subscription account |
-| `codex-oauth` | OAuth + PKCE | ChatGPT Codex Responses upstream |
-| `grok-oauth` | OAuth device flow | Grok CLI chat-proxy upstream |
+| Kind | Authentication | Upstream protocol | Notes |
+| --- | --- | --- | --- |
+| `openai` | API key | Chat Completions | OpenAI-compatible chat upstreams |
+| `anthropic` | API key | Messages | Anthropic Messages upstreams |
+| `claude-oauth` | OAuth + PKCE | Messages | Claude subscription account |
+| `codex-oauth` | OAuth + PKCE | Responses | ChatGPT Codex `/responses` |
+| `grok-oauth` | OAuth device flow | Responses | Grok CLI chat-proxy `/v1/responses` |
 
-Provider compatibility is evolving. Consult [Tasks.md](Tasks.md) before relying on a specific codec edge case or OAuth flow.
+Provider compatibility is evolving; treat codec edge cases and OAuth flows as best-effort until a release is cut.
 
 ## Getting Started
 
@@ -157,6 +156,8 @@ The console connects to `http://127.0.0.1:4001` by default. Set `VITE_CONDUIT_CO
 
 After configuring a provider and a route, send an OpenAI-compatible request. Use the downstream key created in the **Keys** view as a bearer token.
 
+**Chat Completions:**
+
 ```bash
 curl http://127.0.0.1:4000/v1/chat/completions \
   -H 'content-type: application/json' \
@@ -167,12 +168,26 @@ curl http://127.0.0.1:4000/v1/chat/completions \
   }'
 ```
 
-Inspect the resulting trace and usage record in the desktop console or with the CLI:
+**Responses** (same route alias; useful for Codex / Grok clients and Responses-native SDKs):
 
 ```bash
-cargo run -p conduitctl -- trace list
+curl http://127.0.0.1:4000/v1/responses \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer <conduit-key>' \
+  -d '{
+    "model": "gpt-4o",
+    "input": "Hello from Conduit",
+    "store": true
+  }'
+```
+
+With `"store": true`, subsequent turns may pass `previous_response_id` and Conduit will expand the continuation from local state when needed.
+
+Inspect usage and spend in the desktop console or with the CLI:
+
+```bash
 cargo run -p conduitctl -- usage summary
-cargo run -p conduitctl -- trace tail
+cargo run -p conduitctl -- usage list
 ```
 
 Run `cargo run -p conduitctl -- --help` or append `--help` to any subcommand for the complete CLI reference.
@@ -188,15 +203,7 @@ console_port = 4001
 
 [security]
 backend = "keychain"
-
-[trace]
-enabled = true
-max_segment_mb = 64
-max_db_size_mb = 2048
-retention_days = 90
 ```
-
-Runtime changes made through the UI or `conduitctl settings` are stored in `<data-dir>/settings.json` and take precedence over the matching file setting.
 
 ### Environment variables
 
@@ -222,19 +229,9 @@ By default, Conduit stores its state under `~/.conduit`:
 | --- | --- |
 | Providers, routes, keys | SQLite |
 | Usage records | SQLite |
-| Trace metadata | SQLite index |
-| Trace payloads | Append-only compressed segment files |
-| Runtime settings | JSON file |
 | Provider secrets | Selected secret backend plus the documented local mirror behavior |
 
 Secret handling currently makes an explicit local-first trade-off: the keychain-backed path mirrors secrets to a mode-`0600` file so the daemon can operate without interactive keychain prompts. Treat the data directory as sensitive and read the full [security model](ARCHITECTURE.md#security-model) before evaluating Conduit for production use.
-
-Tracing can be disabled without disabling usage accounting:
-
-```bash
-cargo run -p conduitctl -- settings trace off
-cargo run -p conduitctl -- settings trace on
-```
 
 ## Development
 
@@ -270,14 +267,13 @@ cargo run -p conduitctl -- --help
 
 ```text
 crates/
-  conduit-ir/        Canonical request, response, usage, and trace types
+  conduit-ir/        Canonical request, response, usage, and span/content types
   conduit-codec/     OpenAI, Anthropic, and Responses wire codecs
   conduit-router/    Pure routing decisions and retry policies
   conduit-upstream/  Provider HTTP clients and SSE handling
   conduit-oauth/     Claude, Codex, and Grok OAuth flows
   conduit-secret/    Secret backend implementations
   conduit-store/     SQLite configuration, pricing, and usage repositories
-  conduit-trace/     Append-only trace log and index
   conduit-quota/     Rate limiting and usage hooks
   conduit-pipeline/  End-to-end request orchestration
   conduitd/          Gateway daemon and console API
@@ -289,17 +285,16 @@ conduit-ui/          Tauri 2 + Svelte 5 desktop console
 
 Contributions are welcome while the project is taking shape. Before opening a change:
 
-1. Check [Tasks.md](Tasks.md) for known gaps and current priorities.
-2. Keep changes focused and preserve Conduit's faithful-proxy and complete-audit-trail guarantees.
-3. Add or update tests for behavior changes.
-4. Run the Rust and UI quality gates relevant to your change.
-5. Explain user-visible behavior, compatibility impact, and storage changes in the pull request.
+1. Keep changes focused and preserve Conduit's faithful-proxy guarantees.
+2. Add or update tests for behavior changes.
+3. Run the Rust and UI quality gates relevant to your change.
+4. Explain user-visible behavior, compatibility impact, and storage changes in the pull request.
 
 A dedicated contribution guide, issue templates, and pull request template have not been added yet.
 
 ## Security
 
-Do not report suspected vulnerabilities in a public issue. This repository does not yet publish a private disclosure address or response SLA. Until a security policy is added, contact the repository owner through a private channel available on the hosting platform. See [Tasks.md](Tasks.md) for the planned `SECURITY.md`.
+Do not report suspected vulnerabilities in a public issue. This repository does not yet publish a private disclosure address or response SLA. Until a security policy is added, contact the repository owner through a private channel available on the hosting platform.
 
 ## License
 

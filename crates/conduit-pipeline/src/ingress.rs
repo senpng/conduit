@@ -39,7 +39,7 @@ pub fn require_bearer(bearer: Option<&str>) -> Result<&str, GatewayError> {
 }
 
 /// Map a successful key-policy lookup into the stable identity used for
-/// usage ledgers and traces. Rejects missing policy (unknown key).
+/// usage ledger. Rejects missing policy (unknown key).
 ///
 /// `raw_bearer` is only used to ensure we never return it as the identity;
 /// the returned policy's `key_id` must differ from the raw secret when they

@@ -27,28 +27,6 @@ use crate::{
     state::DaemonState,
 };
 
-/// Collect inbound headers for trace audit.
-///
-/// Multi-valued headers become JSON arrays; single values stay strings.
-fn headers_for_audit(headers: &HeaderMap) -> Value {
-    use std::collections::BTreeMap;
-    let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (name, value) in headers.iter() {
-        let key = name.as_str().to_string();
-        let raw = value.to_str().unwrap_or("<non-utf8>");
-        map.entry(key).or_default().push(raw.to_string());
-    }
-    let mut obj = serde_json::Map::new();
-    for (k, mut vs) in map {
-        if vs.len() == 1 {
-            obj.insert(k, Value::String(vs.pop().unwrap()));
-        } else {
-            obj.insert(k, Value::Array(vs.into_iter().map(Value::String).collect()));
-        }
-    }
-    Value::Object(obj)
-}
-
 /// Extract raw bearer secret from Authorization header.
 /// Format: `Bearer <token>` or `Authorization: <token>`
 ///
@@ -227,12 +205,13 @@ pub async fn responses(
     ) {
         Ok(request) => request,
         Err(error) => {
+            let msg = error.to_string();
             return (
                 StatusCode::BAD_REQUEST,
                 Json(OpenAiResponsesCodec::error_body(
                     "invalid_request_error",
                     None,
-                    &error.to_string(),
+                    &msg,
                 )),
             )
                 .into_response();
@@ -240,9 +219,7 @@ pub async fn responses(
     };
 
     let ingress_wire = conduit_pipeline::IngressWire {
-        format: conduit_ir::trace::WireFormat::OpenaiResponses,
-        body: body.clone(),
-        headers: headers_for_audit(&headers),
+        format: conduit_ir::wire_format::WireFormat::OpenaiResponses,
     };
 
     match state
@@ -392,7 +369,6 @@ pub async fn health(State(state): State<Arc<DaemonState>>) -> impl IntoResponse 
     Json(json!({
         "status": "ok",
         "version": state.version,
-        "trace_enabled": state.trace_sink.is_enabled(),
     }))
 }
 
@@ -434,12 +410,13 @@ pub async fn chat_completions(
     ) {
         Ok(r) => r,
         Err(e) => {
+            let msg = e.to_string();
             return (
                 StatusCode::BAD_REQUEST,
                 Json(OpenAiCodec::error_body(
                     "invalid_request_error",
                     None,
-                    &e.to_string(),
+                    &msg,
                 )),
             )
                 .into_response();
@@ -448,9 +425,7 @@ pub async fn chat_completions(
 
     let client_headers = extract_client_headers(&headers);
     let ingress_wire = conduit_pipeline::IngressWire {
-        format: conduit_ir::trace::WireFormat::OpenaiChat,
-        body: body.clone(),
-        headers: headers_for_audit(&headers),
+        format: conduit_ir::wire_format::WireFormat::OpenaiChat,
     };
 
     // Shared pipeline handle — routing table is ArcSwap-loaded inside run().
@@ -582,12 +557,13 @@ pub async fn messages(
     ) {
         Ok(r) => r,
         Err(e) => {
+            let msg = e.to_string();
             return (
                 StatusCode::BAD_REQUEST,
                 Json(AnthropicCodec::error_body(
                     "invalid_request_error",
                     None,
-                    &e.to_string(),
+                    &msg,
                 )),
             )
                 .into_response();
@@ -596,9 +572,7 @@ pub async fn messages(
 
     let client_headers = extract_client_headers(&headers);
     let ingress_wire = conduit_pipeline::IngressWire {
-        format: conduit_ir::trace::WireFormat::AnthropicMessages,
-        body: body.clone(),
-        headers: headers_for_audit(&headers),
+        format: conduit_ir::wire_format::WireFormat::AnthropicMessages,
     };
 
     match state
@@ -735,19 +709,6 @@ mod auth_status_tests {
         assert_eq!(extract_key_id(&h).as_deref(), Some("ck_test_secret"));
     }
 
-    #[test]
-    fn headers_for_audit_preserves_all_values() {
-        let mut h = HeaderMap::new();
-        h.insert("authorization", "Bearer sk-secret-token".parse().unwrap());
-        h.insert("x-api-key", "ck_secret".parse().unwrap());
-        h.insert("user-agent", "test-client/1.0".parse().unwrap());
-        h.insert("content-type", "application/json".parse().unwrap());
-        let v = headers_for_audit(&h);
-        assert_eq!(v["authorization"], "Bearer sk-secret-token");
-        assert_eq!(v["x-api-key"], "ck_secret");
-        assert_eq!(v["user-agent"], "test-client/1.0");
-        assert_eq!(v["content-type"], "application/json");
-    }
 }
 
 /// Tests that hit shipped Anthropic codec + route surface (no parallel reimplementation).

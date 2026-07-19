@@ -1,14 +1,8 @@
-//! L6 Egress Filter: post-response finalization — compute cost, emit final trace event.
+//! L6 Egress Filter: cost calculation and usage ledger.
 
-use conduit_ir::{canonical::Usage, pricing::pricing_kind_aliases, trace::TraceEventKind};
-
-use super::context::PipelineContext;
+use conduit_ir::{canonical::Usage, pricing::pricing_kind_aliases};
 
 /// Compute USD cost for a completed request using the pricing table.
-/// Returns 0.0 if pricing is unknown (logs a warning).
-///
-/// Lookup tries the raw `provider_kind` first, then common OAuth/kind aliases
-/// (the PricingRepo also has its own fallback chain).
 pub fn compute_cost(
     provider_kind: &str,
     model_id: &str,
@@ -16,7 +10,6 @@ pub fn compute_cost(
     pricing_fn: impl Fn(&str, &str) -> Option<ModelPricing>,
 ) -> f64 {
     let price = pricing_fn(provider_kind, model_id).or_else(|| {
-        // Secondary aliases when the injected fn only does exact match.
         for alt in pricing_kind_aliases(provider_kind).iter().copied() {
             if let Some(p) = pricing_fn(alt, model_id) {
                 return Some(p);
@@ -53,12 +46,30 @@ pub struct ModelPricing {
     pub reasoning_per_mtok: Option<f64>,
 }
 
-/// Finalize the pipeline context and emit the FinalUsage trace event.
-pub fn finalize(ctx: &mut PipelineContext, cost_usd: f64) {
-    ctx.push_event(TraceEventKind::FinalUsage {
-        usage: ctx.usage.clone(),
-        cost_usd,
-        loss_report: ctx.loss_report.clone(),
-        downstream_key_id: ctx.downstream_key_id.clone(),
-    });
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use conduit_ir::canonical::Usage;
+
+    #[test]
+    fn compute_cost_uses_pricing_fn() {
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 500_000,
+            total_tokens: 1_500_000,
+            reasoning_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        let cost = compute_cost("openai", "gpt-4o", &usage, |_, _| {
+            Some(ModelPricing {
+                input_per_mtok: 1.0,
+                output_per_mtok: 2.0,
+                cache_read_per_mtok: None,
+                cache_write_per_mtok: None,
+                reasoning_per_mtok: None,
+            })
+        });
+        assert!((cost - 2.0).abs() < 1e-12);
+    }
 }

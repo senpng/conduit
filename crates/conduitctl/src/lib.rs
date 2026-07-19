@@ -9,6 +9,4 @@ pub use console_client::{
 };
 pub use dto::{
     CreateKeyBody, CreateProviderBody, CreateRouteBody, HealthResponse, KeyCreateResponse,
-    TraceIndexRowDto, TraceListResponse,
 };
-pub use util::sse::{classify_sse_frame, extract_sse_data, parse_sse_frame, SseFrame};

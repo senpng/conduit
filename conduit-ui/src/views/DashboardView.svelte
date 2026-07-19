@@ -1,35 +1,48 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { app } from "../state/app.svelte";
-  import { live } from "../state/live.svelte";
   import {
     providers as providersApi,
     routes as routesApi,
     keys as keysApi,
     usage as usageApi,
-    traces as tracesApi,
   } from "../lib/consoleClient";
-  import type { TraceIndexRow } from "../lib/consoleClient";
+  import type { UsageRecord } from "../lib/consoleClient";
   import { fmtUsd2, fmtMs, fmtAgo, shortId } from "../lib/format";
-  import StatusPill from "../components/StatusPill.svelte";
+  import Alert from "../components/app/Alert.svelte";
+  import StatCard from "../components/app/StatCard.svelte";
+  import Card from "../components/app/Card.svelte";
+  import PageHeader from "../components/app/PageHeader.svelte";
+  import Spinner from "../components/app/Spinner.svelte";
+  import EmptyState from "../components/app/EmptyState.svelte";
+  import Button from "../components/ui/button.svelte";
+  import {
+    tableWrapClass,
+    tableClass,
+    thClass,
+    tdClass,
+    monoClass,
+    dimClass,
+  } from "$lib/ui";
+  import { cn } from "$lib/utils";
 
   let providerCount = $state<number | null>(null);
   let routeCount = $state<number | null>(null);
   let keyCount = $state<number | null>(null);
   let monthSpend = $state<number | null>(null);
   let usagePeriod = $state("");
-  let recent = $state<TraceIndexRow[]>([]);
+  let recent = $state<UsageRecord[]>([]);
   let loading = $state(true);
 
   async function load() {
     loading = true;
     try {
-      const [p, r, k, b, t] = await Promise.all([
+      const [p, r, k, b, u] = await Promise.all([
         providersApi.list(),
         routesApi.list(),
         keysApi.list(),
         usageApi.summary().catch(() => null),
-        tracesApi.list(5).catch(() => ({ traces: [] }) as { traces: TraceIndexRow[] }),
+        usageApi.list(5).catch(() => ({ entries: [] as UsageRecord[] })),
       ]);
       providerCount = p.length;
       routeCount = r.length;
@@ -38,7 +51,7 @@
         usagePeriod = b.period;
         monthSpend = b.total_usd ?? 0;
       }
-      recent = t.traces ?? [];
+      recent = u.entries ?? [];
     } catch (e: unknown) {
       app.toast(e instanceof Error ? e.message : String(e), "error");
     } finally {
@@ -55,90 +68,80 @@
 </script>
 
 {#if !app.isLoopback}
-  <div class="warn-bar">
-    ⚠ Console endpoint is not loopback ({app.consoleBase}) — OAuth PKCE callbacks bind to
+  <Alert variant="warning" class="mb-4">
+    Console endpoint is not loopback ({app.consoleBase}) — OAuth PKCE callbacks bind to
     the daemon machine; prefer device-code or API-key providers remotely.
-  </div>
+  </Alert>
 {/if}
 
-<div class="card-grid">
-  <div class="stat-card">
-    <span class="stat-label">Daemon</span>
-    <span
-      class="stat-value"
-      style:color={app.healthError ? "var(--red)" : "var(--green)"}
-    >
-      {app.healthError ? "offline" : "online"}
-    </span>
-    <span class="stat-sub">
-      {#if app.health}v{app.health.version} · {fmtMs(app.rttMs)}{:else}unreachable{/if}
-    </span>
-  </div>
-  <div class="stat-card">
-    <span class="stat-label">Providers</span>
-    <span class="stat-value">{providerCount ?? "—"}</span>
-    <span class="stat-sub">upstream accounts</span>
-  </div>
-  <div class="stat-card">
-    <span class="stat-label">Routes</span>
-    <span class="stat-value">{routeCount ?? "—"}</span>
-    <span class="stat-sub">model aliases</span>
-  </div>
-  <div class="stat-card">
-    <span class="stat-label">Keys</span>
-    <span class="stat-value">{keyCount ?? "—"}</span>
-    <span class="stat-sub">downstream credentials</span>
-  </div>
-  <div class="stat-card">
-    <span class="stat-label">Spend {usagePeriod ? `(${usagePeriod})` : ""}</span>
-    <span class="stat-value">{fmtUsd2(monthSpend)}</span>
-    <span class="stat-sub">current UTC month</span>
-  </div>
-  <button
-    class="stat-card"
-    style="cursor:pointer; text-align:left; font-family:inherit; color:inherit; border:1px solid var(--border); background:var(--surface)"
-    onclick={() => app.goto("live")}
-  >
-    <span class="stat-label">Live stream</span>
-    <span class="stat-value" style="font-size:15px">
-      <span class="sse-dot {live.sse}"></span>{live.statusLabel}
-    </span>
-    <span class="stat-sub">{live.rowCount} rows buffered → open monitor</span>
-  </button>
+{#if app.healthError}
+  <Alert variant="danger" class="mb-4">
+    Daemon offline — start <span class="font-mono">conduitd</span> and ensure console API is
+    reachable at {app.consoleBase}.
+  </Alert>
+{/if}
+
+<div class="mb-4 grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5">
+  <StatCard
+    label="Daemon"
+    value={app.healthError ? "offline" : "online"}
+    valueClass={app.healthError ? "text-[var(--danger)]" : "text-[var(--success)]"}
+    sub={app.health ? `v${app.health.version} · ${fmtMs(app.rttMs)}` : "unreachable"}
+  />
+  <StatCard label="Providers" value={providerCount ?? "—"} sub="upstream accounts" />
+  <StatCard label="Routes" value={routeCount ?? "—"} sub="model aliases" />
+  <StatCard label="Keys" value={keyCount ?? "—"} sub="downstream credentials" />
+  <StatCard
+    label={usagePeriod ? `Spend (${usagePeriod})` : "Spend"}
+    value={fmtUsd2(monthSpend)}
+    sub="current UTC month"
+  />
 </div>
 
-<div class="panel">
-  <div class="row-between">
-    <span class="panel-title">Recent requests</span>
-    <button class="btn-ghost btn-sm" onclick={() => app.goto("traces")}>View all →</button>
-  </div>
+<div class="mb-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+  <Button variant="outline" onclick={() => app.goto("providers")}>+ Provider</Button>
+  <Button variant="outline" onclick={() => app.goto("routes")}>+ Route</Button>
+  <Button variant="outline" onclick={() => app.goto("usage")}>Open Usage</Button>
+</div>
+
+<Card>
+  <PageHeader title="Recent usage">
+    {#snippet actions()}
+      <Button variant="ghost" size="sm" onclick={() => app.goto("usage")}>View all →</Button>
+    {/snippet}
+  </PageHeader>
   {#if loading && recent.length === 0}
-    <div class="loader"><span class="spinner"></span></div>
+    <Spinner />
   {:else if recent.length === 0}
-    <p class="empty">No requests recorded yet.</p>
+    <EmptyState title="No usage recorded yet." />
   {:else}
-    <div class="table-wrap">
-      <table class="table">
+    <div class={tableWrapClass}>
+      <table class={tableClass}>
         <thead>
-          <tr><th>Time</th><th>Alias</th><th>Status</th><th>Latency</th><th>Trace</th></tr>
+          <tr>
+            <th class={thClass}>Time</th>
+            <th class={thClass}>Alias</th>
+            <th class={thClass}>Model</th>
+            <th class={thClass}>Cost</th>
+            <th class={thClass}>Request</th>
+          </tr>
         </thead>
         <tbody>
-          {#each recent as t (t.id)}
-            <tr class="clickable" onclick={() => app.openTrace(t.trace_id || t.id)}>
-              <td class="dim small" title={t.ts}>{fmtAgo(t.ts)}</td>
-              <td class="mono">{t.alias || "—"}</td>
-              <td>
-                <StatusPill
-                  status={t.status_code || undefined}
-                  errorKind={t.error_kind ?? undefined}
-                />
+          {#each recent as r (r.id)}
+            <tr>
+              <td class={cn(tdClass, dimClass, "text-xs")} title={r.ts ?? ""}>
+                {fmtAgo(r.ts)}
               </td>
-              <td class="mono dim">{t.latency_ms ? fmtMs(t.latency_ms) : "—"}</td>
-              <td class="mono dim small">{shortId(t.trace_id || t.id, 10)}</td>
+              <td class={cn(tdClass, monoClass)}>{r.alias || "—"}</td>
+              <td class={cn(tdClass, monoClass, dimClass)}>{r.model_id || "—"}</td>
+              <td class={cn(tdClass, monoClass, dimClass)}>{fmtUsd2(r.cost_usd)}</td>
+              <td class={cn(tdClass, monoClass, dimClass, "text-xs")}>
+                {shortId(r.request_id, 10)}
+              </td>
             </tr>
           {/each}
         </tbody>
       </table>
     </div>
   {/if}
-</div>
+</Card>

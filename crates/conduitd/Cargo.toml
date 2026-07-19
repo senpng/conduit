@@ -13,7 +13,6 @@ conduit-codec = { path = "../conduit-codec" }
 conduit-router = { path = "../conduit-router" }
 conduit-upstream = { path = "../conduit-upstream" }
 conduit-pipeline = { path = "../conduit-pipeline" }
-conduit-trace = { path = "../conduit-trace" }
 conduit-quota = { path = "../conduit-quota" }
 conduit-secret = { path = "../conduit-secret" }
 conduit-store = { path = "../conduit-store" }
@@ -38,7 +37,6 @@ blake3 = "1"
 hex = "0.4"
 arc-swap = "1"
 async-stream = "0.3"
-tokio-stream = "0.1"
 async-trait = "0.1"
 parking_lot = "0.12"
 reqwest = { workspace = true }

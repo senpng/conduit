@@ -79,14 +79,11 @@ pub struct PricingRow {
 // ── Usage record (per-request consumption ledger) ─────────────────────────────
 
 /// One completed gateway request's token + cost footprint.
-///
-/// Stored independently of the append-only trace log so spend remains available
-/// when tracing is disabled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRecordRow {
     pub id: String,
     pub ts: String,
-    /// Correlates with pipeline `trace_id` when traces are enabled; always set.
+    /// Pipeline request correlation id (always set).
     pub request_id: String,
     pub downstream_key_id: Option<String>,
     pub alias: Option<String>,

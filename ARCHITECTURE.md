@@ -1,12 +1,12 @@
 # Conduit v2 Architecture
 
-Conduit is a **local-first, single-binary LLM gateway** with complete audit trail capability. It proxies requests to upstream LLM providers (OpenAI, Anthropic, and more) while recording every request/response for observability and cost management.
+Conduit is a **local-first, single-binary LLM gateway**. It proxies requests to upstream LLM providers (OpenAI, Anthropic, and more) while tracking usage and cost for the operator console.
 
 ## Design Axioms
 
-1. **Faithful Proxy**: Any field silently changed, dropped, or degraded during codec translation is a bug. All losses are recorded in `LossReport` and attached to traces.
-2. **Complete Audit Trail**: Trace integrity cannot be sacrificed for availability. If the trace sink fails, the failure is surfaced — never silently swallowed.
-3. **Local-First, Single Binary**: No cloud dependencies. Offline-capable. Distribution = one signed binary (+ optional UI bundle). **Operator path is CLI + desktop console** (`conduitctl` + `conduit-ui`; see `docs/design/conduit-ui-rewrite.md`).
+1. **Faithful Proxy**: Any field silently changed, dropped, or degraded during codec translation is a bug. All losses are recorded in `LossReport`.
+2. **Local-first operator surface**: Configuration, usage, and secrets stay on the host running `conduitd`.
+3. **Local-First, Single Binary**: No cloud dependencies. Offline-capable. Distribution = one signed binary (+ optional UI bundle). **Operator path is CLI + desktop console** (`conduitctl` + `conduit-ui`).
 
 ## Process Model
 
@@ -33,10 +33,10 @@ Conduit is a **local-first, single-binary LLM gateway** with complete audit trai
 **Chosen form: A — Tauri is a window shell only.** The Svelte frontend talks to
 `conduitd` over loopback HTTP (default `http://127.0.0.1:4001`), same as
 `conduitctl`. There is no console IPC surface in `src-tauri`; Tauri commands are
-not used for providers/routes/keys/traces. Override the console base with
+not used for providers/routes/keys. Override the console base with
 `VITE_CONDUIT_CONSOLE_URL` at build/dev time.
 
-**Product priority (2026-07):** `conduit-ui` is the **operator console** (Live Monitor with SSE request rollup, four-pane trace audit, multi-target route wizard; zero remote resources — see `docs/design/conduit-ui-rewrite.md`).
+**Product priority (2026-07):** `conduit-ui` is the **operator console** (light product shell; providers/routes/keys/usage; multi-target route wizard; zero remote resources).
 
 CSP (`src-tauri/tauri.conf.json`) allows both `http://127.0.0.1:4001` and
 `http://localhost:4001` under `connect-src` for fetch/SSE. The console listener
@@ -44,7 +44,7 @@ applies a permissive `CorsLayer` so the Tauri/dev origin (`localhost:1420` /
 `tauri.localhost`) can call the loopback console API; the client only sends
 `Content-Type: application/json` when a request body is present.
 
-## Pipeline Layers (L1-L7)
+## Pipeline Layers (L1-L6)
 
 ```
 client ──► L1 Transport      (axum, tower middleware stack)
@@ -52,13 +52,12 @@ client ──► L1 Transport      (axum, tower middleware stack)
         ── L3 Router         (PURE function: alias → provider decision)
         ── L4 Codec          (IR ↔ wire format translation)
         ── L5 Upstream       (provider HTTP call, SSE parsing)
-        ── L6 Egress Filter  (cost calculation, trace finalization)
-        ── L7 Sink           (event bus → trace log + index)
+        ── L6 Egress Filter  (cost calculation, usage ledger)
 ```
 
 **L3 Router is a pure function**: `route(alias, table, attempt_no) → Decision`. Zero IO, zero locks. Fully unit-testable and deterministic.
 
-**L7 Sink is an event bus** for audit/trace side effects (log, index, live SSE). Request **usage** is recorded directly from the pipeline into `usage_records`, not via the sink — so spend does not depend on traces being enabled.
+Request **usage** is recorded directly from the pipeline into `usage_records`.
 
 ## Crate Dependency Graph
 
@@ -69,11 +68,10 @@ conduit-router       (IR + pure routing logic)
 conduit-codec        (IR + OpenAI/Anthropic/Responses wire translation)
 conduit-secret       (IR + OS keychain / master password)
 conduit-store        (IR + router + SQLite config repos)
-conduit-trace        (IR + append-only log + SQLite index)
 conduit-quota        (IR + in-memory rate limit + usage record hook)
 conduit-oauth        (Claude/Codex PKCE + Grok device code; credential refresh)
 conduit-upstream     (IR + codec + reqwest HTTP client)
-conduit-pipeline     (all of the above, L1-L7 orchestration)
+conduit-pipeline     (all of the above, L1-L6 orchestration)
     ↑
 conduitd             (binary: axum server + console API + OAuth callbacks)
 conduitctl           (binary: operator CLI)
@@ -93,46 +91,12 @@ Credentials (access + refresh + expiry + account metadata) are stored as JSON in
 
 Console API: `POST /console/oauth/{kind}/start`, `GET /console/oauth/sessions/{id}`, `POST .../cancel`, `POST /console/oauth/{provider_id}/refresh`. CLI: `conduitctl oauth start <claude|codex|grok>`.
 
-### Complete audit trail
-
-Every gateway request shares a `trace_id`. Events carry full payloads for forensic audit,
-preserving the **real client wire format** (OpenAI chat vs Anthropic messages, stream vs not):
-
-| Event | Audit payload |
-|-------|----------------|
-| `request_received` | **Original wire body** + **request headers** (secrets redacted) + IR + `wire_format` |
-| `routing_decided` | provider / model / key ids |
-| `stream_delta` | **Live SSE frame** (`frame` + optional `text_delta`); flushed immediately for `trace tail` |
-| `upstream_response` | **Response headers** + body (non-stream wire JSON, or stream `stream_frames` + summary) |
-| `final_usage` | tokens + cost |
-| `error` | kind + message |
-
-`GET /console/traces` lists one row per request (`kind=request_received`).
-`GET /console/traces/{id}` returns a **bundle**:
-
-```json
-{
-  "trace_id": "...",
-  "events": [...],
-  "request": { /* original wire body */ },
-  "request_ir": { /* canonical IR */ },
-  "response": { /* wire body or stream_summary */ },
-  "wire_format": "openai_chat",
-  "stream": true,
-  "stream_frames": ["data: {...}\n\n", "data: [DONE]\n\n"]
-}
-```
-
-UI Traces view shows Request / Response (wire) sections, optional SSE frames, plus the event timeline.
-
 ## Data Storage
 
 | Data | Storage | Rationale |
 |------|---------|-----------|
-| Trace events | Append-only segmented log (`segments/*.cdlog`, zstd-framed) | LLM traces are 100% append-only; segment rotation = simple file delete |
-| Trace metadata | SQLite index (`trace_index.db`) | Fast querying without reading log files |
 | Config (providers, routes, keys) | SQLite (`config.db`) | Relational data, strong schema, ACID |
-| Request usage | SQLite `usage_records` (per-request) | Independent of traces; spend survives when tracing is toggled off |
+| Request usage | SQLite `usage_records` (per-request) | Spend and token accounting for the console |
 | Secrets | OS Keychain (S1) or Master Password AES-256-GCM (S2) | No S3 machine-bound; silent downgrade eliminated |
 
 ## Security Model
@@ -162,9 +126,7 @@ All secrets are held as `secrecy::SecretVec<u8>` and zeroized on drop.
 
 Every completed request with non-zero tokens or cost is inserted into
 `usage_records` from the pipeline (non-stream + stream finalize paths).
-Recording does **not** go through the trace event bus, so the ledger remains
-complete when tracing is disabled. Aggregate views
-(`GET /console/usage/summary`) are SQL rollups over this table.
+Aggregate views (`GET /console/usage/summary`) are SQL rollups over this table.
 
 Hard monthly budget *caps* are not enforced; RPM rate limits remain.
 
@@ -191,20 +153,6 @@ no fetch on boot):
 
 Reload layers without network: `POST /console/pricing/reload` / `conduitctl pricing reload`.
 
-## Trace Switch
-
-Request auditing can be turned off without affecting usage:
-
-| Layer | Behavior when `trace.enabled = false` |
-|-------|----------------------------------------|
-| `TraceSink::send` | No-op success (no channel enqueue / disk write) |
-| Live SSE | No new events (historical list/get still work) |
-| Usage ledger | Still records tokens + cost |
-| Config | `conduit.toml` `[trace] enabled = true\|false` (default true) |
-| Runtime | `PUT /console/settings` `{ "trace": { "enabled": false } }` → `data_dir/settings.json` |
-
-Effective value = runtime override if set, else config default.
-
 ## Codec Contract
 
 Codec translation is governed by three test suites (all mandatory for every provider):
@@ -212,4 +160,4 @@ Codec translation is governed by three test suites (all mandatory for every prov
 2. **Property tests** (`proptest`): `IR → wire → IR` roundtrip invariance
 3. **Integration tests** (`wiremock`): every finish_reason, tool_call, error path
 
-Codec degradations (e.g., `ToolChoice::AnyOf → Required`) are never silent: they are added to `LossReport` and attached to the trace record.
+Codec degradations (e.g., `ToolChoice::AnyOf → Required`) are never silent: they are added to in-memory `LossReport` on the codec path.

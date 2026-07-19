@@ -5,6 +5,23 @@
   import type { DownstreamKey, CreateKeyResponse } from "../lib/consoleClient";
   import { fmtDate } from "../lib/format";
   import KeyCreatedModal from "../components/KeyCreatedModal.svelte";
+  import Card from "../components/app/Card.svelte";
+  import PageHeader from "../components/app/PageHeader.svelte";
+  import Spinner from "../components/app/Spinner.svelte";
+  import Field from "../components/app/Field.svelte";
+  import Button from "../components/ui/button.svelte";
+  import Badge from "../components/ui/badge.svelte";
+  import {
+    controlClass,
+    tableWrapClass,
+    tableClass,
+    thClass,
+    tdClass,
+    monoClass,
+    dimClass,
+  } from "$lib/ui";
+  import { cn } from "$lib/utils";
+  import { Plus, Trash2 } from "@lucide/svelte";
 
   let list = $state<DownstreamKey[]>([]);
   let loading = $state(true);
@@ -75,75 +92,95 @@
   }
 </script>
 
-<div class="panel">
-  <div class="row-between">
-    <span class="panel-title">Downstream keys</span>
-    <button class="btn-primary" onclick={() => (showForm = !showForm)}>
-      {showForm ? "Close form" : "＋ Create key"}
-    </button>
-  </div>
+<Card>
+  <PageHeader title="Downstream keys" description="Client credentials for the gateway.">
+    {#snippet actions()}
+      <Button onclick={() => (showForm = !showForm)}>
+        <Plus class="h-4 w-4" />
+        {showForm ? "Close form" : "Create key"}
+      </Button>
+    {/snippet}
+  </PageHeader>
 
   {#if showForm}
-    <div class="form-card">
-      <h3>New downstream key</h3>
-      <div class="form-grid">
-        <label>Name <input bind:value={form.name} placeholder="My app" /></label>
-        <label>
-          Rate limit (RPM)
-          <input type="number" bind:value={form.rate_limit_rpm} placeholder="60" min="0" />
-        </label>
+    <div class="mb-4 rounded-lg border border-[var(--border)] bg-[var(--surface-muted)]/60 p-4">
+      <h3 class="mb-3 text-sm font-semibold text-[var(--text)]">New downstream key</h3>
+      <div class="grid gap-3 sm:grid-cols-2">
+        <Field label="Name">
+          <input class={controlClass} bind:value={form.name} placeholder="My app" />
+        </Field>
+        <Field label="Rate limit (RPM)">
+          <input
+            class={controlClass}
+            type="number"
+            bind:value={form.rate_limit_rpm}
+            placeholder="60"
+            min="0"
+          />
+        </Field>
       </div>
-      <div class="form-actions">
-        <button class="btn-primary" onclick={create}>Create</button>
-        <button class="btn-ghost" onclick={() => (showForm = false)}>Cancel</button>
+      <div class="mt-3 flex gap-2">
+        <Button onclick={create}>Create</Button>
+        <Button variant="outline" onclick={() => (showForm = false)}>Cancel</Button>
       </div>
     </div>
   {/if}
 
   {#if loading && list.length === 0}
-    <div class="loader"><span class="spinner"></span></div>
+    <Spinner />
   {:else}
-    <div class="table-wrap">
-      <table class="table">
+    <div class={tableWrapClass}>
+      <table class={tableClass}>
         <thead>
           <tr>
-            <th>Name</th>
-            <th>RPM</th>
-            <th>Status</th>
-            <th>Created</th>
-            <th></th>
+            <th class={thClass}>Name</th>
+            <th class={thClass}>RPM</th>
+            <th class={thClass}>Status</th>
+            <th class={thClass}>Created</th>
+            <th class={thClass}></th>
           </tr>
         </thead>
         <tbody>
           {#each list as k (k.id)}
-            <tr>
-              <td>{k.name}</td>
-              <td class="mono">{k.rate_limit_rpm ?? "—"}</td>
-              <td>
+            <tr class="hover:bg-[var(--surface-muted)]/80">
+              <td class={tdClass}>{k.name}</td>
+              <td class={cn(tdClass, monoClass)}>{k.rate_limit_rpm ?? "—"}</td>
+              <td class={tdClass}>
                 <button
-                  class="pill"
-                  class:on={k.enabled}
-                  class:off={!k.enabled}
-                  style="border:none; cursor:pointer"
+                  type="button"
+                  class="cursor-pointer border-0 bg-transparent p-0"
                   title="Toggle enabled"
                   onclick={() => void toggleEnabled(k)}
                 >
-                  {k.enabled ? "active" : "disabled"}
+                  <Badge variant={k.enabled ? "success" : "secondary"}>
+                    {k.enabled ? "active" : "disabled"}
+                  </Badge>
                 </button>
               </td>
-              <td class="dim small">{fmtDate(k.created_at)}</td>
-              <td class="actions">
-                <button class="btn-icon danger" title="Revoke" onclick={() => void remove(k)}>✕</button>
+              <td class={cn(tdClass, dimClass, "text-xs")}>{fmtDate(k.created_at)}</td>
+              <td class={cn(tdClass, "w-px")}>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  title="Revoke"
+                  onclick={() => void remove(k)}
+                >
+                  <Trash2 class="h-4 w-4 text-[var(--danger)]" />
+                </Button>
               </td>
             </tr>
           {:else}
-            <tr><td colspan="6" class="empty">No keys yet.</td></tr>
+            <tr>
+              <td class={cn(tdClass, "py-8 text-center text-[var(--text-muted)]")} colspan="5">
+                No keys yet.
+              </td>
+            </tr>
           {/each}
         </tbody>
       </table>
     </div>
   {/if}
-</div>
+</Card>
 
 {#if reveal}
   <KeyCreatedModal keyData={reveal} onclose={() => (reveal = null)} />

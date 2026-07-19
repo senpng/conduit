@@ -11,7 +11,7 @@ use serde_json::Value;
 ///
 /// The returned [`LossReport`] records response data that the IR cannot
 /// represent (e.g. extra `choices` beyond the first, or a `refusal` message),
-/// so the audit trail reflects what was dropped instead of losing it silently.
+/// so LossReport reflects what was dropped instead of losing it silently.
 pub fn decode_response(
     body: Value,
     alias: &str,

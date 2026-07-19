@@ -12,7 +12,7 @@ use axum::{
     routing::{delete, get, post, put},
     Router,
 };
-use conduit_ir::{error::GatewayError, trace::TraceEvent};
+use conduit_ir::error::GatewayError;
 use conduit_pipeline::{
     handle::{AuthFn, KeyPolicyFn, PipelineDeps, PipelineHandle, PricingFn},
     ingress::KeyPolicy,
@@ -24,12 +24,8 @@ use conduit_router::{
     AffinityStore,
 };
 use conduit_store::{KeyRepo, PricingRepo, RouteRepo};
-use conduit_trace::{
-    sink::{TraceSink, TraceSubscriber},
-    TraceStore,
-};
 use secrecy::SecretVec;
-use tokio::{net::TcpListener, sync::broadcast};
+use tokio::net::TcpListener;
 use tower_http::{
     cors::{AllowHeaders, AllowOrigin, Any, CorsLayer},
     timeout::TimeoutLayer,
@@ -37,7 +33,7 @@ use tower_http::{
 use tracing::{info, warn};
 
 use crate::{
-    config::{Config, RuntimeSettings},
+    config::Config,
     state::{pricing_map_from_repo, DaemonState},
     usage_wire::make_record_fn,
 };
@@ -45,8 +41,6 @@ use crate::{
 pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
     // Ensure data directories exist
     std::fs::create_dir_all(&data_dir)?;
-    let trace_dir = data_dir.join("traces");
-    std::fs::create_dir_all(&trace_dir)?;
 
     // ── Open SQLite database ──────────────────────────────────────────────────
     let db_url = format!("sqlite:///{}", data_dir.join("conduit.db").display());
@@ -62,24 +56,6 @@ pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
     // ── Pricing repo (hot-reloadable from pricing.json) ───────────────────────
     let pricing_repo = Arc::new(PricingRepo::new(pool.clone(), &data_dir).await?);
 
-    // ── Trace store + sink ────────────────────────────────────────────────────
-    let trace_store = Arc::new(TraceStore::open(trace_dir.clone()).await?);
-    let (trace_sink, _trace_task) = TraceSink::start(trace_store.clone()).await;
-    let trace_sink = Arc::new(trace_sink);
-
-    // Merge conduit.toml `[trace].enabled` with data_dir/settings.toml overlay.
-    let runtime_settings = RuntimeSettings::load(&data_dir);
-    let trace_enabled = runtime_settings.effective_trace_enabled(cfg.trace.enabled);
-    trace_sink.set_enabled(trace_enabled);
-    info!(trace_enabled, "trace sink ready");
-
-    // Live event bus for console SSE tail (capacity: lag-tolerant for slow clients).
-    // Larger buffer: stream_delta events are high-volume during live tails.
-    let (trace_broadcast, _) = broadcast::channel::<TraceEvent>(8192);
-    trace_sink.register(Arc::new(BroadcastTraceSubscriber {
-        tx: trace_broadcast.clone(),
-    }));
-
     // ── Load routing table from DB ─────────────────────────────────────────────
     let routing_table = {
         let route_repo = RouteRepo::new(&pool);
@@ -89,7 +65,7 @@ pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
         Arc::new(ArcSwap::from_pointee(RoutingTable::new(routes)))
     };
 
-    // ── Quota engine: RPM + usage ledger (independent of traces) ─────────────
+    // ── Quota engine: RPM + usage ledger ─────────────────────────────────────
     let record_fn = make_record_fn(pool.clone());
     let quota = Arc::new(InMemoryQuotaEngine::new(record_fn));
 
@@ -181,7 +157,6 @@ pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
     // Shared pipeline — constructed once; routing_table is ArcSwap-backed.
     let pipeline = Arc::new(PipelineHandle::new(Arc::new(PipelineDeps {
         routing_table: routing_table.clone(),
-        trace_sink: trace_sink.clone(),
         secret_fn,
         pricing_fn,
         quota: quota.clone(),
@@ -193,9 +168,6 @@ pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
     let state = Arc::new(DaemonState {
         routing_table,
         pipeline,
-        trace_sink,
-        trace_store: trace_store.clone(),
-        trace_broadcast,
         pool: pool.clone(),
         secret_backend,
         pricing_repo,
@@ -203,8 +175,6 @@ pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
         data_dir: data_dir.clone(),
         oauth: Arc::new(crate::oauth::OAuthRuntime::new()),
         version: env!("CARGO_PKG_VERSION"),
-        trace_config: cfg.trace.clone(),
-        runtime_settings: std::sync::Mutex::new(runtime_settings),
     });
 
     // ── Gateway router (OpenAI + Anthropic-compatible API) ────────────────────
@@ -270,16 +240,6 @@ pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
     console_res?;
 
     // ── Graceful shutdown sequence (each step with 30s timeout) ──────────────
-    info!("flushing trace sink...");
-    tokio::time::timeout(std::time::Duration::from_secs(30), state.trace_sink.drain())
-        .await
-        .ok();
-
-    info!("flushing log writer...");
-    tokio::time::timeout(std::time::Duration::from_secs(30), trace_store.shutdown())
-        .await
-        .ok();
-
     info!("closing database...");
     tokio::time::timeout(std::time::Duration::from_secs(30), state.pool.close())
         .await
@@ -419,10 +379,7 @@ pub fn build_console_router(state: Arc<crate::state::DaemonState>) -> Router {
         .route("/console/keys/{id}", get(crate::console::get_key))
         .route("/console/keys/{id}", put(crate::console::update_key))
         .route("/console/keys/{id}", delete(crate::console::delete_key))
-        // Settings (trace enable, …)
-        .route("/console/settings", get(crate::console::get_settings))
-        .route("/console/settings", put(crate::console::update_settings))
-        // Usage ledger / pricing / traces
+        // Usage ledger / pricing
         .route("/console/usage", get(crate::console::list_usage))
         .route("/console/usage/summary", get(crate::console::usage_summary))
         .route("/console/pricing", get(crate::console::list_pricing))
@@ -431,13 +388,6 @@ pub fn build_console_router(state: Arc<crate::state::DaemonState>) -> Router {
             post(crate::console::reload_pricing),
         )
         .route("/console/pricing/sync", post(crate::console::sync_pricing))
-        .route("/console/traces", get(crate::console::list_traces))
-        .route("/console/traces/stream", get(crate::console::stream_traces))
-        .route("/console/traces/{id}", get(crate::console::get_trace))
-        .route(
-            "/console/traces/{id}/replay",
-            post(crate::console::replay_trace),
-        )
         // OAuth
         .route(
             "/console/oauth/providers",
@@ -529,28 +479,6 @@ pub async fn reload_routing_table(state: &DaemonState) -> Result<(), conduit_sto
     Ok(())
 }
 
-// ── Trace broadcast subscriber ────────────────────────────────────────────────
-
-/// Fan-out durable trace events to console SSE clients (`GET /console/traces/stream`).
-///
-/// `pub(crate)` so crate tests can exercise the real subscriber path.
-pub(crate) struct BroadcastTraceSubscriber {
-    pub(crate) tx: broadcast::Sender<TraceEvent>,
-}
-
-#[async_trait::async_trait]
-impl TraceSubscriber for BroadcastTraceSubscriber {
-    async fn on_event(&self, ev: &TraceEvent) {
-        // Ignore lagging/no-receiver: SSE clients are optional.
-        let _ = self.tx.send(ev.clone());
-    }
-}
-
-/// Serialize a trace event the same way `stream_traces` puts it on the SSE wire.
-pub(crate) fn trace_event_sse_payload(ev: &TraceEvent) -> Result<String, serde_json::Error> {
-    serde_json::to_string(ev)
-}
-
 // ── CORS / preflight tests ────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -621,13 +549,11 @@ mod cors_tests {
     }
 }
 
-// ── Hot-path routing + live tail tests ────────────────────────────────────────
+// ── Hot-path routing tests ───────────────────────────────────────────────────
 
 #[cfg(test)]
 mod hotpath_tests {
-    use conduit_ir::trace::TraceEventKind;
     use conduit_router::{policy::RetryPolicy, table::RouteTarget};
-    use conduit_trace::sink::TraceSubscriber;
 
     use super::*;
 
@@ -693,42 +619,6 @@ mod hotpath_tests {
             Some("https://chatgpt.com/backend-api/codex")
         );
         assert_eq!(target.request_overrides["service_tier"], "priority");
-    }
-
-    /// Honest O1 path: TraceEvent → BroadcastTraceSubscriber → channel →
-    /// same JSON serialization used by `stream_traces` SSE `data:` frames.
-    #[tokio::test]
-    async fn broadcast_subscriber_delivers_real_trace_event_json() {
-        let (tx, mut rx) = broadcast::channel::<TraceEvent>(16);
-        let sub = BroadcastTraceSubscriber { tx };
-
-        let event = TraceEvent::new(TraceEventKind::RequestReceived {
-            downstream_key_id: Some("dk-live".into()),
-            alias: "gpt-4o".into(),
-            stream: false,
-            request: serde_json::json!({}),
-            request_ir: None,
-            wire_format: None,
-            request_headers: None,
-        });
-        let expected_id = event.id.clone();
-
-        // Drive the shipped subscriber trait method (same as TraceSink fan-out).
-        sub.on_event(&event).await;
-
-        let received = rx.try_recv().expect("subscriber must publish the event");
-        assert_eq!(received.id, expected_id);
-
-        // Same payload path as stream_traces SSE data field.
-        let payload = trace_event_sse_payload(&received).expect("serialize");
-        assert!(
-            !payload.contains("not yet implemented"),
-            "must not be the old mock banner"
-        );
-        let v: serde_json::Value = serde_json::from_str(&payload).expect("valid json");
-        assert_eq!(v["id"].as_str().unwrap(), expected_id);
-        assert_eq!(v["kind"]["type"], "request_received");
-        assert_eq!(v["kind"]["alias"], "gpt-4o");
     }
 
     /// Structural proof: process-shared CredentialResolver is constructed once

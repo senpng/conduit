@@ -1,7 +1,9 @@
 /**
- * App-wide UI state: screen nav, health polling, toasts, global keyboard.
+ * App-wide UI state: screen nav, health polling, toasts, confirms.
  * Svelte 5 runes in a singleton class; lifecycle is explicit (start/stop
  * from App.svelte onMount) so no $effect roots leak.
+ *
+ * No global keyboard shortcuts — navigation and actions are pointer/UI only.
  */
 
 import { health as healthApi, getConsoleBase } from "../lib/consoleClient";
@@ -9,31 +11,38 @@ import type { HealthResponse } from "../lib/consoleClient";
 
 export type ScreenId =
   | "dashboard"
-  | "live"
-  | "traces"
+  | "usage"
   | "providers"
   | "routes"
   | "keys"
-  | "usage"
-  | "pricing";
+  | "settings";
+
+export type ScreenGroup =
+  | "overview"
+  | "observability"
+  | "configuration"
+  | "system";
 
 export interface ScreenMeta {
   id: ScreenId;
   label: string;
-  icon: string;
-  /** g-prefix jump key. */
-  g: string;
+  group: ScreenGroup;
 }
 
 export const SCREENS: ScreenMeta[] = [
-  { id: "dashboard", label: "Dashboard", icon: "▤", g: "d" },
-  { id: "live", label: "Live Monitor", icon: "◉", g: "m" },
-  { id: "traces", label: "Traces", icon: "☰", g: "t" },
-  { id: "providers", label: "Providers", icon: "◈", g: "p" },
-  { id: "routes", label: "Routes", icon: "⟶", g: "r" },
-  { id: "keys", label: "Keys", icon: "⚿", g: "k" },
-  { id: "usage", label: "Usage", icon: "◎", g: "b" },
-  { id: "pricing", label: "Pricing", icon: "◇", g: "i" },
+  { id: "dashboard", label: "Dashboard", group: "overview" },
+  { id: "usage", label: "Usage", group: "observability" },
+  { id: "providers", label: "Providers", group: "configuration" },
+  { id: "routes", label: "Routes", group: "configuration" },
+  { id: "keys", label: "Keys", group: "configuration" },
+  { id: "settings", label: "Settings", group: "system" },
+];
+
+export const SCREEN_GROUPS: { id: ScreenGroup; label: string }[] = [
+  { id: "overview", label: "Overview" },
+  { id: "observability", label: "Observability" },
+  { id: "configuration", label: "Configuration" },
+  { id: "system", label: "System" },
 ];
 
 export interface Toast {
@@ -55,16 +64,11 @@ class AppState {
   health = $state<HealthResponse | null>(null);
   healthError = $state(false);
   rttMs = $state<number | null>(null);
-  paletteOpen = $state(false);
-  helpOpen = $state(false);
   toasts = $state<Toast[]>([]);
   confirm = $state<ConfirmRequest | null>(null);
-  /** Deep-link: trace id to open when Traces screen mounts. */
-  traceFocus = $state<string | null>(null);
 
   private healthTimer: ReturnType<typeof setInterval> | null = null;
   private toastSeq = 0;
-  private gPrefixAt = 0;
   private refreshers = new Map<ScreenId, () => void>();
 
   readonly consoleBase = getConsoleBase();
@@ -97,11 +101,6 @@ class AppState {
 
   goto(id: ScreenId): void {
     this.screen = id;
-  }
-
-  openTrace(traceId: string): void {
-    this.traceFocus = traceId;
-    this.screen = "traces";
   }
 
   toast(text: string, kind: Toast["kind"] = "info", ms = 4000): void {
@@ -145,65 +144,6 @@ class AppState {
   refreshCurrent(): void {
     this.refreshers.get(this.screen)?.();
   }
-
-  /** True when any overlay owns the keyboard. */
-  get modalActive(): boolean {
-    return this.paletteOpen || this.helpOpen || this.confirm != null;
-  }
-
-  /**
-   * Global key handler installed once by App.svelte. Returns early when an
-   * overlay or a text input owns the keyboard.
-   */
-  handleKey = (e: KeyboardEvent): void => {
-    if (e.key === "k" && (e.ctrlKey || e.metaKey)) {
-      e.preventDefault();
-      this.paletteOpen = !this.paletteOpen;
-      return;
-    }
-    if (this.modalActive) return; // overlays handle their own keys
-
-    const el = document.activeElement as HTMLElement | null;
-    const tag = el?.tagName;
-    const inField =
-      tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el?.isContentEditable;
-    if (inField) {
-      if (e.key === "Escape") el?.blur();
-      return;
-    }
-
-    if (e.key === "Escape") return; // nothing to close
-    if (e.key === "?") {
-      e.preventDefault();
-      this.helpOpen = true;
-      return;
-    }
-    if (e.key === "r" && !e.ctrlKey && !e.metaKey && !e.altKey) {
-      this.refreshCurrent();
-      return;
-    }
-
-    // g-prefix: first `g` arms (1s window), second key jumps.
-    const now = Date.now();
-    if (e.key === "g" && !e.ctrlKey && !e.metaKey) {
-      if (now - this.gPrefixAt < 1000) {
-        // gg → scroll top of main pane
-        this.gPrefixAt = 0;
-        document.querySelector(".view-scroll")?.scrollTo({ top: 0 });
-      } else {
-        this.gPrefixAt = now;
-      }
-      return;
-    }
-    if (now - this.gPrefixAt < 1000) {
-      this.gPrefixAt = 0;
-      const meta = SCREENS.find((s) => s.g === e.key);
-      if (meta) {
-        e.preventDefault();
-        this.goto(meta.id);
-      }
-    }
-  };
 }
 
 export const app = new AppState();

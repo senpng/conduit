@@ -1,7 +1,9 @@
 <script lang="ts">
   import Modal from "./Modal.svelte";
+  import Button from "./ui/button.svelte";
   import { app } from "../state/app.svelte";
   import type { CreateKeyResponse } from "../lib/consoleClient";
+  import { Copy, Check } from "@lucide/svelte";
 
   interface Props {
     keyData: CreateKeyResponse;
@@ -22,24 +24,30 @@
   }
 
   function close() {
-    // Plaintext is dropped with the component state.
     onclose();
   }
 </script>
 
-<Modal onclose={close}>
-  <h3>Key created — {keyData.name}</h3>
-  <p class="modal-hint">
-    Copy this key now. <strong>It will not be shown again</strong> after this dialog
-    closes.
+<Modal onclose={close} title={`Key created — ${keyData.name}`}>
+  <p class="mb-3 text-sm text-[var(--text-secondary)]">
+    Copy this key now. <strong class="text-[var(--text)]">It will not be shown again</strong> after
+    this dialog closes.
   </p>
-  <div class="key-display">
-    <code>{keyData.key}</code>
-    <button class="btn-ghost btn-sm" onclick={copyKey}>
-      {copied ? "✓ Copied" : "Copy"}
-    </button>
+  <div
+    class="mb-4 flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] p-3"
+  >
+    <code class="min-w-0 flex-1 break-all font-mono text-xs text-[var(--text)]">{keyData.key}</code>
+    <Button variant="outline" size="sm" onclick={copyKey}>
+      {#if copied}
+        <Check class="h-3.5 w-3.5" />
+        Copied
+      {:else}
+        <Copy class="h-3.5 w-3.5" />
+        Copy
+      {/if}
+    </Button>
   </div>
-  <div class="form-actions">
-    <button class="btn-primary" onclick={close}>Done</button>
+  <div class="flex justify-end">
+    <Button onclick={close}>Done</Button>
   </div>
 </Modal>

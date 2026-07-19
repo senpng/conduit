@@ -20,7 +20,7 @@ export function fmtDate(s: string): string {
   }
 }
 
-/** HH:MM:SS local wall time (for live tables). */
+/** HH:MM:SS local wall time. */
 export function fmtTime(s: string | undefined | null): string {
   if (!s) return "—";
   try {

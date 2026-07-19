@@ -249,46 +249,6 @@ describe("usage client", () => {
   });
 });
 
-describe("traces client", () => {
-  it("list/get/replay use Console trace paths with dry_run default", async () => {
-    const calls: { method: string; url: string; body?: string }[] = [];
-    const fetchImpl = mockFetch((url, init) => {
-      calls.push({
-        method: init?.method ?? "GET",
-        url,
-        body: init?.body ? String(init.body) : undefined,
-      });
-      if (url.includes("/replay")) {
-        return jsonResponse({
-          dry_run: true,
-          trace_id: "t1",
-          upstream_called: false,
-          billed: false,
-          intended_target: { provider_kind: "openai", model_id: "gpt-4o" },
-        });
-      }
-      if (url.includes("/console/traces/t1")) {
-        return jsonResponse({ id: "t1", kind: { type: "request_received" } });
-      }
-      return jsonResponse({ traces: [{ id: "t1", alias: "gpt-4o" }] });
-    });
-    const api = createConsoleApi(fetchImpl);
-    const list = await api.traces.list(10);
-    expect(list.traces[0].id).toBe("t1");
-    await api.traces.get("t1");
-    const plan = await api.traces.replay("t1");
-    expect(plan.dry_run).toBe(true);
-    expect(plan.billed).toBe(false);
-    expect(api.traces.streamUrl()).toBe(
-      "http://127.0.0.1:4001/console/traces/stream",
-    );
-
-    expect(calls[0].url).toContain("/console/traces?limit=10");
-    expect(calls[1].url).toContain("/console/traces/t1");
-    expect(calls[2].method).toBe("POST");
-    expect(calls[2].url).toContain("/console/traces/t1/replay?dry_run=true");
-  });
-});
 
 describe("error handling", () => {
   it("throws ConsoleClientError with status and path", async () => {
@@ -319,10 +279,10 @@ describe("buildConsoleHeaders / preflight avoidance", () => {
       headers: new Headers({ Authorization: "Bearer test" }),
     });
     const fromTuples = buildConsoleHeaders({
-      headers: [["X-Trace-Id", "trace-1"]],
+      headers: [["X-Request-Id", "req-1"]],
     });
     expect(fromHeaders.get("authorization")).toBe("Bearer test");
-    expect(fromTuples.get("x-trace-id")).toBe("trace-1");
+    expect(fromTuples.get("x-request-id")).toBe("req-1");
   });
 
   it("preserves an existing lower-case content type", () => {

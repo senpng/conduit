@@ -1,7 +1,7 @@
 //! conduitd — the Conduit v2 daemon process.
 //!
 //! Starts the OpenAI-compatible gateway on the configured port,
-//! console API, and all background services (trace sink, quota cleanup).
+//! console API, and background services (quota cleanup).
 
 use anyhow::Result;
 use clap::Parser;
@@ -19,7 +19,7 @@ pub struct Args {
     #[arg(long, env = "CONDUIT_PORT")]
     pub port: Option<u16>,
 
-    /// Data directory for trace logs, secrets, and SQLite DB
+    /// Data directory for secrets and SQLite DB
     #[arg(long, env = "CONDUIT_DATA_DIR", default_value = "~/.conduit")]
     pub data_dir: std::path::PathBuf,
 

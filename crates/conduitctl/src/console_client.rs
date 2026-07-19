@@ -4,19 +4,13 @@
 
 use std::time::Duration;
 
-use futures::StreamExt;
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinHandle};
 
-use crate::{
-    dto::{
-        CreateKeyBody, CreateProviderBody, CreateRouteBody, HealthResponse, KeyCreateResponse,
-        TraceListResponse,
-    },
-    util::sse::{classify_sse_frame, parse_sse_frame, SseFrame},
+use crate::dto::{
+    CreateKeyBody, CreateProviderBody, CreateRouteBody, HealthResponse, KeyCreateResponse,
 };
 
 /// Errors from console HTTP / SSE transport.
@@ -28,8 +22,6 @@ pub enum ConsoleError {
     Http { status: u16, body: String },
     #[error("decode: {0}")]
     Decode(#[from] serde_json::Error),
-    #[error("sse: {0}")]
-    Sse(String),
 }
 
 /// Shared console API client (loopback by default).
@@ -38,8 +30,6 @@ pub struct ConsoleClient {
     base: String,
     /// Short-lived CRUD calls (JSON).
     http: reqwest::Client,
-    /// Long-lived SSE (no total request timeout — required for `trace tail`).
-    http_sse: reqwest::Client,
 }
 
 impl ConsoleClient {
@@ -51,19 +41,7 @@ impl ConsoleClient {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        // SSE streams must not inherit a 30s total timeout — that aborts the body
-        // mid-stream with "error decoding response body" after idle/keep-alive.
-        let http_sse = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            // No overall timeout; read stays open until server/client closes.
-            .pool_max_idle_per_host(2)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
-            base,
-            http,
-            http_sse,
-        }
+        Self { base, http }
     }
 
     pub fn base_url(&self) -> &str {
@@ -75,117 +53,6 @@ impl ConsoleClient {
     pub async fn health(&self) -> Result<HealthResponse, ConsoleError> {
         let url = format!("{}/health", self.base);
         self.get_json(&url).await
-    }
-
-    // ── Settings ────────────────────────────────────────────────────────────
-
-    pub async fn get_settings(&self) -> Result<crate::dto::SettingsResponse, ConsoleError> {
-        let url = format!("{}/console/settings", self.base);
-        self.get_json(&url).await
-    }
-
-    pub async fn update_settings(
-        &self,
-        body: &crate::dto::UpdateSettingsBody,
-    ) -> Result<crate::dto::SettingsResponse, ConsoleError> {
-        let url = format!("{}/console/settings", self.base);
-        self.put_json(&url, body).await
-    }
-
-    // ── Traces ──────────────────────────────────────────────────────────────
-
-    pub async fn list_traces(&self, limit: usize) -> Result<TraceListResponse, ConsoleError> {
-        let url = format!("{}/console/traces?limit={}", self.base, limit);
-        self.get_json(&url).await
-    }
-
-    pub async fn get_trace_bundle(&self, id: &str) -> Result<Value, ConsoleError> {
-        let url = format!("{}/console/traces/{}", self.base, id);
-        self.get_json(&url).await
-    }
-
-    pub async fn replay_dry_run(&self, id: &str) -> Result<Value, ConsoleError> {
-        let url = format!("{}/console/traces/{}/replay?dry_run=true", self.base, id);
-        self.post_empty_json(&url).await
-    }
-
-    /// Subscribe to `GET /console/traces/stream` (SSE).
-    ///
-    /// Sends [`SseFrame`] values (trace data or lagged).
-    pub fn subscribe_traces(
-        &self,
-        tx: mpsc::Sender<Result<SseFrame, ConsoleError>>,
-    ) -> JoinHandle<()> {
-        let client = self.clone();
-        tokio::spawn(async move {
-            if let Err(e) = client.run_trace_sse(tx.clone()).await {
-                let _ = tx.send(Err(e)).await;
-            }
-        })
-    }
-
-    async fn run_trace_sse(
-        &self,
-        tx: mpsc::Sender<Result<SseFrame, ConsoleError>>,
-    ) -> Result<(), ConsoleError> {
-        let url = format!("{}/console/traces/stream", self.base);
-        // Use the SSE client (no total request timeout).
-        let resp = self
-            .http_sse
-            .get(&url)
-            .header("accept", "text/event-stream")
-            .header("cache-control", "no-cache")
-            .send()
-            .await
-            .map_err(|e| ConsoleError::Sse(format!("connect: {e}")))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ConsoleError::Http { status, body });
-        }
-
-        let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| {
-                // Surface common causes clearly (timeout was the usual culprit).
-                ConsoleError::Sse(format!("stream read: {e}"))
-            })?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-
-            while let Some(pos) = buf.find("\n\n") {
-                let frame = buf[..pos].to_string();
-                buf = buf[pos + 2..].to_string();
-
-                if let Some(raw) = parse_sse_frame(&frame) {
-                    if let Some(classified) = classify_sse_frame(&raw) {
-                        // Reject legacy stub payloads if reintroduced.
-                        if let SseFrame::TraceData(ref payload) = classified {
-                            if payload.contains("not yet implemented") {
-                                return Err(ConsoleError::Sse(
-                                    "received stub tail payload; console stream is broken".into(),
-                                ));
-                            }
-                        }
-                        // try_send: never block the SSE read loop (UI applies backpressure via drop).
-                        match tx.try_send(Ok(classified)) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                // Drop frame when consumer is not keeping up.
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                // Receiver dropped — stop quietly.
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Clean EOF from server (daemon restart / graceful close).
-        Ok(())
     }
 
     // ── Providers ───────────────────────────────────────────────────────────
@@ -326,11 +193,6 @@ impl ConsoleClient {
         body: &B,
     ) -> Result<T, ConsoleError> {
         let resp = self.http.post(url).json(body).send().await?;
-        self.json_response(resp).await
-    }
-
-    async fn post_empty_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, ConsoleError> {
-        let resp = self.http.post(url).send().await?;
         self.json_response(resp).await
     }
 

@@ -1,7 +1,6 @@
 //! Per-request usage ledger.
 //!
-//! Independent of the trace log: every completed request with non-zero usage
-//! or cost is written here so spend remains queryable when traces are disabled.
+//! Every completed request with non-zero tokens or cost is written here.
 
 use chrono::Utc;
 use sqlx::{Row, SqlitePool};

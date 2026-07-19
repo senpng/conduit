@@ -6,9 +6,18 @@
   } from "../lib/consoleClient";
   import type { Provider, Route } from "../lib/consoleClient";
   import Modal from "../components/Modal.svelte";
+  import Field from "../components/app/Field.svelte";
+  import Button from "../components/ui/button.svelte";
+  import {
+    controlClass,
+    selectClass,
+    textareaClass,
+    monoClass,
+  } from "$lib/ui";
+  import { cn } from "$lib/utils";
+  import { Plus, ChevronUp, ChevronDown, Trash2 } from "@lucide/svelte";
 
   interface Props {
-    /** Existing route → edit mode (PUT); absent → create (POST). */
     existing?: Route | null;
     ondone: (changed: boolean) => void;
   }
@@ -43,7 +52,6 @@
   let busy = $state(false);
 
   $effect(() => {
-    // Prefill once on mount (component is remounted per open by the parent).
     alias = existing?.match_alias ?? "";
     strategy = existing?.strategy ?? "fixed";
     void (async () => {
@@ -184,104 +192,136 @@
   }
 </script>
 
-<Modal wide onclose={() => ondone(false)}>
-  <h3>{existing ? `Edit route — ${existing.match_alias}` : "New route"}</h3>
-
-  <div class="form-grid">
-    <label>
-      Match alias
-      <input bind:value={alias} placeholder="gpt-4o" />
-      <span class="field-hint">The model name downstream clients send.</span>
-    </label>
-    <label>
-      Strategy
-      <select bind:value={strategy}>
+<Modal
+  wide
+  onclose={() => ondone(false)}
+  title={existing ? `Edit route — ${existing.match_alias}` : "New route"}
+>
+  <div class="mb-4 grid gap-3 sm:grid-cols-2">
+    <Field label="Match alias" hint="The model name downstream clients send.">
+      <input class={controlClass} bind:value={alias} placeholder="gpt-4o" />
+    </Field>
+    <Field label="Strategy">
+      <select class={selectClass} bind:value={strategy}>
         <option value="fixed">Fixed — always target #0</option>
         <option value="fallback">Fallback — ordered failover + sticky</option>
         <option value="weighted">Weighted — LB by weight + sticky</option>
       </select>
       {#if strategy === "fallback"}
-        <span class="field-hint">
-          Sticky: last successful provider per downstream key + alias is tried first
-          (in-process pin; clears on daemon restart). Retries walk remaining targets.
+        <span class="mt-1 text-[11px] font-normal text-[var(--text-muted)]">
+          Sticky: last successful provider per key + alias is tried first.
         </span>
       {:else if strategy === "weighted"}
-        <span class="field-hint">
+        <span class="mt-1 text-[11px] font-normal text-[var(--text-muted)]">
           Attempt 0 picks by relative weight; sticky pin overrides when present.
-          Retries walk remaining targets in table order.
         </span>
       {/if}
-    </label>
+    </Field>
   </div>
 
-  <div>
-    <div class="row-between" style="margin-bottom:8px">
-      <span class="panel-title">
+  <div class="mb-4">
+    <div class="mb-2 flex items-center justify-between gap-2">
+      <span class="text-sm font-semibold text-[var(--text)]">
         Targets
-        {#if strategy === "fallback"}(default order; sticky first)
-        {:else if strategy === "weighted"}(weights for LB; sticky overrides)
+        {#if strategy === "fallback"}
+          <span class="font-normal text-[var(--text-muted)]">(order; sticky first)</span>
+        {:else if strategy === "weighted"}
+          <span class="font-normal text-[var(--text-muted)]">(weights + sticky)</span>
         {/if}
       </span>
-      <button class="btn-ghost btn-sm" onclick={addTarget}>＋ Add target</button>
+      <Button variant="outline" size="sm" onclick={addTarget}>
+        <Plus class="h-3.5 w-3.5" />
+        Add target
+      </Button>
     </div>
-    <div class="target-list">
+    <div class="space-y-2">
       {#each targets as t, i (i)}
-        <div class="target-row">
-          <span class="target-order">#{i}</span>
-          <select bind:value={t.provider_id} onchange={() => onProviderPick(t)}>
-            <option value="" disabled>Provider…</option>
-            {#each providers as p (p.id)}
-              <option value={p.id}>{p.name} ({p.kind})</option>
-            {/each}
-          </select>
-          <input bind:value={t.model_id} placeholder="model_id e.g. gpt-4o" />
-          <input
-            bind:value={t.upstream_key_id}
-            placeholder="upstream_key_id"
-            title="Secret scope binding; defaults to provider id"
-          />
-          {#if strategy === "weighted"}
+        <div class="rounded-lg border border-[var(--border)] bg-[var(--surface-muted)]/40 p-3">
+          <div class="mb-2 flex flex-wrap items-center gap-2">
+            <span class={cn(monoClass, "text-xs text-[var(--text-muted)]")}>#{i}</span>
+            <select
+              class={cn(selectClass, "min-w-[10rem] flex-1")}
+              bind:value={t.provider_id}
+              onchange={() => onProviderPick(t)}
+            >
+              <option value="" disabled>Provider…</option>
+              {#each providers as p (p.id)}
+                <option value={p.id}>{p.name} ({p.kind})</option>
+              {/each}
+            </select>
             <input
-              type="number"
-              min="0"
-              step="1"
-              style="width:4.5rem"
-              bind:value={t.weight}
-              title="Relative weight (0 = never first-picked by LB)"
-              placeholder="weight"
+              class={cn(controlClass, "min-w-[8rem] flex-1")}
+              bind:value={t.model_id}
+              placeholder="model_id e.g. gpt-4o"
             />
-          {/if}
-          <div class="target-actions">
-            <button class="btn-icon" title="Move up" disabled={i === 0} onclick={() => move(i, -1)}>↑</button>
-            <button class="btn-icon" title="Move down" disabled={i === targets.length - 1} onclick={() => move(i, 1)}>↓</button>
-            <button class="btn-icon danger" title="Remove" onclick={() => removeTarget(i)}>✕</button>
-          </div>
-          <label class="target-overrides">
-            Request overrides (JSON)
             <input
+              class={cn(controlClass, "min-w-[8rem] flex-1")}
+              bind:value={t.upstream_key_id}
+              placeholder="upstream_key_id"
+              title="Secret scope binding; defaults to provider id"
+            />
+            {#if strategy === "weighted"}
+              <input
+                class={cn(controlClass, "w-20")}
+                type="number"
+                min="0"
+                step="1"
+                bind:value={t.weight}
+                title="Relative weight"
+                placeholder="weight"
+              />
+            {/if}
+            <div class="flex gap-0.5">
+              <Button variant="ghost" size="icon" title="Move up" disabled={i === 0} onclick={() => move(i, -1)}>
+                <ChevronUp class="h-4 w-4" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                title="Move down"
+                disabled={i === targets.length - 1}
+                onclick={() => move(i, 1)}
+              >
+                <ChevronDown class="h-4 w-4" />
+              </Button>
+              <Button variant="ghost" size="icon" title="Remove" onclick={() => removeTarget(i)}>
+                <Trash2 class="h-4 w-4 text-[var(--danger)]" />
+              </Button>
+            </div>
+          </div>
+          <Field label="Request overrides (JSON)">
+            <input
+              class={controlClass}
               bind:value={t.request_overrides}
               placeholder={'{"service_tier":"priority"}'}
-              title="Static fields merged into this target's encoded upstream request"
             />
-          </label>
+          </Field>
         </div>
       {/each}
     </div>
   </div>
 
-  <label>
-    Retry policy (optional JSON)
-    <textarea rows="2" bind:value={retryJson} placeholder={'{"max_retries":2,"base_delay_ms":500}'}></textarea>
-  </label>
+  <Field label="Retry policy (optional JSON)" class="mb-4">
+    <textarea
+      class={textareaClass}
+      rows="2"
+      bind:value={retryJson}
+      placeholder={'{"max_retries":2,"base_delay_ms":500}'}
+    ></textarea>
+  </Field>
 
   {#if formError}
-    <div class="form-error">{formError}</div>
+    <div
+      class="mb-3 rounded-lg border border-[color-mix(in_srgb,var(--danger)_30%,var(--border))] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]"
+    >
+      {formError}
+    </div>
   {/if}
 
-  <div class="form-actions">
-    <button class="btn-primary" disabled={busy} onclick={submit}>
+  <div class="flex justify-end gap-2">
+    <Button disabled={busy} onclick={submit}>
       {busy ? "Saving…" : existing ? "Save changes" : "Create route"}
-    </button>
-    <button class="btn-ghost" onclick={() => ondone(false)}>Cancel</button>
+    </Button>
+    <Button variant="outline" onclick={() => ondone(false)}>Cancel</Button>
   </div>
 </Modal>

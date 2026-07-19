@@ -4,7 +4,6 @@ members = [
     "crates/conduit-codec",
     "crates/conduit-secret",
     "crates/conduit-store",
-    "crates/conduit-trace",
     "crates/conduit-quota",
     "crates/conduit-router",
     "crates/conduit-upstream",

@@ -14,7 +14,6 @@ export {
   keys,
   usage,
   pricing,
-  traces,
   ConsoleClientError,
 } from "./lib/consoleClient";
 
@@ -27,9 +26,7 @@ export type {
   CreateKeyResponse,
   UsageSummaryEntry,
   UsageSummaryResponse,
+  UsageRecord,
   PricingRow,
   HealthResponse,
-  TraceIndexRow,
-  TraceListResponse,
-  ReplayPlan,
 } from "./lib/consoleClient";

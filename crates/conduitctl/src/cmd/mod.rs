@@ -3,7 +3,5 @@ pub mod oauth;
 pub mod pricing;
 pub mod provider;
 pub mod route;
-pub mod settings;
 pub mod status;
-pub mod trace;
 pub mod usage;

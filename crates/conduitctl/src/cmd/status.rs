@@ -7,9 +7,6 @@ pub async fn run(console_addr: &str) -> Result<()> {
         Ok(body) => {
             println!("conduitd: {}", body.status);
             println!("version:  {}", body.version);
-            if let Some(te) = body.trace_enabled {
-                println!("trace:    {}", if te { "on" } else { "off" });
-            }
             Ok(())
         }
         Err(conduitctl::ConsoleError::Http { status, .. }) => {

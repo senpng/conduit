@@ -5,6 +5,12 @@
   import type { OAuthProviderMeta, OAuthSession } from "../lib/consoleClient";
   import { providerDisplayName } from "../lib/format";
   import Modal from "../components/Modal.svelte";
+  import Alert from "../components/app/Alert.svelte";
+  import Field from "../components/app/Field.svelte";
+  import Button from "../components/ui/button.svelte";
+  import Badge from "../components/ui/badge.svelte";
+  import { controlClass, selectClass, monoClass } from "$lib/ui";
+  import { cn } from "$lib/utils";
 
   interface Props {
     ondone: () => void;
@@ -40,12 +46,10 @@
   let name = $state("");
   let busy = $state(false);
   let session = $state<OAuthSession | null>(null);
-  /** Resolved after OAuth completes for display (prefer name over raw id). */
   let completedProviderLabel = $state<string | null>(null);
   let pollTimer: ReturnType<typeof setInterval> | null = null;
 
   const selectedMeta = $derived(kinds.find((k) => k.kind === kind));
-  // Daemon flow values: "authorization_code_pkce" | "device_code".
   const isPkce = $derived(!(selectedMeta?.flow ?? "").includes("device"));
 
   onMount(async () => {
@@ -53,7 +57,7 @@
       const list = await oauthApi.listProviders();
       if (list.length > 0) kinds = list;
     } catch {
-      // fallback list stays
+      /* fallback list stays */
     }
   });
   onDestroy(() => stopPoll());
@@ -134,47 +138,56 @@
   }
 </script>
 
-<Modal onclose={close}>
-  <h3>OAuth login</h3>
-  <p class="modal-hint">
+<Modal onclose={close} title="OAuth login">
+  <p class="mb-3 text-sm text-[var(--text-secondary)]">
     Authorize a Claude / Codex / Grok subscription account. A provider is created
     automatically on completion.
   </p>
 
   {#if !app.isLoopback && isPkce}
-    <div class="warn-bar">
-      ⚠ Console endpoint is not loopback. PKCE callbacks bind to the daemon machine
+    <Alert variant="warning" class="mb-3">
+      Console endpoint is not loopback. PKCE callbacks bind to the daemon machine
       {#if selectedMeta?.callback_port}(port {selectedMeta.callback_port}){/if}
       — the browser must reach that machine. Remote-only? Use Grok device code or
       an API-key provider.
-    </div>
+    </Alert>
   {/if}
 
-  <div class="form-grid">
-    <label>
-      Provider
-      <select bind:value={kind} disabled={busy}>
+  <div class="mb-4 grid gap-3 sm:grid-cols-2">
+    <Field label="Provider">
+      <select class={selectClass} bind:value={kind} disabled={busy}>
         {#each kinds as k (k.kind)}
           <option value={k.kind}>{k.display_name}</option>
         {/each}
       </select>
-    </label>
-    <label>
-      Display name (optional)
-      <input bind:value={name} placeholder="My account" disabled={busy} />
-    </label>
+    </Field>
+    <Field label="Display name (optional)">
+      <input class={controlClass} bind:value={name} placeholder="My account" disabled={busy} />
+    </Field>
   </div>
 
   {#if session}
-    <div class="oauth-status">
-      <div>
-        Status: <strong class="mono">{session.status}</strong>
+    <div class="mb-4 space-y-2 rounded-lg border border-[var(--border)] bg-[var(--surface-muted)]/50 p-3 text-sm">
+      <div class="flex items-center gap-2">
+        <span class="text-[var(--text-secondary)]">Status</span>
+        <Badge
+          variant={session.status === "completed"
+            ? "success"
+            : session.status === "error"
+              ? "danger"
+              : "secondary"}
+        >
+          <span class={monoClass}>{session.status}</span>
+        </Badge>
       </div>
       {#if session.user_code}
-        <div class="dim small">Enter this code at the verification page:</div>
-        <div class="device-code">{session.user_code}</div>
+        <p class="text-xs text-[var(--text-secondary)]">Enter this code at the verification page:</p>
+        <div class={cn(monoClass, "text-lg font-semibold tracking-wider text-[var(--text)]")}>
+          {session.user_code}
+        </div>
         {#if session.verification_uri_complete || session.verification_uri}
           <a
+            class="break-all text-[var(--accent)] underline-offset-2 hover:underline"
             href={session.verification_uri_complete ?? session.verification_uri}
             target="_blank"
             rel="noreferrer"
@@ -183,37 +196,40 @@
           </a>
         {/if}
         {#if session.expires_in}
-          <div class="dim small">Expires in {session.expires_in}s</div>
+          <p class="text-xs text-[var(--text-muted)]">Expires in {session.expires_in}s</p>
         {/if}
       {:else if session.auth_url}
-        <div class="dim small">
+        <p class="text-xs text-[var(--text-secondary)]">
           If the browser did not open, complete authorization on the
-          <strong>daemon machine</strong> via:
-        </div>
-        <a href={session.auth_url} target="_blank" rel="noreferrer">{session.auth_url}</a>
+          <strong>daemon machine</strong>:
+        </p>
+        <a
+          class="break-all text-xs text-[var(--accent)] underline-offset-2 hover:underline"
+          href={session.auth_url}
+          target="_blank"
+          rel="noreferrer"
+        >
+          {session.auth_url}
+        </a>
       {/if}
       {#if session.status === "completed"}
-        <div class="ok">
-          ✓ Provider created: {completedProviderLabel ??
-            (name.trim() || session.email || "ok")}
-          {#if session.email && !(completedProviderLabel ?? "").includes(session.email)}
-            <span class="dim">({session.email})</span>
-          {/if}
-        </div>
+        <p class="text-[var(--success)]">
+          Provider created: {completedProviderLabel ?? (name.trim() || session.email || "ok")}
+        </p>
       {/if}
       {#if session.error}
-        <div class="err">{session.error}</div>
+        <p class="text-[var(--danger)]">{session.error}</p>
       {/if}
     </div>
   {/if}
 
-  <div class="form-actions">
+  <div class="flex flex-wrap justify-end gap-2">
     {#if !busy && session?.status !== "completed"}
-      <button class="btn-primary" onclick={start}>Start authorization</button>
+      <Button onclick={start}>Start authorization</Button>
     {/if}
     {#if busy}
-      <button class="btn-ghost" onclick={cancel}>Cancel session</button>
+      <Button variant="outline" onclick={cancel}>Cancel session</Button>
     {/if}
-    <button class="btn-ghost" onclick={close}>Close</button>
+    <Button variant="outline" onclick={close}>Close</Button>
   </div>
 </Modal>
