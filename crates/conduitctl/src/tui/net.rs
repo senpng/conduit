@@ -70,7 +70,10 @@ pub fn spawn_providers(client: ConsoleClient, gen: u64, tx: UnboundedSender<Msg>
     tokio::spawn(async move {
         let r = client.list_providers_typed().await.map_err(|e| e.to_string());
         let _ = tx.send(Msg::Providers { gen, result: r });
-        // Probe OAuth remaining (Claude/Codex usage + Grok billing), then load snapshots + cooldowns.
+        // Render any already-cached remaining immediately, before the (slow) probe —
+        // otherwise the REMAINING column stays blank until every OAuth provider is
+        // probed serially. Then probe upstream and refresh once more.
+        spawn_quota_state(client.clone(), tx.clone()).await;
         if let Err(e) = client.refresh_all_quotas().await {
             let _ = tx.send(Msg::Quota {
                 snapshots: Err(format!("refresh quotas: {e}")),
