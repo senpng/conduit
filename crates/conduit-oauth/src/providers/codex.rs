@@ -326,6 +326,12 @@ pub fn parse_jwt_identity(token: &str) -> Result<CodexJwtIdentity, OAuthError> {
 }
 
 /// Flatten rich JWT claims into credential `extra` for persistence / console.
+///
+/// Do **not** put fields that already exist on [`OAuthCredential`] (e.g. `plan_type`,
+/// `email`, `account_id`) into `extra`. `#[serde(flatten)]` would emit them twice on
+/// serialize, and deserialize then fails with `duplicate field` — which made the
+/// resolver treat the whole JSON blob as a raw API key (ChatGPT 401: could not parse
+/// authentication token).
 pub fn identity_to_extra(id: &CodexJwtIdentity) -> std::collections::HashMap<String, Value> {
     let mut m = std::collections::HashMap::new();
     if let Some(ref v) = id.chatgpt_user_id {
@@ -345,9 +351,6 @@ pub fn identity_to_extra(id: &CodexJwtIdentity) -> std::collections::HashMap<Str
     }
     if let Some(ref v) = id.subscription_active_until {
         m.insert("chatgpt_subscription_active_until".into(), v.clone());
-    }
-    if let Some(ref v) = id.plan_type {
-        m.insert("plan_type".into(), Value::String(v.clone()));
     }
     m
 }
@@ -501,6 +504,32 @@ mod tests {
         assert_eq!(id.account_id.as_deref(), Some("acct-1"));
         assert_eq!(id.email.as_deref(), Some("a@b.com"));
         assert_eq!(id.plan_type.as_deref(), Some("plus"));
+    }
+
+    #[test]
+    fn identity_to_extra_omits_typed_fields() {
+        let id = CodexJwtIdentity {
+            account_id: Some("acc".into()),
+            email: Some("a@b.com".into()),
+            plan_type: Some("prolite".into()),
+            chatgpt_user_id: Some("user-1".into()),
+            user_id: Some("uid".into()),
+            auth_provider: Some("google".into()),
+            organizations: Some(json!([{"id":"org-1"}])),
+            subscription_active_start: None,
+            subscription_active_until: None,
+        };
+        let extra = identity_to_extra(&id);
+        assert!(
+            !extra.contains_key("plan_type"),
+            "plan_type must stay on OAuthCredential only"
+        );
+        assert!(!extra.contains_key("email"));
+        assert!(!extra.contains_key("account_id"));
+        assert_eq!(
+            extra.get("chatgpt_user_id").and_then(|v| v.as_str()),
+            Some("user-1")
+        );
     }
 
     #[test]

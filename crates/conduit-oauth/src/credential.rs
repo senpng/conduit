@@ -173,11 +173,23 @@ impl OAuthCredential {
     }
 
     pub fn to_json_bytes(&self) -> Result<Vec<u8>, OAuthError> {
-        serde_json::to_vec(self).map_err(|e| OAuthError::Serialization(e.to_string()))
+        // Drop known top-level keys from `extra` so `#[serde(flatten)]` cannot
+        // emit duplicate JSON keys (breaks deserialize + OAuth resolve).
+        let mut cleaned = self.clone();
+        cleaned.sanitize_extra();
+        serde_json::to_vec(&cleaned).map_err(|e| OAuthError::Serialization(e.to_string()))
     }
 
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, OAuthError> {
-        serde_json::from_slice(bytes).map_err(|e| OAuthError::Serialization(e.to_string()))
+        // Prefer Value intermediate: historical blobs may contain duplicate keys
+        // (e.g. `plan_type` both top-level and in flattened extra). Parsing to
+        // `Value` keeps the last occurrence; direct struct deserialize errors.
+        let v: Value = serde_json::from_slice(bytes)
+            .map_err(|e| OAuthError::Serialization(e.to_string()))?;
+        let mut cred: Self = serde_json::from_value(v)
+            .map_err(|e| OAuthError::Serialization(e.to_string()))?;
+        cred.sanitize_extra();
+        Ok(cred)
     }
 
     /// Try parse as OAuth JSON; returns `None` if this looks like a raw API key.
@@ -186,11 +198,104 @@ impl OAuthCredential {
         if !s.starts_with('{') {
             return None;
         }
-        let cred: Self = serde_json::from_str(s).ok()?;
+        let cred = Self::from_json_bytes(s.as_bytes()).ok()?;
         if cred.access_token.is_empty() && cred.refresh_token.is_empty() {
             return None;
         }
         Some(cred)
+    }
+
+    /// Keys owned by typed fields — must not also live in `extra` under flatten.
+    const RESERVED_EXTRA_KEYS: &'static [&'static str] = &[
+        "type",
+        "auth_kind",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "token_type",
+        "expired",
+        "expire",
+        "last_refresh",
+        "email",
+        "account_id",
+        "plan_type",
+        "plan",
+        "organization_id",
+        "organization_name",
+        "sub",
+        "base_url",
+        "token_endpoint",
+        "proxy_url",
+        "using_api",
+    ];
+
+    /// Promote known values out of `extra`, then drop reserved keys so flatten
+    /// cannot emit duplicate JSON keys on the next serialize.
+    fn sanitize_extra(&mut self) {
+        if self.plan_type.is_none() {
+            if let Some(s) = self
+                .extra
+                .get("plan_type")
+                .or_else(|| self.extra.get("plan"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                self.plan_type = Some(s.to_string());
+            }
+        }
+        if self.email.is_none() {
+            if let Some(s) = self
+                .extra
+                .get("email")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                self.email = Some(s.to_string());
+            }
+        }
+        if self.account_id.is_none() {
+            if let Some(s) = self
+                .extra
+                .get("account_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                self.account_id = Some(s.to_string());
+            }
+        }
+        if self.proxy_url.is_none() {
+            if let Some(s) = self
+                .extra
+                .get("proxy_url")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                self.proxy_url = Some(s.to_string());
+            }
+        }
+        if self.using_api.is_none() {
+            match self.extra.get("using_api") {
+                Some(Value::Bool(b)) => self.using_api = Some(*b),
+                Some(Value::String(s)) => {
+                    let s = s.trim();
+                    if s.eq_ignore_ascii_case("true") || s == "1" {
+                        self.using_api = Some(true);
+                    } else if s.eq_ignore_ascii_case("false") || s == "0" {
+                        self.using_api = Some(false);
+                    }
+                }
+                Some(Value::Number(n)) if n.as_i64() == Some(1) => self.using_api = Some(true),
+                Some(Value::Number(n)) if n.as_i64() == Some(0) => self.using_api = Some(false),
+                _ => {}
+            }
+        }
+        for k in Self::RESERVED_EXTRA_KEYS {
+            self.extra.remove(*k);
+        }
     }
 
     /// Effective per-credential proxy override (field or `extra.proxy_url`).
@@ -349,6 +454,62 @@ mod tests {
         let back = OAuthCredential::from_json_bytes(&bytes).unwrap();
         assert_eq!(back.access_token, "at");
         assert_eq!(back.kind().unwrap(), OAuthProviderKind::Claude);
+    }
+
+    #[test]
+    fn try_parse_tolerates_duplicate_plan_type_json() {
+        // Historical bug: plan_type written both as typed field and in flatten extra.
+        // Raw JSON with the key twice fails direct serde; Value intermediate recovers.
+        let raw = br#"{"type":"codex","auth_kind":"oauth","access_token":"at-1","refresh_token":"rt-1","plan_type":"prolite","plan_type":"prolite","email":"u@x.com","account_id":"acc-1"}"#;
+        let cred = OAuthCredential::try_parse_secret(raw).expect("should parse");
+        assert_eq!(cred.access_token, "at-1");
+        assert_eq!(cred.plan_type.as_deref(), Some("prolite"));
+        assert_eq!(cred.account_id.as_deref(), Some("acc-1"));
+        // Re-serialize must be clean (single plan_type).
+        let bytes = cred.to_json_bytes().unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(s.matches("\"plan_type\"").count(), 1);
+        let back = OAuthCredential::from_json_bytes(&bytes).unwrap();
+        assert_eq!(back.plan_type.as_deref(), Some("prolite"));
+        assert!(!back.extra.contains_key("plan_type"));
+    }
+
+    #[test]
+    fn to_json_strips_reserved_keys_from_extra() {
+        let mut c = OAuthCredential {
+            provider_type: "codex".into(),
+            auth_kind: "oauth".into(),
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            id_token: None,
+            token_type: None,
+            expired: None,
+            last_refresh: None,
+            email: None,
+            account_id: None,
+            plan_type: Some("plus".into()),
+            organization_id: None,
+            organization_name: None,
+            sub: None,
+            base_url: None,
+            token_endpoint: None,
+            proxy_url: None,
+            using_api: None,
+            extra: Default::default(),
+        };
+        c.extra
+            .insert("plan_type".into(), Value::String("plus".into()));
+        c.extra
+            .insert("chatgpt_user_id".into(), Value::String("u1".into()));
+        let bytes = c.to_json_bytes().unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(s.matches("\"plan_type\"").count(), 1);
+        let back = OAuthCredential::from_json_bytes(&bytes).unwrap();
+        assert_eq!(back.plan_type.as_deref(), Some("plus"));
+        assert_eq!(
+            back.extra.get("chatgpt_user_id").and_then(|v| v.as_str()),
+            Some("u1")
+        );
     }
 
     #[test]
