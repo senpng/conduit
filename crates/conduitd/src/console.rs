@@ -763,11 +763,21 @@ pub async fn refresh_all_quota_snapshots(
         Err(e) => return internal(e).into_response(),
     };
     let mut results = Vec::new();
-    for p in providers {
-        if !is_oauth_provider_kind(&p.kind) {
-            continue;
-        }
-        match probe_oauth_quota(&state, &p.id).await {
+    let oauth: Vec<_> = providers
+        .into_iter()
+        .filter(|p| is_oauth_provider_kind(&p.kind))
+        .collect();
+    // Probe all OAuth providers concurrently — serial awaits made the TUI wait
+    // for every account's usage round-trip before the first refresh returned.
+    let state_ref = &state;
+    let probed = futures::future::join_all(
+        oauth
+            .iter()
+            .map(|p| async move { (p, probe_oauth_quota(state_ref, &p.id).await) }),
+    )
+    .await;
+    for (p, probe) in probed {
+        match probe {
             Ok(Some(note)) => results.push(json!({
                 "provider_id": p.id,
                 "kind": p.kind,
