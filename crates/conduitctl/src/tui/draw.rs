@@ -809,9 +809,9 @@ fn draw_master_detail_routes(frame: &mut Frame, area: Rect, app: &App) {
                 super::forms::summarize_route_targets(&r.targets_json, &app.providers);
             let row = Row::new(vec![
                 en.into(),
-                truncate(&r.match_alias, 18),
-                truncate(&r.strategy, 9),
-                truncate(&summary, 28),
+                truncate(&r.match_alias, 22),
+                truncate(&r.strategy, 11),
+                truncate(&summary, 40),
             ]);
             if view_i == sel {
                 row.style(theme.selection())
@@ -825,11 +825,17 @@ fn draw_master_detail_routes(frame: &mut Frame, area: Rect, app: &App) {
         rows,
         [
             Constraint::Length(2),
-            Constraint::Percentage(28),
-            Constraint::Length(9),
-            Constraint::Min(18),
+            // STRAT: exactly wide enough for the longest value (`round_robin`),
+            // so `fixed` rows stop leaving a gap before TARGETS.
+            //
+            // ALIAS / TARGETS split the remaining width by weight — TARGETS gets
+            // the larger share since `pool:…×N→…` summaries are the longest.
+            Constraint::Fill(2), // ALIAS
+            Constraint::Length(11), // STRAT
+            Constraint::Fill(3), // TARGETS
         ],
     )
+    .column_spacing(1)
     .header(
         Row::new(vec!["", "ALIAS", "STRAT", "TARGETS"]).style(theme.header_cell()),
     )
