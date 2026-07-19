@@ -22,7 +22,7 @@ use super::forms::{
 use super::input::InputField;
 use super::msg::{Msg, RefreshKind};
 use super::net;
-use super::theme::Theme;
+use super::theme::{Theme, ThemeMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -179,6 +179,8 @@ pub struct App {
     pub status: String,
     pub error: Option<String>,
     pub theme: Theme,
+    /// auto | dark | light — `CONDUIT_THEME` at launch; `T` cycles at runtime.
+    pub theme_mode: ThemeMode,
     /// Animation frame for spinners (advanced on Tick).
     pub tick_frame: u64,
     /// List filter query (applied in Browse; edited in Filter mode).
@@ -228,6 +230,12 @@ pub struct App {
 
 impl App {
     pub fn new(console_addr: &str, tx: UnboundedSender<Msg>) -> Self {
+        let theme_mode = ThemeMode::from_env();
+        let theme = theme_mode.resolve();
+        let status = format!(
+            "Ready — ? help · / filter · T theme ({})",
+            theme_mode.status_label(theme.kind)
+        );
         Self {
             client: ConsoleClient::new(console_addr),
             console_addr: console_addr.to_string(),
@@ -235,9 +243,10 @@ impl App {
             mode: Mode::Browse,
             should_quit: false,
             loading: false,
-            status: "Ready — press ? for help · / filter".into(),
+            status,
             error: None,
-            theme: Theme::dark(),
+            theme_mode,
+            theme,
             tick_frame: 0,
             filter: String::new(),
             health: None,
@@ -372,6 +381,16 @@ impl App {
                     )
                 {
                     self.mode = Mode::Filter;
+                }
+            }
+            Action::ToggleTheme => {
+                if matches!(self.mode, Mode::Browse | Mode::Filter | Mode::Help) {
+                    self.theme_mode = self.theme_mode.next();
+                    self.theme = self.theme_mode.resolve();
+                    self.status = format!(
+                        "Theme: {}",
+                        self.theme_mode.status_label(self.theme.kind)
+                    );
                 }
             }
             Action::Refresh => self.request_refresh(),
@@ -902,6 +921,7 @@ impl App {
             ("?", "help"),
             ("q", "quit"),
             ("r", "refresh"),
+            ("T", "theme"),
             ("tab", "next"),
         ];
         match self.tab {

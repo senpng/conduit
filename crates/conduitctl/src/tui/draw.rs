@@ -2451,6 +2451,7 @@ Global
   1-6 / Tab     Switch tab          j/k ↑↓     Move
   PgUp/PgDn     Page                g / G      Top / bottom
   /             Filter lists        r          Refresh
+  T             Theme auto/dark/light (also CONDUIT_THEME=…)
   ?             Help                q          Quit
 
 Providers  (OAuth is an add method here)

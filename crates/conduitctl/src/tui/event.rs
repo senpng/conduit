@@ -101,6 +101,8 @@ fn map_browse(tab: Tab, key: KeyEvent) -> Option<Action> {
         KeyCode::End | KeyCode::Char('G') => Some(Action::GoBottom),
         KeyCode::Char('/') => Some(Action::StartFilter),
         KeyCode::Char('r') => Some(Action::Refresh),
+        // Shift-T — cycle auto/dark/light (plain `t` is Usage detail).
+        KeyCode::Char('T') => Some(Action::ToggleTheme),
         KeyCode::Char('a') => Some(Action::Add),
         // Usage / Pricing / Keys have right-hand detail panes — no Enter modal.
         KeyCode::Char('e') if tab != Tab::Usage => Some(Action::Edit),
@@ -247,6 +249,19 @@ mod tests {
         assert_eq!(
             map_key(&Mode::Browse, Tab::Overview, key(KeyCode::Char('q'))),
             Some(Action::Quit)
+        );
+    }
+
+    #[test]
+    fn shift_t_toggles_theme() {
+        assert_eq!(
+            map_key(&Mode::Browse, Tab::Overview, key(KeyCode::Char('T'))),
+            Some(Action::ToggleTheme)
+        );
+        // plain `t` is Usage-only detail cycle — not theme.
+        assert_eq!(
+            map_key(&Mode::Browse, Tab::Overview, key(KeyCode::Char('t'))),
+            None
         );
     }
 

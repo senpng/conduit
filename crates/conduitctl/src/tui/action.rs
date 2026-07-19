@@ -69,6 +69,8 @@ pub enum Action {
     CycleUsageDetail,
     /// Start filter input (`/`)
     StartFilter,
+    /// Cycle theme: auto → dark → light → auto (`T`)
+    ToggleTheme,
     /// Page up / down in lists
     PageUp,
     PageDown,
