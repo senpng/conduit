@@ -91,6 +91,17 @@ pub fn encode_request(req: &CanonicalChatRequest, stream: bool) -> Value {
             body["reasoning_effort"] = json!(effort);
         }
     }
+    if let Some(tier) = &s.service_tier {
+        if !tier.is_empty() {
+            body["service_tier"] = json!(tier);
+        }
+    }
+    // parallel_tool_calls is stored in meta.extra for round-trip.
+    if let Some(v) = req.meta.extra.get("parallel_tool_calls") {
+        if v.is_boolean() {
+            body["parallel_tool_calls"] = v.clone();
+        }
+    }
 
     // Response format
     if let Some(rf) = &req.response_format {
@@ -564,5 +575,17 @@ mod tests {
         }];
         let v = encode_request(&req, false);
         assert!(v["tools"][0]["function"]["parameters"]["properties"].is_object());
+    }
+
+    #[test]
+    fn parallel_tool_calls_and_service_tier_emitted() {
+        let mut req = make_request();
+        req.sampling.service_tier = Some("priority".into());
+        req.meta
+            .extra
+            .insert("parallel_tool_calls".into(), json!(true));
+        let v = encode_request(&req, false);
+        assert_eq!(v["service_tier"].as_str().unwrap(), "priority");
+        assert_eq!(v["parallel_tool_calls"].as_bool(), Some(true));
     }
 }

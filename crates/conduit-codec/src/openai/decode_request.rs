@@ -26,22 +26,28 @@ pub fn decode_request(
     for msg in msgs_raw {
         let role_str = msg["role"].as_str().unwrap_or("user");
         match role_str {
-            "system" => {
-                let text = msg["content"].as_str().unwrap_or("").to_string();
+            "system" | "developer" => {
+                // CLIProxyAPI / OpenAI: developer is system-equivalent on chat.
+                let content = decode_textish_content(&msg["content"]);
                 messages.push(CanonicalMessage {
                     role: Role::System,
-                    content: vec![CanonicalContent::Text { text }],
+                    content,
                     name: msg["name"].as_str().map(String::from),
                 });
             }
             "assistant" => {
                 let mut content: Vec<CanonicalContent> = Vec::new();
 
-                // Text part
-                if let Some(text) = msg["content"].as_str() {
-                    if !text.is_empty() {
-                        content.push(CanonicalContent::Text {
-                            text: text.to_string(),
+                // Text part (string or multimodal array)
+                content.extend(decode_textish_content(&msg["content"]));
+
+                // reasoning_content → Thinking (CLIProxyAPI multi-turn parity)
+                if let Some(rc) = msg["reasoning_content"].as_str() {
+                    if !rc.is_empty() {
+                        content.push(CanonicalContent::Thinking {
+                            thinking: rc.to_string(),
+                            // Stamp gpt# so encode_request maps it back to reasoning_content.
+                            signature: Some("gpt#conduit".into()),
                         });
                     }
                 }
@@ -85,7 +91,7 @@ pub fn decode_request(
                         field: "tool_call_id".into(),
                     })?
                     .to_string();
-                let text = msg["content"].as_str().unwrap_or("").to_string();
+                let text = content_as_plain_text(&msg["content"]);
                 messages.push(CanonicalMessage {
                     role: Role::Tool,
                     content: vec![CanonicalContent::ToolResult {
@@ -128,10 +134,16 @@ pub fn decode_request(
 
     let response_format = decode_response_format(&body["response_format"]);
 
+    // Prefer max_tokens; fall back to max_completion_tokens (newer OpenAI clients).
+    let max_tokens = body["max_tokens"]
+        .as_u64()
+        .or_else(|| body["max_completion_tokens"].as_u64())
+        .map(|v| v as u32);
+
     let sampling = Sampling {
         temperature: body["temperature"].as_f64().map(|v| v as f32),
         top_p: body["top_p"].as_f64().map(|v| v as f32),
-        max_tokens: body["max_tokens"].as_u64().map(|v| v as u32),
+        max_tokens,
         stop: body["stop"].as_array().map(|arr| {
             arr.iter()
                 .filter_map(|v| v.as_str().map(String::from))
@@ -143,7 +155,7 @@ pub fn decode_request(
         n: body["n"].as_u64().map(|v| v as u8),
         top_k: None,
         reasoning_effort: body["reasoning_effort"].as_str().map(String::from),
-        service_tier: None,
+        service_tier: body["service_tier"].as_str().map(String::from),
     };
 
     Ok(CanonicalChatRequest {
@@ -173,11 +185,69 @@ pub fn decode_request(
             if let Some(m) = body.get("metadata").filter(|v| !v.is_null()) {
                 meta.extra.insert("metadata".into(), m.clone());
             }
+            // parallel_tool_calls lives in meta.extra for round-trip (CLIProxyAPI parity).
+            if let Some(v) = body.get("parallel_tool_calls").filter(|v| v.is_boolean()) {
+                meta.extra
+                    .insert("parallel_tool_calls".into(), v.clone());
+            }
             meta
         },
         stream,
         loss_report: Default::default(),
     })
+}
+
+/// Decode system/developer content: plain string or multimodal array of text parts.
+fn decode_textish_content(val: &Value) -> Vec<CanonicalContent> {
+    if let Some(text) = val.as_str() {
+        if text.is_empty() {
+            return vec![];
+        }
+        return vec![CanonicalContent::Text {
+            text: text.to_string(),
+        }];
+    }
+    if let Some(arr) = val.as_array() {
+        return arr
+            .iter()
+            .filter_map(|part| {
+                if let Some(s) = part.as_str() {
+                    if s.is_empty() {
+                        return None;
+                    }
+                    return Some(CanonicalContent::Text {
+                        text: s.to_string(),
+                    });
+                }
+                let ty = part.get("type").and_then(|t| t.as_str()).unwrap_or("text");
+                if matches!(ty, "text" | "input_text" | "output_text") {
+                    let text = part["text"].as_str().unwrap_or("").to_string();
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(CanonicalContent::Text { text })
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+    }
+    vec![]
+}
+
+fn content_as_plain_text(val: &Value) -> String {
+    if let Some(text) = val.as_str() {
+        return text.to_string();
+    }
+    decode_textish_content(val)
+        .into_iter()
+        .filter_map(|c| match c {
+            CanonicalContent::Text { text } => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn decode_user_content(val: &Value) -> Vec<CanonicalContent> {
@@ -190,7 +260,7 @@ fn decode_user_content(val: &Value) -> Vec<CanonicalContent> {
         return arr
             .iter()
             .filter_map(|part| match part["type"].as_str() {
-                Some("text") => Some(CanonicalContent::Text {
+                Some("text") | Some("input_text") => Some(CanonicalContent::Text {
                     text: part["text"].as_str().unwrap_or("").to_string(),
                 }),
                 Some("image_url") => {
@@ -273,6 +343,93 @@ mod tests {
             {"role": "user", "content": "Hello"}
         ]}));
         assert_eq!(req.messages[0].role, Role::System);
+    }
+
+    #[test]
+    fn developer_role_maps_to_system() {
+        let req = decode(json!({"messages": [
+            {"role": "developer", "content": "You are a coding agent"},
+            {"role": "user", "content": "Hello"}
+        ]}));
+        assert_eq!(req.messages[0].role, Role::System);
+        assert!(
+            matches!(&req.messages[0].content[0], CanonicalContent::Text { text } if text == "You are a coding agent")
+        );
+    }
+
+    #[test]
+    fn system_array_content_kept() {
+        let req = decode(json!({"messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "part-a"},
+                {"type": "text", "text": "part-b"}
+            ]},
+            {"role": "user", "content": "hi"}
+        ]}));
+        assert_eq!(req.messages[0].role, Role::System);
+        assert_eq!(req.messages[0].content.len(), 2);
+        assert!(
+            matches!(&req.messages[0].content[0], CanonicalContent::Text { text } if text == "part-a")
+        );
+        assert!(
+            matches!(&req.messages[0].content[1], CanonicalContent::Text { text } if text == "part-b")
+        );
+    }
+
+    #[test]
+    fn assistant_reasoning_content_decoded() {
+        let body = json!({"messages": [{
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_content": "I thought carefully"
+        }]});
+        let req = decode(body);
+        let thinking = req.messages[0]
+            .content
+            .iter()
+            .find_map(|c| match c {
+                CanonicalContent::Thinking { thinking, .. } => Some(thinking.as_str()),
+                _ => None,
+            });
+        assert_eq!(thinking, Some("I thought carefully"));
+        assert!(
+            req.messages[0].content.iter().any(
+                |c| matches!(c, CanonicalContent::Text { text } if text == "answer")
+            )
+        );
+    }
+
+    #[test]
+    fn max_completion_tokens_fallback() {
+        let req = decode(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 128
+        }));
+        assert_eq!(req.sampling.max_tokens, Some(128));
+    }
+
+    #[test]
+    fn max_tokens_preferred_over_max_completion_tokens() {
+        let req = decode(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 64,
+            "max_completion_tokens": 128
+        }));
+        assert_eq!(req.sampling.max_tokens, Some(64));
+    }
+
+    #[test]
+    fn parallel_tool_calls_and_service_tier() {
+        let req = decode(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "parallel_tool_calls": true,
+            "service_tier": "priority"
+        }));
+        assert_eq!(req.sampling.service_tier.as_deref(), Some("priority"));
+        assert_eq!(
+            req.meta.extra.get("parallel_tool_calls"),
+            Some(&json!(true))
+        );
     }
 
     #[test]

@@ -7,6 +7,9 @@ use conduit_ir::{
     error::CodecError,
     loss::LossReport,
 };
+pub use openai::{
+    convert_responses_to_chat_completions, should_treat_as_responses_format, OpenAiCodec,
+};
 pub use openai_responses::{
     apply_codex_chatgpt_account_body, can_reset_responses_continuation,
     merge_responses_continuation, prepare_responses_continuation, reset_responses_continuation,

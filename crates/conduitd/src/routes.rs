@@ -10,7 +10,8 @@ use axum::{
     Json,
 };
 use conduit_codec::{
-    anthropic::AnthropicCodec, openai::OpenAiCodec, response_output_items, responses_store_enabled,
+    anthropic::AnthropicCodec, convert_responses_to_chat_completions, openai::OpenAiCodec,
+    response_output_items, responses_store_enabled, should_treat_as_responses_format,
     OpenAiResponsesCodec, ResponsesStreamEncoder, WireCodec,
 };
 use conduit_ir::error::GatewayError;
@@ -456,6 +457,22 @@ pub async fn chat_completions(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+
+    // CLIProxyAPI: some clients send Responses-shaped payloads to chat/completions.
+    let body = if should_treat_as_responses_format(&body) {
+        debug!(
+            endpoint = "/v1/chat/completions",
+            "responses-shaped body detected; converting to chat completions"
+        );
+        convert_responses_to_chat_completions(&body, stream)
+    } else {
+        body
+    };
+
+    let stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(stream);
     let alias = match body.get("model").and_then(|v| v.as_str()) {
         Some(a) if !a.is_empty() => a.to_string(),
         _ => {
@@ -897,6 +914,47 @@ mod auth_status_tests {
         assert!(
             gateway_public_paths().contains(&"/v1/responses"),
             "POST /v1/responses must be part of the public gateway surface"
+        );
+    }
+
+    /// CLIProxyAPI parity: Responses-shaped body on /v1/chat/completions is
+    /// converted before decode (same pure helpers the handler calls).
+    #[test]
+    fn chat_completions_accepts_responses_shaped_body() {
+        let body = json!({
+            "model": "gpt-4o",
+            "instructions": "Be concise",
+            "input": "hello from responses on chat",
+            "stream": false
+        });
+        assert!(
+            should_treat_as_responses_format(&body),
+            "body without messages but with input must be treated as Responses"
+        );
+        let chat = convert_responses_to_chat_completions(&body, false);
+        assert!(
+            chat.get("messages").and_then(|m| m.as_array()).is_some(),
+            "conversion must produce messages: {chat}"
+        );
+        let req = OpenAiCodec::decode_request(
+            chat,
+            "gpt-4o".into(),
+            false,
+            "req-test".into(),
+            "key".into(),
+        )
+        .expect("decode after conversion must succeed");
+        assert!(
+            req.messages
+                .iter()
+                .any(|m| matches!(m.role, conduit_ir::canonical::Role::User)),
+            "must include a user turn from input"
+        );
+        assert!(
+            req.messages
+                .iter()
+                .any(|m| matches!(m.role, conduit_ir::canonical::Role::System)),
+            "instructions must become system"
         );
     }
 

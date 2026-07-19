@@ -1,6 +1,7 @@
 pub mod decode_request;
 pub mod decode_response;
 pub mod encode_request;
+pub mod responses_to_chat;
 pub mod stream;
 
 use conduit_ir::{
@@ -11,6 +12,10 @@ use conduit_ir::{
 use serde_json::{json, Value};
 
 use crate::WireCodec;
+
+pub use responses_to_chat::{
+    convert_responses_to_chat_completions, should_treat_as_responses_format,
+};
 
 pub struct OpenAiCodec;
 
@@ -73,11 +78,42 @@ impl WireCodec for OpenAiCodec {
             .collect::<Vec<_>>()
             .join("");
 
-        let message = if !tool_calls.is_empty() {
-            json!({"role": "assistant", "content": null, "tool_calls": tool_calls})
+        // Keep non-empty text even when tool_calls are present (CLIProxyAPI parity).
+        let mut message = if !tool_calls.is_empty() {
+            if text.is_empty() {
+                json!({"role": "assistant", "content": null, "tool_calls": tool_calls})
+            } else {
+                json!({
+                    "role": "assistant",
+                    "content": text,
+                    "tool_calls": tool_calls,
+                })
+            }
         } else {
             json!({"role": "assistant", "content": text})
         };
+
+        // Re-emit reasoning_content from Thinking blocks when present.
+        let reasoning: String = first
+            .map(|m| &m.content)
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|c| {
+                if let CanonicalContent::Thinking { thinking, .. } = c {
+                    if thinking.is_empty() {
+                        None
+                    } else {
+                        Some(thinking.as_str())
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if !reasoning.is_empty() {
+            message["reasoning_content"] = json!(reasoning);
+        }
 
         let fr_str = match &resp.finish_reason {
             FinishReason::Stop => "stop",
@@ -87,6 +123,22 @@ impl WireCodec for OpenAiCodec {
             FinishReason::Other(s) => s.as_str(),
             _ => "stop",
         };
+
+        let mut usage = json!({
+            "prompt_tokens": resp.usage.prompt_tokens,
+            "completion_tokens": resp.usage.completion_tokens,
+            "total_tokens": resp.usage.total_tokens,
+        });
+        if resp.usage.cache_read_tokens > 0 {
+            usage["prompt_tokens_details"] = json!({
+                "cached_tokens": resp.usage.cache_read_tokens,
+            });
+        }
+        if resp.usage.reasoning_tokens > 0 {
+            usage["completion_tokens_details"] = json!({
+                "reasoning_tokens": resp.usage.reasoning_tokens,
+            });
+        }
 
         json!({
             "id": resp.id,
@@ -98,11 +150,7 @@ impl WireCodec for OpenAiCodec {
                 "message": message,
                 "finish_reason": fr_str,
             }],
-            "usage": {
-                "prompt_tokens": resp.usage.prompt_tokens,
-                "completion_tokens": resp.usage.completion_tokens,
-                "total_tokens": resp.usage.total_tokens,
-            }
+            "usage": usage,
         })
     }
 
@@ -242,5 +290,98 @@ mod tests {
             "Hello!"
         );
         assert_eq!(wire["usage"]["total_tokens"].as_u64().unwrap(), 15);
+    }
+
+    #[test]
+    fn encode_response_keeps_text_with_tool_calls() {
+        use conduit_ir::canonical::{
+            CanonicalChatResponse, CanonicalContent, FinishReason, Role, Usage,
+        };
+        let resp = CanonicalChatResponse {
+            id: "chatcmpl-2".into(),
+            request_id: String::new(),
+            model: "gpt-4o".into(),
+            choices: vec![CanonicalMessage {
+                role: Role::Assistant,
+                content: vec![
+                    CanonicalContent::Text {
+                        text: "Calling tools".into(),
+                    },
+                    CanonicalContent::ToolUse {
+                        id: "call_1".into(),
+                        name: "search".into(),
+                        input: json!({"q": "x"}),
+                    },
+                ],
+                name: None,
+            }],
+            finish_reason: FinishReason::ToolCalls,
+            usage: Usage::default(),
+            created_at: chrono::Utc::now(),
+        };
+        let wire = OpenAiCodec::encode_response(&resp);
+        let msg = &wire["choices"][0]["message"];
+        assert_eq!(msg["content"].as_str().unwrap(), "Calling tools");
+        assert_eq!(msg["tool_calls"][0]["id"].as_str().unwrap(), "call_1");
+        assert_eq!(
+            msg["tool_calls"][0]["function"]["name"].as_str().unwrap(),
+            "search"
+        );
+    }
+
+    #[test]
+    fn encode_response_usage_details_when_nonzero() {
+        use conduit_ir::canonical::{CanonicalChatResponse, FinishReason, Usage};
+        let resp = CanonicalChatResponse {
+            id: "chatcmpl-3".into(),
+            request_id: String::new(),
+            model: "o1".into(),
+            choices: vec![CanonicalMessage::assistant("42")],
+            finish_reason: FinishReason::Stop,
+            usage: Usage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+                cache_read_tokens: 80,
+                reasoning_tokens: 30,
+                ..Default::default()
+            },
+            created_at: chrono::Utc::now(),
+        };
+        let wire = OpenAiCodec::encode_response(&resp);
+        assert_eq!(
+            wire["usage"]["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap(),
+            80
+        );
+        assert_eq!(
+            wire["usage"]["completion_tokens_details"]["reasoning_tokens"]
+                .as_u64()
+                .unwrap(),
+            30
+        );
+    }
+
+    #[test]
+    fn encode_response_omits_usage_details_when_zero() {
+        use conduit_ir::canonical::{CanonicalChatResponse, FinishReason, Usage};
+        let resp = CanonicalChatResponse {
+            id: "chatcmpl-4".into(),
+            request_id: String::new(),
+            model: "gpt-4o".into(),
+            choices: vec![CanonicalMessage::assistant("ok")],
+            finish_reason: FinishReason::Stop,
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+                ..Default::default()
+            },
+            created_at: chrono::Utc::now(),
+        };
+        let wire = OpenAiCodec::encode_response(&resp);
+        assert!(wire["usage"].get("prompt_tokens_details").is_none());
+        assert!(wire["usage"].get("completion_tokens_details").is_none());
     }
 }
