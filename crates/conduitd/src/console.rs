@@ -29,6 +29,17 @@ fn internal(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
+/// Reject nonsensical rate limits. The value is stored as `i64` but later cast
+/// to `u32` for enforcement, so a negative wraps to a near-infinite limit
+/// (rate-limiting silently disabled) and `0` rejects every request (the key is
+/// bricked). Only a positive requests/minute is meaningful.
+fn validate_rpm(rpm: Option<i64>) -> Result<(), &'static str> {
+    match rpm {
+        Some(v) if v < 1 => Err("rate_limit_rpm must be a positive number"),
+        _ => Ok(()),
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Providers
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -485,6 +496,9 @@ pub async fn create_key(
     if body.name.is_empty() {
         return err(StatusCode::BAD_REQUEST, "name is required").into_response();
     }
+    if let Err(e) = validate_rpm(body.rate_limit_rpm) {
+        return err(StatusCode::BAD_REQUEST, e).into_response();
+    }
 
     // Generate a cryptographically random key: "sk_" + 32-byte random hex
     let rand_bytes = {
@@ -574,6 +588,9 @@ pub async fn update_key(
         Ok(None) => return err(StatusCode::NOT_FOUND, "key not found").into_response(),
         Err(e) => return internal(e).into_response(),
     };
+    if let Err(e) = validate_rpm(body.rate_limit_rpm) {
+        return err(StatusCode::BAD_REQUEST, e).into_response();
+    }
 
     let now = Utc::now().to_rfc3339();
     let updated = DownstreamKeyRow {
@@ -1281,5 +1298,20 @@ pub async fn sync_pricing(
                 .into_response()
         }
         Err(e) => internal(e).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_rpm;
+
+    #[test]
+    fn rpm_validation_rejects_zero_and_negative() {
+        assert!(validate_rpm(Some(-1)).is_err());
+        assert!(validate_rpm(Some(0)).is_err());
+        assert!(validate_rpm(Some(1)).is_ok());
+        assert!(validate_rpm(Some(600)).is_ok());
+        // Absent limit is fine — no rate limiting.
+        assert!(validate_rpm(None).is_ok());
     }
 }

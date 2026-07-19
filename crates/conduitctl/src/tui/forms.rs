@@ -237,10 +237,16 @@ impl KeyForm {
             if s.is_empty() {
                 None
             } else {
-                Some(
-                    s.parse::<i64>()
-                        .map_err(|_| format!("invalid rpm: {s}"))?,
-                )
+                let v = s
+                    .parse::<i64>()
+                    .map_err(|_| format!("invalid rpm: {s}"))?;
+                // Server stores this and later casts i64 → u32, so a negative
+                // value wraps to a huge limit (rate-limiting disabled) and 0
+                // rejects every request. Require a positive requests/minute.
+                if v < 1 {
+                    return Err("rpm must be a positive number".into());
+                }
+                Some(v)
             }
         };
         let whitelist = {
