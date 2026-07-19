@@ -32,8 +32,9 @@ use sqlx::{
 };
 use thiserror::Error;
 pub use usage_repo::{
-    new_usage_attempt, new_usage_record, UsageDayRow, UsageListOpts, UsageListPage, UsageListSort,
-    UsageModelRow, UsageOutcomeSummary, UsageProviderRow, UsageRepo, UsageSummaryRow,
+    clamp_tz_offset_minutes, new_usage_attempt, new_usage_record, UsageDayRow, UsageListOpts,
+    UsageListPage, UsageListSort, UsageModelRow, UsageOutcomeSummary, UsageProviderRow, UsageRepo,
+    UsageSummaryRow,
 };
 
 // ── Error type ────────────────────────────────────────────────────────────────

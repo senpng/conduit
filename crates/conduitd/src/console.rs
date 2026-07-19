@@ -711,12 +711,14 @@ pub struct ListUsageQuery {
     #[serde(default)]
     pub offset: usize,
     pub key_id: Option<String>,
-    /// Optional calendar month (`YYYY-MM`); scopes rows via `ts LIKE 'YYYY-MM%'`.
+    /// Optional calendar month (`YYYY-MM`) in the client timezone.
     pub period: Option<String>,
     /// Free-text filter (model / alias / provider / request id / key id).
     pub q: Option<String>,
     /// Sort: `date` (default) | `cost` | `tokens` — always descending.
     pub sort: Option<String>,
+    /// Minutes east of UTC for calendar day/month bucketing (e.g. 480 for CST).
+    pub tz_offset_minutes: Option<i32>,
 }
 
 fn default_usage_limit() -> usize {
@@ -969,18 +971,20 @@ async fn probe_oauth_quota(
 /// GET /console/usage — paginated per-request consumption rows.
 ///
 /// Query: `limit`, `offset`, `key_id`, `period` (`YYYY-MM`), `q` (filter),
-/// `sort` (`date`|`cost`|`tokens`). Response includes `total` for pagination.
+/// `sort` (`date`|`cost`|`tokens`), `tz_offset_minutes`. Response includes
+/// `total` for pagination. Period uses the client local calendar.
 pub async fn list_usage(
     State(state): State<Arc<DaemonState>>,
     Query(q): Query<ListUsageQuery>,
 ) -> impl IntoResponse {
-    use conduit_store::{UsageListOpts, UsageListSort};
+    use conduit_store::{clamp_tz_offset_minutes, UsageListOpts, UsageListSort};
     let repo = UsageRepo::new(&state.pool);
     let sort = q
         .sort
         .as_deref()
         .map(UsageListSort::parse)
         .unwrap_or_default();
+    let tz = clamp_tz_offset_minutes(q.tz_offset_minutes.unwrap_or(0));
     match repo
         .list_page(UsageListOpts {
             limit: q.limit,
@@ -989,6 +993,7 @@ pub async fn list_usage(
             period: q.period.as_deref(),
             q: q.q.as_deref(),
             sort,
+            tz_offset_minutes: tz,
         })
         .await
     {
@@ -1010,63 +1015,70 @@ pub async fn list_usage(
 #[derive(Debug, Deserialize)]
 pub struct UsageSummaryQuery {
     /// `YYYY-MM` calendar month, or `all` for lifetime totals.
-    /// Defaults to the current UTC month.
+    /// Defaults to the current month in the client timezone.
     pub period: Option<String>,
     /// Optional downstream key scope for `by_day` / `by_model` rollups.
     pub key_id: Option<String>,
+    /// Minutes east of UTC for calendar day/month bucketing (e.g. 480 for CST).
+    pub tz_offset_minutes: Option<i32>,
 }
 
 /// GET /console/usage/summary — aggregate spend by key / day / model.
 ///
-/// `period=YYYY-MM` scopes to a calendar month; `period=all` is lifetime.
+/// `period=YYYY-MM` scopes to a **local** calendar month (see `tz_offset_minutes`);
+/// `period=all` is lifetime.
 pub async fn usage_summary(
     State(state): State<Arc<DaemonState>>,
     Query(q): Query<UsageSummaryQuery>,
 ) -> impl IntoResponse {
-    use chrono::Datelike;
-    let now = Utc::now();
+    use chrono::{Datelike, FixedOffset, Utc};
+    use conduit_store::clamp_tz_offset_minutes;
+
+    let tz = clamp_tz_offset_minutes(q.tz_offset_minutes.unwrap_or(0));
+    let offset = FixedOffset::east_opt(tz * 60).unwrap_or(FixedOffset::east_opt(0).unwrap());
+    let local_now = Utc::now().with_timezone(&offset);
     let period = match q.period.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(p) if p.eq_ignore_ascii_case("all") => "all".to_string(),
         Some(p) => p.to_string(),
-        None => format!("{:04}-{:02}", now.year(), now.month()),
+        None => format!("{:04}-{:02}", local_now.year(), local_now.month()),
     };
     let key_id = q.key_id.as_deref().filter(|s| !s.is_empty());
     let repo = UsageRepo::new(&state.pool);
 
-    let entries = match repo.summary_period(&period).await {
+    let entries = match repo.summary_period(&period, tz).await {
         Ok(e) => e,
         Err(e) => return internal(e).into_response(),
     };
-    let by_day = match repo.summary_by_day(&period, key_id).await {
+    let by_day = match repo.summary_by_day(&period, key_id, tz).await {
         Ok(d) => d,
         Err(e) => return internal(e).into_response(),
     };
-    // Trailing ~400 days for the GitHub-style contribution graph (52 weeks).
-    let since = (now - chrono::Duration::days(400))
+    // Trailing ~400 local days for the GitHub-style contribution graph (52 weeks).
+    let since = (local_now.date_naive() - chrono::Duration::days(400))
         .format("%Y-%m-%d")
         .to_string();
-    let by_day_trailing = match repo.summary_by_day_since(&since, key_id).await {
+    let by_day_trailing = match repo.summary_by_day_since(&since, key_id, tz).await {
         Ok(d) => d,
         Err(e) => return internal(e).into_response(),
     };
-    let by_model = match repo.summary_by_model(&period, key_id).await {
+    let by_model = match repo.summary_by_model(&period, key_id, tz).await {
         Ok(m) => m,
         Err(e) => return internal(e).into_response(),
     };
     // Nested model breakdowns for Usage UI detail panes (by key / by day).
-    let by_key_model = match repo.summary_by_key_model(&period).await {
+    let by_key_model = match repo.summary_by_key_model(&period, tz).await {
         Ok(m) => m,
         Err(e) => return internal(e).into_response(),
     };
-    let by_day_model = match repo.summary_by_day_model(&period).await {
+    let by_day_model = match repo.summary_by_day_model(&period, tz).await {
         Ok(m) => m,
         Err(e) => return internal(e).into_response(),
     };
-    let outcome = match repo.summary_outcome(&period, key_id).await {
+    let outcome = match repo.summary_outcome(&period, key_id, tz).await {
         Ok(o) => o,
         Err(e) => return internal(e).into_response(),
     };
-    let by_provider = match repo.summary_by_provider(&period, key_id).await {
+    let by_provider = match repo.summary_by_provider(&period, key_id, tz).await {
         Ok(p) => p,
         Err(e) => return internal(e).into_response(),
     };

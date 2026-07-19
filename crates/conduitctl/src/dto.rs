@@ -344,7 +344,7 @@ pub struct UsageKeyModelEntry {
     pub total_tokens: u64,
 }
 
-/// Model breakdown for one UTC day (from `by_day_model`).
+/// Model breakdown for one local calendar day (from `by_day_model`).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct UsageDayModelEntry {
     #[serde(default)]

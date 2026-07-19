@@ -1,6 +1,6 @@
 //! Overlay form / wizard state for write operations.
 
-use chrono::{Datelike, Utc};
+use chrono::{Datelike, Local};
 
 use crate::dto::{
     CreateKeyBody, CreateProviderBody, CreateRouteBody, KeyView, ProviderView, RouteTargetSpec,
@@ -1030,7 +1030,8 @@ pub enum ConfirmAction {
 }
 
 pub fn current_period() -> String {
-    let now = Utc::now();
+    // Client-local calendar month (matches usage rollups with tz_offset_minutes).
+    let now = Local::now();
     format!("{:04}-{:02}", now.year(), now.month())
 }
 
@@ -1039,8 +1040,8 @@ pub fn shift_period(period: &str, delta: i32) -> String {
     if parts.len() != 2 {
         return current_period();
     }
-    let y: i32 = parts[0].parse().unwrap_or(Utc::now().year());
-    let m: u32 = parts[1].parse().unwrap_or(Utc::now().month());
+    let y: i32 = parts[0].parse().unwrap_or(Local::now().year());
+    let m: u32 = parts[1].parse().unwrap_or(Local::now().month());
     let mut month = m as i32 + delta;
     let mut year = y;
     while month < 1 {

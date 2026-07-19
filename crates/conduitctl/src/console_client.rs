@@ -225,16 +225,20 @@ impl ConsoleClient {
         &self,
         period: Option<&str>,
     ) -> Result<UsageSummaryView, ConsoleError> {
-        let mut url = format!("{}/console/usage/summary", self.base);
+        let tz = client_tz_offset_minutes();
+        let mut url = format!(
+            "{}/console/usage/summary?tz_offset_minutes={tz}",
+            self.base
+        );
         if let Some(p) = period {
-            url.push_str(&format!("?period={p}"));
+            url.push_str(&format!("&period={p}"));
         }
         self.get_json(&url).await
     }
 
     /// Paginated per-request usage rows.
     ///
-    /// Optional `period` (`YYYY-MM`) scopes to that calendar month.
+    /// Optional `period` (`YYYY-MM`) scopes to that local calendar month.
     /// `offset` / `q` / `sort` support real pagination, free-text filter, and sort.
     pub async fn list_usage(
         &self,
@@ -275,7 +279,11 @@ impl ConsoleClient {
         q: Option<&str>,
         sort: Option<&str>,
     ) -> Result<T, ConsoleError> {
-        let mut url = format!("{}/console/usage?limit={limit}&offset={offset}", self.base);
+        let tz = client_tz_offset_minutes();
+        let mut url = format!(
+            "{}/console/usage?limit={limit}&offset={offset}&tz_offset_minutes={tz}",
+            self.base
+        );
         if let Some(p) = period {
             url.push_str(&format!("&period={}", urlencoding_path(p)));
         }
@@ -495,6 +503,11 @@ fn urlencoding_path(s: &str) -> String {
         }
     }
     out
+}
+
+/// Minutes east of UTC for the process local timezone (e.g. 480 for Asia/Shanghai).
+fn client_tz_offset_minutes() -> i32 {
+    chrono::Local::now().offset().local_minus_utc() / 60
 }
 
 #[cfg(test)]

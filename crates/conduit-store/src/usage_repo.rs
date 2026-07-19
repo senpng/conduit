@@ -1,6 +1,9 @@
 //! Per-request usage ledger.
 //!
 //! Every completed request with non-zero tokens or cost is written here.
+//!
+//! Calendar day / month rollups default to **UTC**, but accept a client
+//! `tz_offset_minutes` (minutes east of UTC) so TUI charts follow local days.
 
 use chrono::Utc;
 use sqlx::{Row, SqlitePool};
@@ -10,6 +13,20 @@ use crate::{
     schema::{UsageAttemptRow, UsageRecordRow},
     StoreError,
 };
+
+/// Clamp client-provided offset to a sane range (minutes east of UTC).
+pub fn clamp_tz_offset_minutes(minutes: i32) -> i32 {
+    minutes.clamp(-14 * 60, 14 * 60)
+}
+
+/// SQLite `date(..., ?)` modifier, e.g. `+480 minutes` / `-300 minutes`.
+fn offset_modifier(tz_offset_minutes: i32) -> String {
+    format!("{:+} minutes", clamp_tz_offset_minutes(tz_offset_minutes))
+}
+
+/// Local calendar date of stored UTC RFC3339 `ts`:
+/// `date(replace(substr(ts, 1, 19), 'T', ' '), "{:+} minutes")`
+/// where `ts` is from `Utc::now().to_rfc3339()` (first 19 chars = `YYYY-MM-DDTHH:MM:SS`).
 
 pub struct UsageRepo<'a> {
     pool: &'a SqlitePool,
@@ -52,6 +69,8 @@ pub struct UsageListOpts<'a> {
     /// Case-insensitive substring across model / alias / provider / request / key.
     pub q: Option<&'a str>,
     pub sort: UsageListSort,
+    /// Client timezone offset minutes east of UTC (0 = UTC calendar).
+    pub tz_offset_minutes: i32,
 }
 
 /// One page of usage rows plus total matching count.
@@ -164,14 +183,15 @@ impl<'a> UsageRepo<'a> {
                 period,
                 q: None,
                 sort: UsageListSort::Date,
-            })
+                        tz_offset_minutes: 0,
+                        })
             .await?;
         Ok(page.rows)
     }
 
     /// Paginated usage list with optional key / period / free-text filter and sort.
     ///
-    /// - `period` (`YYYY-MM`) scopes rows with `ts LIKE 'YYYY-MM%'`.
+    /// - `period` (`YYYY-MM`) scopes rows by **local** calendar month (`tz_offset_minutes`).
     /// - `key_id` scopes to one downstream key.
     /// - `q` matches (case-insensitive substring) model, alias, provider, request id, key id.
     /// - `sort` is always descending (date / cost / tokens), with `ts` as tie-breaker.
@@ -180,10 +200,11 @@ impl<'a> UsageRepo<'a> {
         let limit = opts.limit.clamp(1, 500) as i64;
         let offset = opts.offset as i64;
         let key_id = opts.key_id.map(str::trim).filter(|s| !s.is_empty());
+        let off = offset_modifier(opts.tz_offset_minutes);
         let period_pat = opts
             .period
             .map(str::trim)
-            .filter(|p| !p.is_empty())
+            .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("all"))
             .map(|p| format!("{p}%"));
         let q = opts
             .q
@@ -198,12 +219,13 @@ impl<'a> UsageRepo<'a> {
             UsageListSort::Tokens => "total_tokens DESC, ts DESC",
         };
 
-        // Optional filters: bind NULL / empty to skip the predicate.
+        // Period uses local calendar day; empty period_pat skips the predicate.
+        // ?4 = timezone offset modifier for date().
         let count_sql = r#"
             SELECT COUNT(*) AS cnt
             FROM usage_records
             WHERE (?1 IS NULL OR downstream_key_id = ?1)
-              AND (?2 IS NULL OR ts LIKE ?2)
+              AND (?2 IS NULL OR date(replace(substr(ts, 1, 19), 'T', ' '), ?4) LIKE ?2)
               AND (
                 length(?3) = 0
                 OR instr(lower(ifnull(model_id, '')), ?3) > 0
@@ -218,6 +240,7 @@ impl<'a> UsageRepo<'a> {
             .bind(key_id)
             .bind(period_pat.as_deref())
             .bind(&q)
+            .bind(&off)
             .fetch_one(self.pool)
             .await
             .map_err(|e| StoreError::Sqlx(e.to_string()))?;
@@ -235,7 +258,7 @@ impl<'a> UsageRepo<'a> {
                    pool_id, selected_reason
             FROM usage_records
             WHERE (?1 IS NULL OR downstream_key_id = ?1)
-              AND (?2 IS NULL OR ts LIKE ?2)
+              AND (?2 IS NULL OR date(replace(substr(ts, 1, 19), 'T', ' '), ?4) LIKE ?2)
               AND (
                 length(?3) = 0
                 OR instr(lower(ifnull(model_id, '')), ?3) > 0
@@ -246,13 +269,14 @@ impl<'a> UsageRepo<'a> {
                 OR instr(lower(ifnull(downstream_key_id, '')), ?3) > 0
               )
             ORDER BY {order}
-            LIMIT ?4 OFFSET ?5
+            LIMIT ?5 OFFSET ?6
             "#
         );
         let rows = sqlx::query(&list_sql)
             .bind(key_id)
             .bind(period_pat.as_deref())
             .bind(&q)
+            .bind(&off)
             .bind(limit)
             .bind(offset)
             .fetch_all(self.pool)
@@ -269,11 +293,16 @@ impl<'a> UsageRepo<'a> {
 
     /// Aggregate spend by downstream key.
     ///
-    /// * `period` = `YYYY-MM` — match ISO timestamp prefix (`ts LIKE 'YYYY-MM%'`).
+    /// * `period` = `YYYY-MM` — local calendar month (`tz_offset_minutes`).
     /// * `period` = `"all"` — no time filter (lifetime totals).
     #[instrument(skip(self))]
-    pub async fn summary_period(&self, period: &str) -> Result<Vec<UsageSummaryRow>, StoreError> {
-        let rows = match period_like(period) {
+    pub async fn summary_period(
+        &self,
+        period: &str,
+        tz_offset_minutes: i32,
+    ) -> Result<Vec<UsageSummaryRow>, StoreError> {
+        let off = offset_modifier(tz_offset_minutes);
+        let rows = match period_day_like(period) {
             Some(pattern) => {
                 sqlx::query(
                     r#"SELECT
@@ -284,10 +313,11 @@ impl<'a> UsageRepo<'a> {
                    COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
                    COALESCE(SUM(total_tokens), 0) AS total_tokens
                FROM usage_records
-               WHERE ts LIKE ?
+               WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?
                GROUP BY COALESCE(downstream_key_id, '')
                ORDER BY total_usd DESC"#,
                 )
+                .bind(&off)
                 .bind(&pattern)
                 .fetch_all(self.pool)
                 .await
@@ -324,7 +354,7 @@ impl<'a> UsageRepo<'a> {
             .collect())
     }
 
-    /// Daily rollup for a trailing window ending today (`since_day` = `YYYY-MM-DD`).
+    /// Daily rollup for a trailing window ending today (`since_day` = local `YYYY-MM-DD`).
     ///
     /// Used by the TUI contribution graph (≈52 weeks), independent of the
     /// selected calendar-month period cards.
@@ -333,38 +363,47 @@ impl<'a> UsageRepo<'a> {
         &self,
         since_day: &str,
         key_id: Option<&str>,
+        tz_offset_minutes: i32,
     ) -> Result<Vec<UsageDayRow>, StoreError> {
+        let off = offset_modifier(tz_offset_minutes);
         let rows = match key_id {
             Some(kid) => {
                 sqlx::query(
                     r#"SELECT
-                       substr(ts, 1, 10) AS day,
+                       date(replace(substr(ts, 1, 19), 'T', ' '), ?) AS day,
                        COUNT(*) AS request_count,
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
                        COALESCE(SUM(total_tokens), 0) AS total_tokens
                    FROM usage_records
-                   WHERE substr(ts, 1, 10) >= ? AND downstream_key_id = ?
-                   GROUP BY substr(ts, 1, 10)
+                   WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) >= ?
+                     AND downstream_key_id = ?
+                   GROUP BY date(replace(substr(ts, 1, 19), 'T', ' '), ?)
                    ORDER BY day ASC"#,
                 )
+                .bind(&off)
+                .bind(&off)
                 .bind(since_day)
                 .bind(kid)
+                .bind(&off)
                 .fetch_all(self.pool)
                 .await
             }
             None => {
                 sqlx::query(
                     r#"SELECT
-                       substr(ts, 1, 10) AS day,
+                       date(replace(substr(ts, 1, 19), 'T', ' '), ?) AS day,
                        COUNT(*) AS request_count,
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
                        COALESCE(SUM(total_tokens), 0) AS total_tokens
                    FROM usage_records
-                   WHERE substr(ts, 1, 10) >= ?
-                   GROUP BY substr(ts, 1, 10)
+                   WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) >= ?
+                   GROUP BY date(replace(substr(ts, 1, 19), 'T', ' '), ?)
                    ORDER BY day ASC"#,
                 )
+                .bind(&off)
+                .bind(&off)
                 .bind(since_day)
+                .bind(&off)
                 .fetch_all(self.pool)
                 .await
             }
@@ -384,75 +423,89 @@ impl<'a> UsageRepo<'a> {
 
     /// Daily rollup for a calendar period (`YYYY-MM`) or all-time (`"all"`).
     ///
-    /// UTC day from `ts` prefix. Optional `key_id` scopes to one downstream key.
+    /// Days are in the client local calendar (`tz_offset_minutes`). Optional
+    /// `key_id` scopes to one downstream key.
     #[instrument(skip(self))]
     pub async fn summary_by_day(
         &self,
         period: &str,
         key_id: Option<&str>,
+        tz_offset_minutes: i32,
     ) -> Result<Vec<UsageDayRow>, StoreError> {
-        let pattern = period_like(period);
+        let off = offset_modifier(tz_offset_minutes);
+        let pattern = period_day_like(period);
         let rows = match (pattern.as_deref(), key_id) {
             (Some(pat), Some(kid)) => {
                 sqlx::query(
                     r#"SELECT
-                       substr(ts, 1, 10) AS day,
+                       date(replace(substr(ts, 1, 19), 'T', ' '), ?) AS day,
                        COUNT(*) AS request_count,
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
                        COALESCE(SUM(total_tokens), 0) AS total_tokens
                    FROM usage_records
-                   WHERE ts LIKE ? AND downstream_key_id = ?
-                   GROUP BY substr(ts, 1, 10)
+                   WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?
+                     AND downstream_key_id = ?
+                   GROUP BY date(replace(substr(ts, 1, 19), 'T', ' '), ?)
                    ORDER BY day ASC"#,
                 )
+                .bind(&off)
+                .bind(&off)
                 .bind(pat)
                 .bind(kid)
+                .bind(&off)
                 .fetch_all(self.pool)
                 .await
             }
             (Some(pat), None) => {
                 sqlx::query(
                     r#"SELECT
-                       substr(ts, 1, 10) AS day,
+                       date(replace(substr(ts, 1, 19), 'T', ' '), ?) AS day,
                        COUNT(*) AS request_count,
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
                        COALESCE(SUM(total_tokens), 0) AS total_tokens
                    FROM usage_records
-                   WHERE ts LIKE ?
-                   GROUP BY substr(ts, 1, 10)
+                   WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?
+                   GROUP BY date(replace(substr(ts, 1, 19), 'T', ' '), ?)
                    ORDER BY day ASC"#,
                 )
+                .bind(&off)
+                .bind(&off)
                 .bind(pat)
+                .bind(&off)
                 .fetch_all(self.pool)
                 .await
             }
             (None, Some(kid)) => {
                 sqlx::query(
                     r#"SELECT
-                       substr(ts, 1, 10) AS day,
+                       date(replace(substr(ts, 1, 19), 'T', ' '), ?) AS day,
                        COUNT(*) AS request_count,
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
                        COALESCE(SUM(total_tokens), 0) AS total_tokens
                    FROM usage_records
                    WHERE downstream_key_id = ?
-                   GROUP BY substr(ts, 1, 10)
+                   GROUP BY date(replace(substr(ts, 1, 19), 'T', ' '), ?)
                    ORDER BY day ASC"#,
                 )
+                .bind(&off)
                 .bind(kid)
+                .bind(&off)
                 .fetch_all(self.pool)
                 .await
             }
             (None, None) => {
                 sqlx::query(
                     r#"SELECT
-                       substr(ts, 1, 10) AS day,
+                       date(replace(substr(ts, 1, 19), 'T', ' '), ?) AS day,
                        COUNT(*) AS request_count,
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
                        COALESCE(SUM(total_tokens), 0) AS total_tokens
                    FROM usage_records
-                   GROUP BY substr(ts, 1, 10)
+                   GROUP BY date(replace(substr(ts, 1, 19), 'T', ' '), ?)
                    ORDER BY day ASC"#,
                 )
+                .bind(&off)
+                .bind(&off)
                 .fetch_all(self.pool)
                 .await
             }
@@ -476,8 +529,10 @@ impl<'a> UsageRepo<'a> {
         &self,
         period: &str,
         key_id: Option<&str>,
+        tz_offset_minutes: i32,
     ) -> Result<Vec<UsageModelRow>, StoreError> {
-        let pattern = period_like(period);
+        let off = offset_modifier(tz_offset_minutes);
+        let pattern = period_day_like(period);
         let rows = match (pattern.as_deref(), key_id) {
             (Some(pat), Some(kid)) => {
                 sqlx::query(
@@ -488,11 +543,12 @@ impl<'a> UsageRepo<'a> {
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
                        COALESCE(SUM(total_tokens), 0) AS total_tokens
                    FROM usage_records
-                   WHERE ts LIKE ? AND downstream_key_id = ?
+                   WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ? AND downstream_key_id = ?
                    GROUP BY COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
                             provider_kind
                    ORDER BY total_usd DESC"#,
                 )
+                .bind(&off)
                 .bind(pat)
                 .bind(kid)
                 .fetch_all(self.pool)
@@ -507,11 +563,12 @@ impl<'a> UsageRepo<'a> {
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
                        COALESCE(SUM(total_tokens), 0) AS total_tokens
                    FROM usage_records
-                   WHERE ts LIKE ?
+                   WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?
                    GROUP BY COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
                             provider_kind
                    ORDER BY total_usd DESC"#,
                 )
+                .bind(&off)
                 .bind(pat)
                 .fetch_all(self.pool)
                 .await
@@ -570,8 +627,10 @@ impl<'a> UsageRepo<'a> {
     pub async fn summary_by_key_model(
         &self,
         period: &str,
+        tz_offset_minutes: i32,
     ) -> Result<Vec<UsageKeyModelRow>, StoreError> {
-        let rows = match period_like(period) {
+        let off = offset_modifier(tz_offset_minutes);
+        let rows = match period_day_like(period) {
             Some(pattern) => {
                 sqlx::query(
                     r#"SELECT
@@ -582,12 +641,13 @@ impl<'a> UsageRepo<'a> {
                    COALESCE(SUM(cost_usd), 0) AS total_usd,
                    COALESCE(SUM(total_tokens), 0) AS total_tokens
                FROM usage_records
-               WHERE ts LIKE ?
+               WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?
                GROUP BY COALESCE(downstream_key_id, ''),
                         COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
                         provider_kind
                ORDER BY total_usd DESC"#,
                 )
+                .bind(&off)
                 .bind(&pattern)
                 .fetch_all(self.pool)
                 .await
@@ -626,48 +686,55 @@ impl<'a> UsageRepo<'a> {
             .collect())
     }
 
-    /// Model breakdown nested under each UTC day for a period / all-time.
+    /// Model breakdown nested under each local day for a period / all-time.
     #[instrument(skip(self))]
     pub async fn summary_by_day_model(
         &self,
         period: &str,
+        tz_offset_minutes: i32,
     ) -> Result<Vec<UsageDayModelRow>, StoreError> {
-        let rows = match period_like(period) {
+        let off = offset_modifier(tz_offset_minutes);
+        let rows = match period_day_like(period) {
             Some(pattern) => {
                 sqlx::query(
                     r#"SELECT
-                   substr(ts, 1, 10) AS day,
+                   date(replace(substr(ts, 1, 19), 'T', ' '), ?) AS day,
                    COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
                    provider_kind,
                    COUNT(*) AS request_count,
                    COALESCE(SUM(cost_usd), 0) AS total_usd,
                    COALESCE(SUM(total_tokens), 0) AS total_tokens
                FROM usage_records
-               WHERE ts LIKE ?
-               GROUP BY substr(ts, 1, 10),
+               WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?
+               GROUP BY date(replace(substr(ts, 1, 19), 'T', ' '), ?),
                         COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
                         provider_kind
                ORDER BY day ASC, total_usd DESC"#,
                 )
+                .bind(&off)
+                .bind(&off)
                 .bind(&pattern)
+                .bind(&off)
                 .fetch_all(self.pool)
                 .await
             }
             None => {
                 sqlx::query(
                     r#"SELECT
-                   substr(ts, 1, 10) AS day,
+                   date(replace(substr(ts, 1, 19), 'T', ' '), ?) AS day,
                    COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
                    provider_kind,
                    COUNT(*) AS request_count,
                    COALESCE(SUM(cost_usd), 0) AS total_usd,
                    COALESCE(SUM(total_tokens), 0) AS total_tokens
                FROM usage_records
-               GROUP BY substr(ts, 1, 10),
+               GROUP BY date(replace(substr(ts, 1, 19), 'T', ' '), ?),
                         COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
                         provider_kind
                ORDER BY day ASC, total_usd DESC"#,
                 )
+                .bind(&off)
+                .bind(&off)
                 .fetch_all(self.pool)
                 .await
             }
@@ -693,8 +760,10 @@ impl<'a> UsageRepo<'a> {
         &self,
         period: &str,
         key_id: Option<&str>,
+        tz_offset_minutes: i32,
     ) -> Result<UsageOutcomeSummary, StoreError> {
-        let pattern = period_like(period);
+        let off = offset_modifier(tz_offset_minutes);
+        let pattern = period_day_like(period);
         let row = match (pattern.as_deref(), key_id) {
             (Some(pat), Some(kid)) => {
                 sqlx::query(
@@ -705,8 +774,9 @@ impl<'a> UsageRepo<'a> {
                            AVG(ttfb_ms) AS avg_ttfb_ms,
                            AVG(duration_ms) AS avg_duration_ms
                        FROM usage_records
-                       WHERE ts LIKE ? AND downstream_key_id = ?"#,
+                       WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ? AND downstream_key_id = ?"#,
                 )
+                .bind(&off)
                 .bind(pat)
                 .bind(kid)
                 .fetch_one(self.pool)
@@ -721,8 +791,9 @@ impl<'a> UsageRepo<'a> {
                            AVG(ttfb_ms) AS avg_ttfb_ms,
                            AVG(duration_ms) AS avg_duration_ms
                        FROM usage_records
-                       WHERE ts LIKE ?"#,
+                       WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?"#,
                 )
+                .bind(&off)
                 .bind(pat)
                 .fetch_one(self.pool)
                 .await
@@ -780,8 +851,10 @@ impl<'a> UsageRepo<'a> {
         &self,
         period: &str,
         key_id: Option<&str>,
+        tz_offset_minutes: i32,
     ) -> Result<Vec<UsageProviderRow>, StoreError> {
-        let pattern = period_like(period);
+        let off = offset_modifier(tz_offset_minutes);
+        let pattern = period_day_like(period);
         let rows = match (pattern.as_deref(), key_id) {
             (Some(pat), Some(kid)) => {
                 sqlx::query(
@@ -796,10 +869,11 @@ impl<'a> UsageRepo<'a> {
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
                        COALESCE(SUM(total_tokens), 0) AS total_tokens
                    FROM usage_records
-                   WHERE ts LIKE ? AND downstream_key_id = ?
+                   WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ? AND downstream_key_id = ?
                    GROUP BY COALESCE(NULLIF(provider_id, ''), '(unknown)'), provider_kind
                    ORDER BY total_tokens DESC"#,
                 )
+                .bind(&off)
                 .bind(pat)
                 .bind(kid)
                 .fetch_all(self.pool)
@@ -818,10 +892,11 @@ impl<'a> UsageRepo<'a> {
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
                        COALESCE(SUM(total_tokens), 0) AS total_tokens
                    FROM usage_records
-                   WHERE ts LIKE ?
+                   WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?
                    GROUP BY COALESCE(NULLIF(provider_id, ''), '(unknown)'), provider_kind
                    ORDER BY total_tokens DESC"#,
                 )
+                .bind(&off)
                 .bind(pat)
                 .fetch_all(self.pool)
                 .await
@@ -895,12 +970,13 @@ impl<'a> UsageRepo<'a> {
     }
 }
 
-/// `YYYY-MM%` for calendar months; `None` for all-time (`period == "all"`).
-fn period_like(period: &str) -> Option<String> {
+/// `YYYY-MM%` for local calendar months; `None` for all-time (`period == "all"`).
+fn period_day_like(period: &str) -> Option<String> {
     if period.eq_ignore_ascii_case("all") {
         None
     } else {
-        Some(format!("{period}%"))
+        // Local day is `YYYY-MM-DD`; prefix match scopes one calendar month.
+        Some(format!("{}%", period.trim()))
     }
 }
 
@@ -915,7 +991,7 @@ pub struct UsageSummaryRow {
     pub total_tokens: u64,
 }
 
-/// One UTC calendar day within a period summary.
+/// One local calendar day within a period summary (`YYYY-MM-DD`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageDayRow {
     /// `YYYY-MM-DD` (UTC, from `ts` prefix).
@@ -1266,7 +1342,8 @@ mod tests {
                 period: None,
                 q: Some("gpt-4o"),
                 sort: UsageListSort::Date,
-            })
+                        tz_offset_minutes: 0,
+                        })
             .await
             .unwrap();
         assert_eq!(page.total, 1);
@@ -1315,7 +1392,8 @@ mod tests {
                 period: Some("2026-07"),
                 q: None,
                 sort: UsageListSort::Cost,
-            })
+                        tz_offset_minutes: 0,
+                        })
             .await
             .unwrap();
         assert_eq!(by_cost.total, 3);
@@ -1331,7 +1409,8 @@ mod tests {
                 period: Some("2026-07"),
                 q: None,
                 sort: UsageListSort::Cost,
-            })
+                        tz_offset_minutes: 0,
+                        })
             .await
             .unwrap();
         assert_eq!(page2.total, 3);
@@ -1346,7 +1425,8 @@ mod tests {
                 period: None,
                 q: Some("MID"),
                 sort: UsageListSort::Date,
-            })
+                        tz_offset_minutes: 0,
+                        })
             .await
             .unwrap();
         assert_eq!(q.total, 1);
@@ -1487,7 +1567,7 @@ mod tests {
             repo.insert(r).await.unwrap();
         }
 
-        let sum = repo.summary_period("2026-07").await.unwrap();
+        let sum = repo.summary_period("2026-07", 0).await.unwrap();
         assert_eq!(sum.len(), 2);
         let k1 = sum.iter().find(|s| s.downstream_key_id == "k1").unwrap();
         assert_eq!(k1.request_count, 2);
@@ -1498,30 +1578,66 @@ mod tests {
         assert!((k2.total_usd - 0.5).abs() < 1e-9);
 
         // Lifetime includes the June outlier (k1 +$9).
-        let all = repo.summary_period("all").await.unwrap();
+        let all = repo.summary_period("all", 0).await.unwrap();
         assert_eq!(all.len(), 2);
         let k1_all = all.iter().find(|s| s.downstream_key_id == "k1").unwrap();
         assert_eq!(k1_all.request_count, 3);
         assert!((k1_all.total_usd - 12.5).abs() < 1e-9);
         assert_eq!(k1_all.total_tokens, 7);
 
-        let by_day = repo.summary_by_day("2026-07", None).await.unwrap();
+        let by_day = repo.summary_by_day("2026-07", None, 0).await.unwrap();
         assert_eq!(by_day.len(), 3); // 01, 15, 20
         assert_eq!(by_day[0].day, "2026-07-01");
         assert!((by_day[0].total_usd - 1.0).abs() < 1e-9);
         let day15 = by_day.iter().find(|d| d.day == "2026-07-15").unwrap();
         assert!((day15.total_usd - 2.5).abs() < 1e-9);
 
-        let k1_days = repo.summary_by_day("2026-07", Some("k1")).await.unwrap();
+        let k1_days = repo.summary_by_day("2026-07", Some("k1"), 0).await.unwrap();
         assert_eq!(k1_days.len(), 2);
         assert!(k1_days.iter().all(|d| d.day.starts_with("2026-07")));
 
         // Alias rollup (rows above have no alias — label falls back to "(unknown)")
-        let by_model = repo.summary_by_model("2026-07", None).await.unwrap();
+        let by_model = repo.summary_by_model("2026-07", None, 0).await.unwrap();
         assert!(!by_model.is_empty());
         let unknown = by_model.iter().find(|m| m.label == "(unknown)").unwrap();
         assert_eq!(unknown.request_count, 3);
         assert!((unknown.total_usd - 4.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn summary_by_day_respects_tz_offset() {
+        let pool = open_db("sqlite::memory:").await.unwrap();
+        let repo = UsageRepo::new(&pool);
+        // UTC 2026-07-31 20:00 → Asia/Shanghai (+480) is 2026-08-01 04:00
+        let mut row = new_usage_record(
+            "r-tz",
+            Some("k1".into()),
+            None,
+            None,
+            None,
+            None,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0,
+            1.0,
+            false,
+        );
+        row.ts = "2026-07-31T20:00:00Z".into();
+        repo.insert(&row).await.unwrap();
+
+        let utc_days = repo.summary_by_day("2026-07", None, 0).await.unwrap();
+        assert_eq!(utc_days.len(), 1);
+        assert_eq!(utc_days[0].day, "2026-07-31");
+
+        let sh_days = repo.summary_by_day("2026-08", None, 480).await.unwrap();
+        assert_eq!(sh_days.len(), 1);
+        assert_eq!(sh_days[0].day, "2026-08-01");
+
+        let sh_july = repo.summary_by_day("2026-07", None, 480).await.unwrap();
+        assert!(sh_july.is_empty());
     }
 
     #[tokio::test]
@@ -1620,12 +1736,12 @@ mod tests {
         assert_eq!(attempts[1].provider_id.as_deref(), Some("p2"));
         assert_eq!(attempts[0].status, "error");
 
-        let outcome = repo.summary_outcome("2026-07", None).await.unwrap();
+        let outcome = repo.summary_outcome("2026-07", None, 0).await.unwrap();
         assert_eq!(outcome.request_count, 1);
         assert_eq!(outcome.success_count, 0);
         assert!((outcome.success_rate - 0.0).abs() < 1e-12);
 
-        let by_p = repo.summary_by_provider("2026-07", None).await.unwrap();
+        let by_p = repo.summary_by_provider("2026-07", None, 0).await.unwrap();
         assert_eq!(by_p.len(), 1);
         assert_eq!(by_p[0].provider_id, "p2");
         assert!((by_p[0].success_rate - 0.0).abs() < 1e-12);
@@ -1702,14 +1818,14 @@ mod tests {
         ok_b.duration_ms = Some(200);
         repo.insert(&ok_b).await.unwrap();
 
-        let outcome = repo.summary_outcome("2026-07", None).await.unwrap();
+        let outcome = repo.summary_outcome("2026-07", None, 0).await.unwrap();
         assert_eq!(outcome.request_count, 3);
         assert_eq!(outcome.success_count, 2);
         assert!((outcome.success_rate - 2.0 / 3.0).abs() < 1e-9);
         let avg_ttfb = outcome.avg_ttfb_ms.unwrap();
         assert!((avg_ttfb - 60.0).abs() < 1e-6); // (40+80)/2
 
-        let by_p = repo.summary_by_provider("2026-07", None).await.unwrap();
+        let by_p = repo.summary_by_provider("2026-07", None, 0).await.unwrap();
         let a = by_p.iter().find(|p| p.provider_id == "prov-a").unwrap();
         assert_eq!(a.request_count, 2);
         assert!((a.success_rate - 0.5).abs() < 1e-9);
