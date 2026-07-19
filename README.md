@@ -68,6 +68,7 @@ For crate boundaries, storage details, security trade-offs, and codec contracts,
 | --- | --- | --- | --- |
 | OpenAI Chat Completions | `POST /v1/chat/completions` | Yes | Classic chat `messages` shape |
 | OpenAI Responses | `POST /v1/responses` | Yes | First-class ingress; local `previous_response_id` continuation when `store` is enabled |
+| OpenAI Responses Compact | `POST /v1/responses/compact` | No (non-stream only) | Context compaction for Codex; preserves `compaction_trigger` and proxies to upstream `/responses/compact` |
 | Anthropic Messages | `POST /v1/messages` | Yes | Native Anthropic wire format |
 | OpenAI Models | `GET /v1/models` | N/A | Lists configured route aliases |
 

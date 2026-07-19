@@ -166,6 +166,74 @@ pub async fn dispatch_stream(
     }
 }
 
+/// Responses compact (`POST …/responses/compact`) for providers that support it.
+///
+/// Body is raw Responses JSON (must keep `compaction_trigger`). Only Codex OAuth
+/// implements this today; other kinds return a clear InvalidRequest error.
+pub async fn dispatch_responses_compact(
+    resolved: &ResolvedProvider,
+    body: serde_json::Value,
+    auth: &UpstreamAuth,
+    rate_limit_sink: Option<RateLimitHeaderSink>,
+) -> Result<serde_json::Value, ProviderError> {
+    let kind = resolve_kind(&resolved.provider_kind)?;
+    debug!(
+        provider_id = %resolved.provider_id,
+        provider_kind = %kind,
+        model_id = %resolved.model_id,
+        "dispatch responses compact"
+    );
+    match kind {
+        ProviderKind::CodexOAuth => {
+            codex_oauth_compact(resolved, body, auth, rate_limit_sink).await
+        }
+        other => Err(ProviderError::InvalidRequest(format!(
+            "/responses/compact not supported for provider kind '{other}'"
+        ))),
+    }
+}
+
+async fn codex_oauth_compact(
+    resolved: &ResolvedProvider,
+    body: serde_json::Value,
+    auth: &UpstreamAuth,
+    rate_limit_sink: Option<RateLimitHeaderSink>,
+) -> Result<serde_json::Value, ProviderError> {
+    use conduit_codec::{prepare_responses_compact_body, OpenAiResponsesCodec};
+    let base_url = resolved
+        .base_url
+        .as_deref()
+        .unwrap_or("https://chatgpt.com/backend-api/codex");
+    let mut headers = auth.extra_headers.clone();
+    // Merge client headers that Codex may want (session, etc.) without forcing SSE.
+    for (k, v) in &auth.client_headers {
+        if !headers
+            .iter()
+            .any(|(hk, _)| hk.eq_ignore_ascii_case(k.as_str()))
+        {
+            headers.push((k.clone(), v.clone()));
+        }
+    }
+    let cfg = apply_sink(
+        ProviderClientConfig::codex_oauth(&resolved.provider_id, base_url, headers)
+            .with_request_overrides(resolved.request_overrides.clone()),
+        rate_limit_sink,
+    );
+    let model = if resolved.model_id.is_empty() {
+        body.get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("gpt-5.4")
+            .to_string()
+    } else {
+        resolved.model_id.clone()
+    };
+    let prepared = prepare_responses_compact_body(body, &model);
+    // Type param is unused for compact (raw JSON path) but required by ProviderClient.
+    ProviderClient::<OpenAiResponsesCodec>::new(cfg)
+        .responses_compact(prepared, &auth.token)
+        .await
+}
+
 fn apply_sink(cfg: ProviderClientConfig, sink: Option<RateLimitHeaderSink>) -> ProviderClientConfig {
     match sink {
         Some(s) => cfg.with_rate_limit_sink(s),

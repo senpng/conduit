@@ -150,6 +150,7 @@ pub fn gateway_public_paths() -> &'static [&'static str] {
     &[
         "/v1/chat/completions",
         "/v1/responses",
+        "/v1/responses/compact",
         "/v1/messages",
         "/v1/models",
         "/health",
@@ -380,6 +381,91 @@ pub async fn responses(
                 status = %status,
                 error = %error,
                 "gateway request failed"
+            );
+            (
+                status,
+                Json(OpenAiResponsesCodec::error_body(
+                    "error",
+                    None,
+                    &error.to_string(),
+                )),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// POST /v1/responses/compact — OpenAI Responses context compaction.
+///
+/// CLIProxyAPI parity: non-stream only; body is forwarded (after light prep)
+/// to Codex `{base}/responses/compact` so items like `compaction_trigger`
+/// survive. Does not IR-round-trip.
+#[instrument(skip_all, fields(endpoint = "/v1/responses/compact"))]
+pub async fn responses_compact(
+    State(state): State<Arc<DaemonState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let key_id = extract_key_id(&headers);
+    if body.get("stream").and_then(|v| v.as_bool()) == Some(true) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(OpenAiResponsesCodec::error_body(
+                "invalid_request_error",
+                None,
+                "Streaming not supported for compact responses",
+            )),
+        )
+            .into_response();
+    }
+    let alias = match body.get("model").and_then(|v| v.as_str()) {
+        Some(model) if !model.is_empty() => model.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(OpenAiResponsesCodec::error_body(
+                    "invalid_request_error",
+                    None,
+                    "model field required",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    debug!(
+        endpoint = "/v1/responses/compact",
+        alias = %alias,
+        has_key = key_id.is_some(),
+        "gateway compact request accept"
+    );
+
+    match state
+        .pipeline
+        .run_compact(
+            alias.clone(),
+            body,
+            key_id,
+            extract_client_headers(&headers),
+        )
+        .await
+    {
+        Ok(response) => {
+            info!(
+                endpoint = "/v1/responses/compact",
+                alias = %alias,
+                "gateway compact complete"
+            );
+            Json(response).into_response()
+        }
+        Err(error) => {
+            let status = status_for_gateway_error(&error);
+            warn!(
+                endpoint = "/v1/responses/compact",
+                alias = %alias,
+                status = %status,
+                error = %error,
+                "gateway compact failed"
             );
             (
                 status,
@@ -915,6 +1001,21 @@ mod auth_status_tests {
             gateway_public_paths().contains(&"/v1/responses"),
             "POST /v1/responses must be part of the public gateway surface"
         );
+    }
+
+    #[test]
+    fn gateway_registers_responses_compact_path() {
+        assert!(
+            gateway_public_paths().contains(&"/v1/responses/compact"),
+            "POST /v1/responses/compact must be part of the public gateway surface"
+        );
+    }
+
+    #[test]
+    fn compact_rejects_stream_true_message() {
+        // Handler validation message must stay stable for CLIProxyAPI clients.
+        let msg = "Streaming not supported for compact responses";
+        assert!(msg.contains("Streaming not supported"));
     }
 
     /// CLIProxyAPI parity: Responses-shaped body on /v1/chat/completions is

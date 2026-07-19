@@ -12,8 +12,9 @@ pub use openai::{
 };
 pub use openai_responses::{
     apply_codex_chatgpt_account_body, can_reset_responses_continuation,
-    merge_responses_continuation, prepare_responses_continuation, reset_responses_continuation,
-    response_output_items, responses_store_enabled, OpenAiResponsesCodec, ResponsesContinuation,
+    merge_responses_continuation, prepare_responses_compact_body, prepare_responses_continuation,
+    reset_responses_continuation, response_output_items, responses_store_enabled,
+    sanitize_responses_reasoning_encrypted_content, OpenAiResponsesCodec, ResponsesContinuation,
     ResponsesContinuationRequest, ResponsesStreamEncoder,
 };
 use serde_json::Value;

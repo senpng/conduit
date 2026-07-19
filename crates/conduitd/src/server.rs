@@ -275,6 +275,10 @@ pub async fn run(
             post(crate::routes::chat_completions),
         )
         .route("/v1/responses", post(crate::routes::responses))
+        .route(
+            "/v1/responses/compact",
+            post(crate::routes::responses_compact),
+        )
         .route("/v1/messages", post(crate::routes::messages))
         .route("/v1/models", get(crate::routes::list_models))
         .route("/health", get(crate::routes::health))
@@ -902,6 +906,10 @@ mod hotpath_tests {
         assert!(
             src.contains("/v1/responses") && src.contains("routes::responses"),
             "gateway router must register POST /v1/responses → routes::responses"
+        );
+        assert!(
+            src.contains("/v1/responses/compact") && src.contains("routes::responses_compact"),
+            "gateway router must register POST /v1/responses/compact → routes::responses_compact"
         );
         // Shared resolver: construct once at startup, not per request.
         let ctor = format!("{}{}", "CredentialResolver", "::new");

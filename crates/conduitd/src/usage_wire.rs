@@ -207,6 +207,7 @@ mod tests {
                     period: None,
                     q: None,
                     sort: Default::default(),
+                    tz_offset_minutes: 0,
                 })
                 .await
                 .map(|p| p.total as usize)

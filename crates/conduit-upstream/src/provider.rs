@@ -233,6 +233,103 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         }
     }
 
+    /// Compact endpoint: `{base}/responses/compact` (Codex backend parity).
+    fn compact_url(&self) -> String {
+        let responses = self.chat_url();
+        if responses.ends_with("/responses") {
+            format!("{responses}/compact")
+        } else {
+            format!("{responses}/responses/compact")
+        }
+    }
+
+    /// POST raw Responses body to `/responses/compact` (non-stream JSON).
+    ///
+    /// Does **not** IR-encode: compact must preserve items like
+    /// `compaction_trigger` that the chat codec would drop.
+    #[instrument(skip(self, body, secret), fields(provider = %self.config.id))]
+    pub async fn responses_compact(
+        &self,
+        body: Value,
+        secret: &SecretString,
+    ) -> Result<Value, ProviderError> {
+        if self.config.path != UpstreamPath::Responses {
+            return Err(ProviderError::InvalidRequest(
+                "/responses/compact requires a Responses upstream path".into(),
+            ));
+        }
+        let url = self.compact_url();
+        let body_bytes = body.to_string().len();
+        debug!(
+            provider = %self.config.id,
+            kind = %self.config.kind,
+            url = %url,
+            body_bytes,
+            "upstream responses compact request"
+        );
+
+        let mut builder = self
+            .client()
+            .post(&url)
+            .timeout(Duration::from_millis(self.config.timeouts.overall_ms))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&body);
+        builder = self.apply_auth(builder, secret);
+        // Compact is non-stream JSON; do not force SSE Accept from Responses headers.
+        if self.config.kind != "codex-oauth" {
+            builder = self.apply_provider_headers(builder);
+        } else {
+            builder = builder.header("Connection", "Keep-Alive");
+        }
+
+        let started = std::time::Instant::now();
+        let resp = builder.send().await.map_err(|e| {
+            debug!(
+                provider = %self.config.id,
+                url = %url,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %e,
+                "upstream compact transport error"
+            );
+            if e.is_timeout() {
+                ProviderError::Timeout
+            } else {
+                ProviderError::Network(e.to_string())
+            }
+        })?;
+
+        rate_limit::emit(
+            &self.config.rate_limit_sink,
+            &self.config.id,
+            rate_limit::collect_from_reqwest(resp.headers()),
+        );
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(self.map_status_error(status, &text));
+        }
+
+        let val: Value = resp.json().await.map_err(|e| {
+            debug!(
+                provider = %self.config.id,
+                error = %e,
+                "upstream compact response json parse failed"
+            );
+            ProviderError::Serialization(e.to_string())
+        })?;
+
+        debug!(
+            provider = %self.config.id,
+            kind = %self.config.kind,
+            status = status.as_u16(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "upstream compact response ok"
+        );
+        Ok(val)
+    }
+
     fn models_url(&self) -> String {
         let base = self.config.base_url.trim_end_matches('/');
         if base.ends_with("/v1") {
@@ -691,5 +788,65 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
         assert_eq!(body["input"], "hello");
+    }
+
+    #[test]
+    fn compact_url_appends_compact_to_responses_base() {
+        use conduit_codec::OpenAiResponsesCodec;
+        let cfg = ProviderClientConfig::codex_oauth(
+            "codex-1",
+            "https://chatgpt.com/backend-api/codex",
+            vec![],
+        );
+        let client = ProviderClient::<OpenAiResponsesCodec>::new(cfg);
+        assert_eq!(
+            client.compact_url(),
+            "https://chatgpt.com/backend-api/codex/responses/compact"
+        );
+        let cfg2 = ProviderClientConfig::codex_oauth(
+            "codex-2",
+            "https://example.com/backend-api/codex/responses",
+            vec![],
+        );
+        let client2 = ProviderClient::<OpenAiResponsesCodec>::new(cfg2);
+        assert_eq!(
+            client2.compact_url(),
+            "https://example.com/backend-api/codex/responses/compact"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_compact_posts_to_compact_path_and_returns_json() {
+        use conduit_codec::OpenAiResponsesCodec;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses/compact"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "object": "response.compaction",
+                "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+            })))
+            .mount(&server)
+            .await;
+
+        let cfg = ProviderClientConfig::codex_oauth("codex-test", server.uri(), vec![]);
+        let client = ProviderClient::<OpenAiResponsesCodec>::new(cfg);
+        let body = json!({
+            "model": "gpt-5.4",
+            "instructions": "",
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger"}
+            ]
+        });
+        let out = client
+            .responses_compact(body, &SecretString::new("test-token".into()))
+            .await
+            .expect("compact ok");
+        assert_eq!(out["object"], "response.compaction");
+        assert_eq!(out["usage"]["total_tokens"], 3);
     }
 }
