@@ -627,9 +627,16 @@ pub async fn delete_key(
 pub struct ListUsageQuery {
     #[serde(default = "default_usage_limit")]
     pub limit: usize,
+    /// Row offset for pagination (0-based).
+    #[serde(default)]
+    pub offset: usize,
     pub key_id: Option<String>,
     /// Optional calendar month (`YYYY-MM`); scopes rows via `ts LIKE 'YYYY-MM%'`.
     pub period: Option<String>,
+    /// Free-text filter (model / alias / provider / request id / key id).
+    pub q: Option<String>,
+    /// Sort: `date` (default) | `cost` | `tokens` — always descending.
+    pub sort: Option<String>,
 }
 
 fn default_usage_limit() -> usize {
@@ -869,17 +876,43 @@ async fn probe_oauth_quota(
     Ok(Some(format!("oauth remaining: {label}")))
 }
 
-/// GET /console/usage — recent per-request consumption rows.
+/// GET /console/usage — paginated per-request consumption rows.
+///
+/// Query: `limit`, `offset`, `key_id`, `period` (`YYYY-MM`), `q` (filter),
+/// `sort` (`date`|`cost`|`tokens`). Response includes `total` for pagination.
 pub async fn list_usage(
     State(state): State<Arc<DaemonState>>,
     Query(q): Query<ListUsageQuery>,
 ) -> impl IntoResponse {
+    use conduit_store::{UsageListOpts, UsageListSort};
     let repo = UsageRepo::new(&state.pool);
+    let sort = q
+        .sort
+        .as_deref()
+        .map(UsageListSort::parse)
+        .unwrap_or_default();
     match repo
-        .list(q.limit, q.key_id.as_deref(), q.period.as_deref())
+        .list_page(UsageListOpts {
+            limit: q.limit,
+            offset: q.offset,
+            key_id: q.key_id.as_deref(),
+            period: q.period.as_deref(),
+            q: q.q.as_deref(),
+            sort,
+        })
         .await
     {
-        Ok(rows) => (StatusCode::OK, Json(json!({ "entries": rows }))).into_response(),
+        Ok(page) => (
+            StatusCode::OK,
+            Json(json!({
+                "entries": page.rows,
+                "total": page.total,
+                "limit": page.limit,
+                "offset": page.offset,
+                "sort": sort.as_str(),
+            })),
+        )
+            .into_response(),
         Err(e) => internal(e).into_response(),
     }
 }

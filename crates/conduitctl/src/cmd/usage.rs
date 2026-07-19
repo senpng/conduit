@@ -23,6 +23,15 @@ pub enum UsageCommand {
         period: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Pagination offset (0-based)
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Free-text filter (model / alias / provider / request / key)
+        #[arg(long, short = 'q')]
+        query: Option<String>,
+        /// Sort: date (default) | cost | tokens
+        #[arg(long, default_value = "date")]
+        sort: String,
     },
 }
 
@@ -44,13 +53,19 @@ pub async fn run(console_addr: &str, args: UsageArgs, _output: &str) -> Result<(
             key_id,
             period,
             limit,
+            offset,
+            query,
+            sort,
         } => {
-            let mut url = format!("{base}/console/usage?limit={limit}");
+            let mut url = format!("{base}/console/usage?limit={limit}&offset={offset}&sort={sort}");
             if let Some(k) = key_id {
                 url.push_str(&format!("&key_id={}", k));
             }
             if let Some(p) = period {
                 url.push_str(&format!("&period={}", p));
+            }
+            if let Some(q) = query {
+                url.push_str(&format!("&q={}", q));
             }
             let resp = client.get(&url).send().await?;
             let body: serde_json::Value = resp.json().await?;

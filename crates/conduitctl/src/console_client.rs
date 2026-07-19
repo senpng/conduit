@@ -226,19 +226,17 @@ impl ConsoleClient {
         self.get_json(&url).await
     }
 
-    /// Recent per-request usage rows.
+    /// Paginated per-request usage rows.
     ///
     /// Optional `period` (`YYYY-MM`) scopes to that calendar month.
+    /// `offset` / `q` / `sort` support real pagination, free-text filter, and sort.
     pub async fn list_usage(
         &self,
         limit: usize,
         period: Option<&str>,
     ) -> Result<Value, ConsoleError> {
-        let mut url = format!("{}/console/usage?limit={limit}", self.base);
-        if let Some(p) = period {
-            url.push_str(&format!("&period={p}"));
-        }
-        self.get_json(&url).await
+        self.list_usage_query(limit, 0, period, None, None, None)
+            .await
     }
 
     pub async fn list_usage_typed(
@@ -246,9 +244,43 @@ impl ConsoleClient {
         limit: usize,
         period: Option<&str>,
     ) -> Result<UsageListResponse, ConsoleError> {
-        let mut url = format!("{}/console/usage?limit={limit}", self.base);
+        self.list_usage_page(limit, 0, period, None, None).await
+    }
+
+    /// Full usage list query (pagination + filter + sort).
+    pub async fn list_usage_page(
+        &self,
+        limit: usize,
+        offset: usize,
+        period: Option<&str>,
+        q: Option<&str>,
+        sort: Option<&str>,
+    ) -> Result<UsageListResponse, ConsoleError> {
+        self.list_usage_query(limit, offset, period, None, q, sort)
+            .await
+    }
+
+    async fn list_usage_query<T: serde::de::DeserializeOwned>(
+        &self,
+        limit: usize,
+        offset: usize,
+        period: Option<&str>,
+        key_id: Option<&str>,
+        q: Option<&str>,
+        sort: Option<&str>,
+    ) -> Result<T, ConsoleError> {
+        let mut url = format!("{}/console/usage?limit={limit}&offset={offset}", self.base);
         if let Some(p) = period {
-            url.push_str(&format!("&period={p}"));
+            url.push_str(&format!("&period={}", urlencoding_path(p)));
+        }
+        if let Some(k) = key_id {
+            url.push_str(&format!("&key_id={}", urlencoding_path(k)));
+        }
+        if let Some(query) = q.filter(|s| !s.is_empty()) {
+            url.push_str(&format!("&q={}", urlencoding_path(query)));
+        }
+        if let Some(s) = sort.filter(|s| !s.is_empty()) {
+            url.push_str(&format!("&sort={}", urlencoding_path(s)));
         }
         self.get_json(&url).await
     }

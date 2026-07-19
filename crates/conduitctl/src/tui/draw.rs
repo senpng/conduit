@@ -1012,7 +1012,7 @@ fn draw_usage_barchart(frame: &mut Frame, area: Rect, app: &App) {
     let block = panel_block(
         theme,
         format!(
-            "Daily cost  ·  sort={}  detail={}  [ / ] month",
+            "Daily cost  ·  sort={}  detail={}  [ ] month · / filter",
             app.usage_sort.label(),
             app.usage_detail.label()
         ),
@@ -1094,8 +1094,39 @@ fn draw_usage_detail(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_usage_recent(frame: &mut Frame, area: Rect, app: &App, sel: usize) {
     let theme = &app.theme;
+    let title = {
+        let total = app.usage_total;
+        let from = if total == 0 {
+            0
+        } else {
+            app.usage_offset.saturating_add(1)
+        };
+        let to = app
+            .usage_offset
+            .saturating_add(app.usage_recent.len())
+            .min(total as usize);
+        let page = if total == 0 {
+            0
+        } else {
+            app.usage_offset / super::app::USAGE_PAGE_SIZE + 1
+        };
+        let pages = if total == 0 {
+            0
+        } else {
+            (total as usize).div_ceil(super::app::USAGE_PAGE_SIZE)
+        };
+        format!(
+            "Recent  {from}–{to}/{total} · p.{page}/{pages} · sort={}  (cR=cache read · cW=cache write)",
+            app.usage_sort.label()
+        )
+    };
     if app.usage_recent.is_empty() {
-        empty_state(frame, area, theme, "Recent", "no requests recorded");
+        let hint = if !app.filter.is_empty() {
+            "no matches for filter — Esc clear · / edit"
+        } else {
+            "no requests recorded"
+        };
+        empty_state(frame, area, theme, &title, hint);
         return;
     }
     let (list_area, detail_area, show_detail) = usage_master_detail(area);
@@ -1115,20 +1146,14 @@ fn draw_usage_recent(frame: &mut Frame, area: Rect, app: &App, sel: usize) {
     .min(flex.saturating_sub(12).max(12));
     let model_w = flex.saturating_sub(ts_w).max(12);
 
-    let mut rows_data: Vec<(f64, u64, String, usize)> = app
+    // Server already sorted/paginated — display in API order.
+    let sel = sel.min(app.usage_recent.len().saturating_sub(1));
+
+    let rows: Vec<Row> = app
         .usage_recent
         .iter()
         .enumerate()
-        .map(|(i, u)| (u.cost_usd, u.total_tokens as u64, u.ts.clone(), i))
-        .collect();
-    sort_triples(&mut rows_data, app.usage_sort);
-    let sel = sel.min(rows_data.len().saturating_sub(1));
-
-    let rows: Vec<Row> = rows_data
-        .iter()
-        .enumerate()
-        .map(|(view_i, &(_, _, _, data_i))| {
-            let u = &app.usage_recent[data_i];
+        .map(|(view_i, u)| {
             let row = Row::new(vec![
                 Cell::from(truncate(&format_local_time(&u.ts), ts_w)),
                 Cell::from(truncate(u.model_id.as_deref().unwrap_or(""), model_w)),
@@ -1159,16 +1184,11 @@ fn draw_usage_recent(frame: &mut Frame, area: Rect, app: &App, sel: usize) {
     .header(
         Row::new(vec!["TS", "MODEL", "TOK", "cR", "cW", "COST"]).style(theme.header_cell()),
     )
-    .block(panel_block(
-        theme,
-        "Recent  (cR=cache read · cW=cache write)",
-        true,
-    ));
+    .block(panel_block(theme, title, true));
     frame.render_widget(table, list_area);
 
     if show_detail {
-        let data_i = rows_data.get(sel).map(|r| r.3).unwrap_or(0);
-        if let Some(u) = app.usage_recent.get(data_i) {
+        if let Some(u) = app.usage_recent.get(sel) {
             draw_usage_record_detail(frame, detail_area, theme, u, &app.pricing);
         }
     }
@@ -1182,31 +1202,38 @@ fn draw_usage_by_model(
     period_total: f64,
 ) {
     let theme = &app.theme;
+    let filtered = app.filtered_indices();
     let mut items: Vec<(usize, String, String, f64, u64, u64)> = app
         .usage_summary
         .as_ref()
         .map(|s| {
-            s.by_model
+            filtered
                 .iter()
-                .enumerate()
-                .map(|(i, m)| {
-                    (
-                        i,
-                        m.label.clone(),
-                        m.provider_kind.clone(),
-                        m.total_usd,
-                        m.total_tokens,
-                        m.request_count,
-                    )
+                .filter_map(|&i| {
+                    s.by_model.get(i).map(|m| {
+                        (
+                            i,
+                            m.label.clone(),
+                            m.provider_kind.clone(),
+                            m.total_usd,
+                            m.total_tokens,
+                            m.request_count,
+                        )
+                    })
                 })
                 .collect()
         })
         .unwrap_or_default();
     if items.is_empty() {
-        empty_state(frame, area, theme, "By model", "no rollup data");
+        let hint = if !app.filter.is_empty() {
+            "no matches for filter"
+        } else {
+            "no rollup data"
+        };
+        empty_state(frame, area, theme, "By model", hint);
         return;
     }
-    items.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+    sort_usage_items(&mut items, app.usage_sort);
     let sel = sel.min(items.len().saturating_sub(1));
     let (list_area, detail_area, show_detail) = usage_master_detail(area);
     let max_cost = items
@@ -1289,34 +1316,51 @@ fn draw_usage_by_model(
 
 fn draw_usage_by_key(frame: &mut Frame, area: Rect, app: &App, sel: usize, period_total: f64) {
     let theme = &app.theme;
+    let filtered = app.filtered_indices();
     // (display_name, key_id, cost, tokens, reqs, prompt, completion)
     let mut items: Vec<(String, String, f64, u64, u64, u64, u64)> = app
         .usage_summary
         .as_ref()
         .map(|s| {
-            s.entries
+            filtered
                 .iter()
-                .map(|e| {
-                    let id = e.downstream_key_id.clone();
-                    let name = resolve_key_name(&app.keys, &id);
-                    (
-                        name,
-                        id,
-                        e.total_usd,
-                        e.total_tokens,
-                        e.request_count,
-                        e.prompt_tokens,
-                        e.completion_tokens,
-                    )
+                .filter_map(|&i| {
+                    s.entries.get(i).map(|e| {
+                        let id = e.downstream_key_id.clone();
+                        let name = resolve_key_name(&app.keys, &id);
+                        (
+                            name,
+                            id,
+                            e.total_usd,
+                            e.total_tokens,
+                            e.request_count,
+                            e.prompt_tokens,
+                            e.completion_tokens,
+                        )
+                    })
                 })
                 .collect()
         })
         .unwrap_or_default();
     if items.is_empty() {
-        empty_state(frame, area, theme, "By key", "no rollup data");
+        let hint = if !app.filter.is_empty() {
+            "no matches for filter"
+        } else {
+            "no rollup data"
+        };
+        empty_state(frame, area, theme, "By key", hint);
         return;
     }
-    items.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    match app.usage_sort {
+        super::app::UsageSort::Cost => {
+            items.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+        }
+        super::app::UsageSort::Tokens => items.sort_by(|a, b| b.3.cmp(&a.3)),
+        super::app::UsageSort::Date => {
+            // Keys have no timestamp; fall back to name.
+            items.sort_by(|a, b| a.0.cmp(&b.0))
+        }
+    }
     let sel = sel.min(items.len().saturating_sub(1));
     let (list_area, detail_area, show_detail) = usage_master_detail(area);
     let max_cost = items
@@ -1475,25 +1519,33 @@ fn resolve_key_name(keys: &[crate::dto::KeyView], id: &str) -> String {
 
 fn draw_usage_by_day(frame: &mut Frame, area: Rect, app: &App, sel: usize, period_total: f64) {
     let theme = &app.theme;
+    let filtered = app.filtered_indices();
     let mut days: Vec<(String, u64, u64, f64)> = app
         .usage_summary
         .as_ref()
         .map(|s| {
-            s.by_day
+            filtered
                 .iter()
-                .map(|d| {
-                    (
-                        d.day.clone(),
-                        d.request_count,
-                        d.total_tokens,
-                        d.total_usd,
-                    )
+                .filter_map(|&i| {
+                    s.by_day.get(i).map(|d| {
+                        (
+                            d.day.clone(),
+                            d.request_count,
+                            d.total_tokens,
+                            d.total_usd,
+                        )
+                    })
                 })
                 .collect()
         })
         .unwrap_or_default();
     if days.is_empty() {
-        empty_state(frame, area, theme, "By day", "no daily rows");
+        let hint = if !app.filter.is_empty() {
+            "no matches for filter"
+        } else {
+            "no daily rows"
+        };
+        empty_state(frame, area, theme, "By day", hint);
         return;
     }
     // Keep chronological by default for day view unless cost/token sort.
@@ -1676,14 +1728,18 @@ fn draw_usage_rollup_detail(
     );
 }
 
-fn sort_triples(rows: &mut [(f64, u64, String, usize)], sort: super::app::UsageSort) {
+/// Sort by-model rollup rows: (idx, label, provider, cost, tokens, reqs).
+fn sort_usage_items(
+    items: &mut [(usize, String, String, f64, u64, u64)],
+    sort: super::app::UsageSort,
+) {
     use super::app::UsageSort;
     match sort {
         UsageSort::Cost => {
-            rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal))
+            items.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
         }
-        UsageSort::Tokens => rows.sort_by(|a, b| b.1.cmp(&a.1)),
-        UsageSort::Date => rows.sort_by(|a, b| b.2.cmp(&a.2)),
+        UsageSort::Tokens => items.sort_by(|a, b| b.4.cmp(&a.4)),
+        UsageSort::Date => items.sort_by(|a, b| a.1.cmp(&b.1)), // label A–Z
     }
 }
 
@@ -2213,7 +2269,9 @@ Keys
   a add · e edit · d delete
 
 Usage
-  [ ] month · c sort · t cycle list (right pane is detail; no Enter modal)
+  [ ] month · c sort · t cycle list · / filter
+  Recent: PgUp/PgDn page · g/G first/last page
+  (right pane is detail; no Enter modal)
 
 Pricing
   o             Toggle merged ↔ overrides pane

@@ -8,8 +8,11 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::console_client::ConsoleClient;
 use crate::dto::{
     HealthResponse, KeyView, PricingView, ProviderSecretView, ProviderView, RouteView,
-    UsageRecordView, UsageSummaryView,
+    UsageListResponse, UsageRecordView, UsageSummaryView,
 };
+
+/// Page size for Usage → recent (server-side pagination).
+pub const USAGE_PAGE_SIZE: usize = 50;
 
 use super::action::Action;
 use super::forms::{
@@ -101,17 +104,17 @@ pub enum PricingPane {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UsageSort {
     #[default]
+    Date,
     Cost,
     Tokens,
-    Date,
 }
 
 impl UsageSort {
     pub fn next(self) -> Self {
         match self {
+            UsageSort::Date => UsageSort::Cost,
             UsageSort::Cost => UsageSort::Tokens,
             UsageSort::Tokens => UsageSort::Date,
-            UsageSort::Date => UsageSort::Cost,
         }
     }
 
@@ -181,6 +184,11 @@ pub struct App {
     pub usage_summary: Option<UsageSummaryView>,
     pub usage_recent: Vec<UsageRecordView>,
     pub usage_period: String,
+    /// Server-side pagination for Usage → recent.
+    pub usage_offset: usize,
+    pub usage_total: u64,
+    /// Last filter string applied to the usage list API (Recent pane).
+    pub usage_applied_filter: String,
     pub pricing: Vec<PricingView>,
     pub pricing_overrides: Vec<PricingView>,
     pub pricing_pane: PricingPane,
@@ -218,6 +226,9 @@ impl App {
             usage_summary: None,
             usage_recent: Vec::new(),
             usage_period: current_period(),
+            usage_offset: 0,
+            usage_total: 0,
+            usage_applied_filter: String::new(),
             pricing: Vec::new(),
             pricing_overrides: Vec::new(),
             pricing_pane: PricingPane::Merged,
@@ -233,11 +244,7 @@ impl App {
         self.error = None;
         match self.tab {
             Tab::Usage => {
-                net::spawn_usage(
-                    self.client.clone(),
-                    Some(self.usage_period.clone()),
-                    self.tx.clone(),
-                );
+                self.spawn_usage_load(true);
             }
             Tab::Pricing => {
                 // Always reload pricing + period usage together.
@@ -277,20 +284,54 @@ impl App {
                     self.move_sel(1);
                 }
             }
-            Action::PageUp => self.move_sel(-10),
-            Action::PageDown => self.move_sel(10),
+            Action::PageUp => {
+                if self.tab == Tab::Usage && self.usage_detail == UsageDetail::Recent {
+                    self.usage_prev_page();
+                } else {
+                    self.move_sel(-10);
+                }
+            }
+            Action::PageDown => {
+                if self.tab == Tab::Usage && self.usage_detail == UsageDetail::Recent {
+                    self.usage_next_page();
+                } else {
+                    self.move_sel(10);
+                }
+            }
             Action::GoTop => {
-                self.selected[self.tab.index()] = 0;
+                if self.tab == Tab::Usage && self.usage_detail == UsageDetail::Recent {
+                    if self.usage_offset > 0 {
+                        self.usage_offset = 0;
+                        self.selected[Tab::Usage.index()] = 0;
+                        self.spawn_usage_load(false);
+                    } else {
+                        self.selected[self.tab.index()] = 0;
+                    }
+                } else {
+                    self.selected[self.tab.index()] = 0;
+                }
             }
             Action::GoBottom => {
-                let n = self.list_len();
-                self.selected[self.tab.index()] = n.saturating_sub(1);
+                if self.tab == Tab::Usage && self.usage_detail == UsageDetail::Recent {
+                    let last_off = self.usage_last_offset();
+                    if self.usage_offset < last_off {
+                        self.usage_offset = last_off;
+                        self.selected[Tab::Usage.index()] = 0;
+                        self.spawn_usage_load(false);
+                    } else {
+                        let n = self.list_len();
+                        self.selected[self.tab.index()] = n.saturating_sub(1);
+                    }
+                } else {
+                    let n = self.list_len();
+                    self.selected[self.tab.index()] = n.saturating_sub(1);
+                }
             }
             Action::StartFilter => {
                 if matches!(self.mode, Mode::Browse)
                     && matches!(
                         self.tab,
-                        Tab::Providers | Tab::Routes | Tab::Keys | Tab::Pricing
+                        Tab::Providers | Tab::Routes | Tab::Keys | Tab::Pricing | Tab::Usage
                     )
                 {
                     self.mode = Mode::Filter;
@@ -346,11 +387,13 @@ impl App {
             }
             Action::PeriodPrev => {
                 self.usage_period = shift_period(&self.usage_period, -1);
+                self.usage_offset = 0;
                 self.selected[Tab::Usage.index()] = 0;
                 self.request_refresh();
             }
             Action::PeriodNext => {
                 self.usage_period = shift_period(&self.usage_period, 1);
+                self.usage_offset = 0;
                 self.selected[Tab::Usage.index()] = 0;
                 self.request_refresh();
             }
@@ -474,7 +517,13 @@ impl App {
             Action::CycleUsageSort => {
                 if self.tab == Tab::Usage {
                     self.usage_sort = self.usage_sort.next();
+                    self.usage_offset = 0;
+                    self.selected[Tab::Usage.index()] = 0;
                     self.status = format!("Usage sort: {}", self.usage_sort.label());
+                    // Recent list is sorted server-side; re-fetch so pagination stays correct.
+                    if self.usage_detail == UsageDetail::Recent {
+                        self.spawn_usage_load(false);
+                    }
                 }
             }
             Action::CycleUsageDetail => {
@@ -482,9 +531,82 @@ impl App {
                     self.usage_detail = self.usage_detail.next();
                     self.selected[Tab::Usage.index()] = 0;
                     self.status = format!("Usage detail: {}", self.usage_detail.label());
+                    // Entering Recent with a filter (or stale page) → re-fetch server page.
+                    if self.usage_detail == UsageDetail::Recent
+                        && self.filter != self.usage_applied_filter
+                    {
+                        self.usage_offset = 0;
+                        self.spawn_usage_load(false);
+                    }
                 }
             }
         }
+    }
+
+    /// Load Usage summary + current recent page.
+    /// When `include_summary` is false, only re-fetches the list page (filter/page/sort).
+    fn spawn_usage_load(&mut self, include_summary: bool) {
+        self.loading = true;
+        self.error = None;
+        self.usage_applied_filter = self.filter.clone();
+        let q = if self.filter.is_empty() {
+            None
+        } else {
+            Some(self.filter.clone())
+        };
+        if include_summary {
+            net::spawn_usage(
+                self.client.clone(),
+                Some(self.usage_period.clone()),
+                self.usage_offset,
+                USAGE_PAGE_SIZE,
+                q,
+                Some(self.usage_sort.label().to_string()),
+                self.tx.clone(),
+            );
+        } else {
+            net::spawn_usage_page(
+                self.client.clone(),
+                Some(self.usage_period.clone()),
+                self.usage_offset,
+                USAGE_PAGE_SIZE,
+                q,
+                Some(self.usage_sort.label().to_string()),
+                self.tx.clone(),
+            );
+        }
+    }
+
+    fn usage_last_offset(&self) -> usize {
+        let total = self.usage_total as usize;
+        if total == 0 {
+            return 0;
+        }
+        ((total - 1) / USAGE_PAGE_SIZE) * USAGE_PAGE_SIZE
+    }
+
+    fn usage_next_page(&mut self) {
+        let next = self.usage_offset.saturating_add(USAGE_PAGE_SIZE);
+        if (next as u64) >= self.usage_total && self.usage_total > 0 {
+            self.status = "Already on last page".into();
+            return;
+        }
+        if self.usage_total == 0 {
+            return;
+        }
+        self.usage_offset = next;
+        self.selected[Tab::Usage.index()] = 0;
+        self.spawn_usage_load(false);
+    }
+
+    fn usage_prev_page(&mut self) {
+        if self.usage_offset == 0 {
+            self.status = "Already on first page".into();
+            return;
+        }
+        self.usage_offset = self.usage_offset.saturating_sub(USAGE_PAGE_SIZE);
+        self.selected[Tab::Usage.index()] = 0;
+        self.spawn_usage_load(false);
     }
 
     fn switch_tab(&mut self, tab: Tab) {
@@ -493,6 +615,8 @@ impl App {
         }
         self.mode = Mode::Browse;
         self.filter.clear();
+        self.usage_applied_filter.clear();
+        self.usage_offset = 0;
         self.tab = tab;
         self.request_refresh();
     }
@@ -536,27 +660,58 @@ impl App {
                 .filter(|(_, k)| match_q(&k.name) || match_q(&k.id))
                 .map(|(i, _)| i)
                 .collect(),
-            Tab::Usage => {
-                let n = match self.usage_detail {
-                    UsageDetail::Recent => self.usage_recent.len(),
-                    UsageDetail::ByModel => self
-                        .usage_summary
-                        .as_ref()
-                        .map(|s| s.by_model.len())
-                        .unwrap_or(0),
-                    UsageDetail::ByKey => self
-                        .usage_summary
-                        .as_ref()
-                        .map(|s| s.entries.len())
-                        .unwrap_or(0),
-                    UsageDetail::ByDay => self
-                        .usage_summary
-                        .as_ref()
-                        .map(|s| s.by_day.len())
-                        .unwrap_or(0),
-                };
-                (0..n).collect()
-            }
+            Tab::Usage => match self.usage_detail {
+                // Recent: filter is applied server-side; list is already scoped.
+                UsageDetail::Recent => (0..self.usage_recent.len()).collect(),
+                UsageDetail::ByModel => self
+                    .usage_summary
+                    .as_ref()
+                    .map(|s| {
+                        s.by_model
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, m)| {
+                                match_q(&m.label)
+                                    || match_q(&m.provider_kind)
+                                    || match_q(&m.total_usd.to_string())
+                            })
+                            .map(|(i, _)| i)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                UsageDetail::ByKey => self
+                    .usage_summary
+                    .as_ref()
+                    .map(|s| {
+                        s.entries
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, e)| {
+                                match_q(&e.downstream_key_id)
+                                    || self
+                                        .keys
+                                        .iter()
+                                        .find(|k| k.id == e.downstream_key_id)
+                                        .map(|k| match_q(&k.name))
+                                        .unwrap_or(false)
+                            })
+                            .map(|(i, _)| i)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                UsageDetail::ByDay => self
+                    .usage_summary
+                    .as_ref()
+                    .map(|s| {
+                        s.by_day
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, d)| match_q(&d.day))
+                            .map(|(i, _)| i)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
             Tab::Pricing => {
                 let rows = match self.pricing_pane {
                     PricingPane::Merged => &self.pricing,
@@ -623,8 +778,18 @@ impl App {
             }
         }
         if matches!(self.mode, Mode::Filter) {
-            // Esc in filter: keep filter text but leave edit mode
+            // Esc/Enter in filter: keep filter text but leave edit mode.
+            // Usage → recent applies filter server-side on leave.
             self.mode = Mode::Browse;
+            if self.tab == Tab::Usage && self.filter != self.usage_applied_filter {
+                self.usage_offset = 0;
+                self.selected[Tab::Usage.index()] = 0;
+                if self.usage_detail == UsageDetail::Recent {
+                    self.spawn_usage_load(false);
+                } else {
+                    self.usage_applied_filter = self.filter.clone();
+                }
+            }
             return;
         }
         self.mode = Mode::Browse;
@@ -667,7 +832,11 @@ impl App {
                     ("]", "next mo"),
                     ("c", "sort"),
                     ("t", "detail"),
+                    ("/", "filter"),
                 ]);
+                if self.usage_detail == UsageDetail::Recent {
+                    v.extend([("PgUp", "prev pg"), ("PgDn", "next pg")]);
+                }
             }
             Tab::Pricing => match self.pricing_pane {
                 PricingPane::Merged => {
@@ -1350,6 +1519,38 @@ impl App {
         }
     }
 
+    fn apply_usage_page(&mut self, page: UsageListResponse) {
+        self.usage_recent = page.entries;
+        self.usage_total = page.total;
+        // Prefer server-reported offset/limit when present.
+        if page.limit > 0 {
+            // keep page size constant; offset from response if coherent
+            self.usage_offset = page.offset;
+        }
+        if self.tab == Tab::Usage && self.usage_detail == UsageDetail::Recent {
+            let from = self.usage_offset.saturating_add(1).min(self.usage_total as usize);
+            let to = self
+                .usage_offset
+                .saturating_add(self.usage_recent.len())
+                .min(self.usage_total as usize);
+            let page_n = if self.usage_total == 0 {
+                0
+            } else {
+                self.usage_offset / USAGE_PAGE_SIZE + 1
+            };
+            let pages = if self.usage_total == 0 {
+                0
+            } else {
+                (self.usage_total as usize).div_ceil(USAGE_PAGE_SIZE)
+            };
+            self.status = if self.usage_total == 0 {
+                "Usage: no matching requests".into()
+            } else {
+                format!("Usage {from}–{to} of {} · page {page_n}/{pages}", self.usage_total)
+            };
+        }
+    }
+
     fn on_tick(&mut self) {
         self.tick_frame = self.tick_frame.wrapping_add(1);
         if let Mode::OauthFlow(f) = &mut self.mode {
@@ -1459,33 +1660,41 @@ impl App {
                 }
             },
             Msg::Usage { summary, recent } => {
-                match summary {
-                    Ok(s) => self.usage_summary = Some(s),
-                    Err(e) => {
-                        // Pricing tab preloads usage for detail panes — don't paint
-                        // a hard error over pricing if the summary fails.
-                        if self.tab == Tab::Usage {
-                            self.error = Some(e);
-                        } else {
-                            self.status = format!("usage summary unavailable: {e}");
+                if let Some(summary) = summary {
+                    match summary {
+                        Ok(s) => self.usage_summary = Some(s),
+                        Err(e) => {
+                            // Pricing tab preloads usage for detail panes — don't paint
+                            // a hard error over pricing if the summary fails.
+                            if self.tab == Tab::Usage {
+                                self.error = Some(e);
+                            } else {
+                                self.status = format!("usage summary unavailable: {e}");
+                            }
                         }
                     }
                 }
-                match recent {
-                    Ok(r) => {
-                        // Pricing preload sends empty recent — don't wipe a list
-                        // already loaded from the Usage tab.
-                        if !r.is_empty() || self.tab == Tab::Usage || self.usage_recent.is_empty()
-                        {
-                            self.usage_recent = r;
+                if let Some(recent) = recent {
+                    match recent {
+                        Ok(page) => {
+                            // Pricing/overview preload may send empty page — don't wipe
+                            // a list already loaded from the Usage tab.
+                            let empty_preload = page.entries.is_empty()
+                                && page.total == 0
+                                && page.limit == 0
+                                && self.tab != Tab::Usage
+                                && !self.usage_recent.is_empty();
+                            if !empty_preload {
+                                self.apply_usage_page(page);
+                            }
+                            if self.tab == Tab::Usage {
+                                self.clamp_sel(Tab::Usage);
+                            }
                         }
-                        if self.tab == Tab::Usage {
-                            self.clamp_sel(Tab::Usage);
-                        }
-                    }
-                    Err(e) => {
-                        if self.tab == Tab::Usage {
-                            self.error = Some(e);
+                        Err(e) => {
+                            if self.tab == Tab::Usage {
+                                self.error = Some(e);
+                            }
                         }
                     }
                 }
@@ -1675,11 +1884,7 @@ impl App {
             RefreshKind::Routes => net::spawn_routes(self.client.clone(), self.tx.clone()),
             RefreshKind::Keys => net::spawn_keys(self.client.clone(), self.tx.clone()),
             RefreshKind::Usage => {
-                net::spawn_usage(
-                    self.client.clone(),
-                    Some(self.usage_period.clone()),
-                    self.tx.clone(),
-                );
+                self.spawn_usage_load(true);
             }
             RefreshKind::Pricing => net::spawn_pricing(self.client.clone(), self.tx.clone()),
             RefreshKind::PricingOverrides => {

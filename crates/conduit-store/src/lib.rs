@@ -28,7 +28,10 @@ use sqlx::{
     SqlitePool,
 };
 use thiserror::Error;
-pub use usage_repo::{new_usage_record, UsageDayRow, UsageModelRow, UsageRepo, UsageSummaryRow};
+pub use usage_repo::{
+    new_usage_record, UsageDayRow, UsageListOpts, UsageListPage, UsageListSort, UsageModelRow,
+    UsageRepo, UsageSummaryRow,
+};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 

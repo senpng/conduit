@@ -238,6 +238,16 @@ pub struct UsageRecordView {
 pub struct UsageListResponse {
     #[serde(default)]
     pub entries: Vec<UsageRecordView>,
+    /// Total rows matching the query (for pagination).
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+    /// Echo of server sort: `date` | `cost` | `tokens`.
+    #[serde(default)]
+    pub sort: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -588,12 +598,16 @@ mod tests {
 
     #[test]
     fn usage_list_response_wraps_entries() {
-        let raw = r#"{"entries":[{"id":"1","ts":"t","request_id":"r","cost_usd":0.01}]}"#;
+        let raw = r#"{"entries":[{"id":"1","ts":"t","request_id":"r","cost_usd":0.01}],"total":42,"limit":50,"offset":0,"sort":"date"}"#;
         let list: UsageListResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(list.entries.len(), 1);
         assert!((list.entries[0].cost_usd - 0.01).abs() < f64::EPSILON);
         assert_eq!(list.entries[0].cache_read_tokens, 0);
         assert_eq!(list.entries[0].cache_write_tokens, 0);
+        assert_eq!(list.total, 42);
+        assert_eq!(list.limit, 50);
+        assert_eq!(list.offset, 0);
+        assert_eq!(list.sort.as_deref(), Some("date"));
     }
 
     #[test]

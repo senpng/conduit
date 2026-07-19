@@ -197,8 +197,13 @@ one-shot CLI commands:
 
 ```bash
 cargo run -p conduitctl -- usage summary
-cargo run -p conduitctl -- usage list
+cargo run -p conduitctl -- usage list --limit 50 --offset 0 --sort date
+cargo run -p conduitctl -- usage list -q gpt-4o --sort cost
 ```
+
+TUI **Usage** tab: default sort is date (newest first); `/` filters; **PgUp/PgDn** pages the
+recent list (50 per page). `c` cycles sort (`date` → `cost` → `tokens`); `[`/`]` change month.
+
 
 Manage **operator pricing overrides** (`pricing.json`, USD per MTok) like tokscale
 custom-pricing:

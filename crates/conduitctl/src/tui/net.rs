@@ -5,8 +5,10 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::console_client::ConsoleClient;
 use crate::dto::{
     CreateKeyBody, CreateProviderBody, CreateRouteBody, SetSecretBody, UpdateProviderBody,
+    UsageListResponse,
 };
 
+use super::app::USAGE_PAGE_SIZE;
 use super::msg::{Msg, RefreshKind};
 
 pub fn spawn_load_tab(client: ConsoleClient, tab_idx: usize, tx: UnboundedSender<Msg>) {
@@ -15,9 +17,27 @@ pub fn spawn_load_tab(client: ConsoleClient, tab_idx: usize, tx: UnboundedSender
         1 => spawn_providers(client, tx),
         2 => spawn_routes(client, tx),
         3 => spawn_keys(client, tx),
-        4 => spawn_usage(client, None, tx),
+        4 => spawn_usage(
+            client,
+            None,
+            0,
+            USAGE_PAGE_SIZE,
+            None,
+            Some("date".into()),
+            tx,
+        ),
         5 => spawn_pricing(client, tx),
         _ => {}
+    }
+}
+
+fn empty_usage_page() -> UsageListResponse {
+    UsageListResponse {
+        entries: Vec::new(),
+        total: 0,
+        limit: 0,
+        offset: 0,
+        sort: None,
     }
 }
 
@@ -38,8 +58,8 @@ pub fn spawn_overview(client: ConsoleClient, tx: UnboundedSender<Msg>) {
             .await
             .map_err(|e| e.to_string());
         let _ = tx.send(Msg::Usage {
-            summary,
-            recent: Ok(Vec::new()),
+            summary: Some(summary),
+            recent: Some(Ok(empty_usage_page())),
         });
     });
 }
@@ -116,24 +136,69 @@ pub fn spawn_keys(client: ConsoleClient, tx: UnboundedSender<Msg>) {
     });
 }
 
-pub fn spawn_usage(client: ConsoleClient, period: Option<String>, tx: UnboundedSender<Msg>) {
+/// Full Usage tab load: period summary + one recent page + pricing/keys for detail panes.
+pub fn spawn_usage(
+    client: ConsoleClient,
+    period: Option<String>,
+    offset: usize,
+    limit: usize,
+    q: Option<String>,
+    sort: Option<String>,
+    tx: UnboundedSender<Msg>,
+) {
     tokio::spawn(async move {
         let summary = client
             .usage_summary_typed(period.as_deref())
             .await
             .map_err(|e| e.to_string());
         let recent = client
-            .list_usage_typed(50, period.as_deref())
+            .list_usage_page(
+                limit,
+                offset,
+                period.as_deref(),
+                q.as_deref(),
+                sort.as_deref(),
+            )
             .await
-            .map(|r| r.entries)
             .map_err(|e| e.to_string());
-        let _ = tx.send(Msg::Usage { summary, recent });
+        let _ = tx.send(Msg::Usage {
+            summary: Some(summary),
+            recent: Some(recent),
+        });
         // Pricing rates used by usage detail pane (cache read/write unit prices).
         let pricing = client.list_pricing_typed().await.map_err(|e| e.to_string());
         let _ = tx.send(Msg::Pricing(pricing));
         // Key names for Usage → by key rollup labels.
         let keys = client.list_keys_typed().await.map_err(|e| e.to_string());
         let _ = tx.send(Msg::Keys(keys));
+    });
+}
+
+/// List page only (filter / sort / page flip) — skips summary + pricing.
+pub fn spawn_usage_page(
+    client: ConsoleClient,
+    period: Option<String>,
+    offset: usize,
+    limit: usize,
+    q: Option<String>,
+    sort: Option<String>,
+    tx: UnboundedSender<Msg>,
+) {
+    tokio::spawn(async move {
+        let recent = client
+            .list_usage_page(
+                limit,
+                offset,
+                period.as_deref(),
+                q.as_deref(),
+                sort.as_deref(),
+            )
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(Msg::Usage {
+            summary: None,
+            recent: Some(recent),
+        });
     });
 }
 
@@ -151,8 +216,8 @@ pub fn spawn_pricing(client: ConsoleClient, tx: UnboundedSender<Msg>) {
         );
         // Usage first so detail panes have spend as soon as the list appears.
         let _ = tx.send(Msg::Usage {
-            summary,
-            recent: Ok(Vec::new()),
+            summary: Some(summary),
+            recent: Some(Ok(empty_usage_page())),
         });
         let _ = tx.send(Msg::PricingOverrides(overrides));
         let _ = tx.send(Msg::Pricing(pricing));
@@ -167,8 +232,8 @@ pub fn spawn_usage_summary_only(client: ConsoleClient, tx: UnboundedSender<Msg>)
             .await
             .map_err(|e| e.to_string());
         let _ = tx.send(Msg::Usage {
-            summary,
-            recent: Ok(Vec::new()),
+            summary: Some(summary),
+            recent: None,
         });
     });
 }

@@ -12,6 +12,54 @@ pub struct UsageRepo<'a> {
     pool: &'a SqlitePool,
 }
 
+/// Sort key for paginated usage list (always descending).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UsageListSort {
+    #[default]
+    Date,
+    Cost,
+    Tokens,
+}
+
+impl UsageListSort {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "cost" => Self::Cost,
+            "tokens" | "token" => Self::Tokens,
+            _ => Self::Date,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Date => "date",
+            Self::Cost => "cost",
+            Self::Tokens => "tokens",
+        }
+    }
+}
+
+/// Options for [`UsageRepo::list_page`].
+#[derive(Debug, Clone, Copy)]
+pub struct UsageListOpts<'a> {
+    pub limit: usize,
+    pub offset: usize,
+    pub key_id: Option<&'a str>,
+    pub period: Option<&'a str>,
+    /// Case-insensitive substring across model / alias / provider / request / key.
+    pub q: Option<&'a str>,
+    pub sort: UsageListSort,
+}
+
+/// One page of usage rows plus total matching count.
+#[derive(Debug, Clone)]
+pub struct UsageListPage {
+    pub rows: Vec<UsageRecordRow>,
+    pub total: u64,
+    pub limit: usize,
+    pub offset: usize,
+}
+
 impl<'a> UsageRepo<'a> {
     pub fn new(pool: &'a SqlitePool) -> Self {
         Self { pool }
@@ -51,10 +99,7 @@ impl<'a> UsageRepo<'a> {
         Ok(())
     }
 
-    /// Recent usage rows, newest first.
-    ///
-    /// Optional `period` (`YYYY-MM`) scopes rows with `ts LIKE 'YYYY-MM%'`.
-    /// Optional `key_id` scopes to one downstream key.
+    /// Recent usage rows (default: newest first). Thin wrapper around [`list_page`].
     #[instrument(skip(self))]
     pub async fn list(
         &self,
@@ -62,84 +107,111 @@ impl<'a> UsageRepo<'a> {
         key_id: Option<&str>,
         period: Option<&str>,
     ) -> Result<Vec<UsageRecordRow>, StoreError> {
-        let limit = limit.clamp(1, 500) as i64;
-        let period_pat = period
+        let page = self
+            .list_page(UsageListOpts {
+                limit,
+                offset: 0,
+                key_id,
+                period,
+                q: None,
+                sort: UsageListSort::Date,
+            })
+            .await?;
+        Ok(page.rows)
+    }
+
+    /// Paginated usage list with optional key / period / free-text filter and sort.
+    ///
+    /// - `period` (`YYYY-MM`) scopes rows with `ts LIKE 'YYYY-MM%'`.
+    /// - `key_id` scopes to one downstream key.
+    /// - `q` matches (case-insensitive substring) model, alias, provider, request id, key id.
+    /// - `sort` is always descending (date / cost / tokens), with `ts` as tie-breaker.
+    #[instrument(skip(self))]
+    pub async fn list_page(&self, opts: UsageListOpts<'_>) -> Result<UsageListPage, StoreError> {
+        let limit = opts.limit.clamp(1, 500) as i64;
+        let offset = opts.offset as i64;
+        let key_id = opts.key_id.map(str::trim).filter(|s| !s.is_empty());
+        let period_pat = opts
+            .period
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(|p| format!("{p}%"));
+        let q = opts
+            .q
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
 
-        let rows = match (key_id, period_pat.as_deref()) {
-            (Some(kid), Some(pat)) => {
-                sqlx::query(
-                    r#"SELECT id, ts, request_id, downstream_key_id, alias,
-                          provider_id, provider_kind, model_id,
-                          prompt_tokens, completion_tokens, total_tokens,
-                          reasoning_tokens, cache_read_tokens, cache_write_tokens,
-                          cost_usd, stream
-                   FROM usage_records
-                   WHERE downstream_key_id = ? AND ts LIKE ?
-                   ORDER BY ts DESC
-                   LIMIT ?"#,
-                )
-                .bind(kid)
-                .bind(pat)
-                .bind(limit)
-                .fetch_all(self.pool)
-                .await
-            }
-            (Some(kid), None) => {
-                sqlx::query(
-                    r#"SELECT id, ts, request_id, downstream_key_id, alias,
-                          provider_id, provider_kind, model_id,
-                          prompt_tokens, completion_tokens, total_tokens,
-                          reasoning_tokens, cache_read_tokens, cache_write_tokens,
-                          cost_usd, stream
-                   FROM usage_records
-                   WHERE downstream_key_id = ?
-                   ORDER BY ts DESC
-                   LIMIT ?"#,
-                )
-                .bind(kid)
-                .bind(limit)
-                .fetch_all(self.pool)
-                .await
-            }
-            (None, Some(pat)) => {
-                sqlx::query(
-                    r#"SELECT id, ts, request_id, downstream_key_id, alias,
-                          provider_id, provider_kind, model_id,
-                          prompt_tokens, completion_tokens, total_tokens,
-                          reasoning_tokens, cache_read_tokens, cache_write_tokens,
-                          cost_usd, stream
-                   FROM usage_records
-                   WHERE ts LIKE ?
-                   ORDER BY ts DESC
-                   LIMIT ?"#,
-                )
-                .bind(pat)
-                .bind(limit)
-                .fetch_all(self.pool)
-                .await
-            }
-            (None, None) => {
-                sqlx::query(
-                    r#"SELECT id, ts, request_id, downstream_key_id, alias,
-                          provider_id, provider_kind, model_id,
-                          prompt_tokens, completion_tokens, total_tokens,
-                          reasoning_tokens, cache_read_tokens, cache_write_tokens,
-                          cost_usd, stream
-                   FROM usage_records
-                   ORDER BY ts DESC
-                   LIMIT ?"#,
-                )
-                .bind(limit)
-                .fetch_all(self.pool)
-                .await
-            }
-        }
-        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        let order = match opts.sort {
+            UsageListSort::Date => "ts DESC",
+            UsageListSort::Cost => "cost_usd DESC, ts DESC",
+            UsageListSort::Tokens => "total_tokens DESC, ts DESC",
+        };
 
-        Ok(rows.into_iter().map(map_row).collect())
+        // Optional filters: bind NULL / empty to skip the predicate.
+        let count_sql = r#"
+            SELECT COUNT(*) AS cnt
+            FROM usage_records
+            WHERE (?1 IS NULL OR downstream_key_id = ?1)
+              AND (?2 IS NULL OR ts LIKE ?2)
+              AND (
+                length(?3) = 0
+                OR instr(lower(ifnull(model_id, '')), ?3) > 0
+                OR instr(lower(ifnull(alias, '')), ?3) > 0
+                OR instr(lower(ifnull(provider_kind, '')), ?3) > 0
+                OR instr(lower(ifnull(provider_id, '')), ?3) > 0
+                OR instr(lower(ifnull(request_id, '')), ?3) > 0
+                OR instr(lower(ifnull(downstream_key_id, '')), ?3) > 0
+              )
+        "#;
+        let total: i64 = sqlx::query_scalar(count_sql)
+            .bind(key_id)
+            .bind(period_pat.as_deref())
+            .bind(&q)
+            .fetch_one(self.pool)
+            .await
+            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+
+        let list_sql = format!(
+            r#"
+            SELECT id, ts, request_id, downstream_key_id, alias,
+                   provider_id, provider_kind, model_id,
+                   prompt_tokens, completion_tokens, total_tokens,
+                   reasoning_tokens, cache_read_tokens, cache_write_tokens,
+                   cost_usd, stream
+            FROM usage_records
+            WHERE (?1 IS NULL OR downstream_key_id = ?1)
+              AND (?2 IS NULL OR ts LIKE ?2)
+              AND (
+                length(?3) = 0
+                OR instr(lower(ifnull(model_id, '')), ?3) > 0
+                OR instr(lower(ifnull(alias, '')), ?3) > 0
+                OR instr(lower(ifnull(provider_kind, '')), ?3) > 0
+                OR instr(lower(ifnull(provider_id, '')), ?3) > 0
+                OR instr(lower(ifnull(request_id, '')), ?3) > 0
+                OR instr(lower(ifnull(downstream_key_id, '')), ?3) > 0
+              )
+            ORDER BY {order}
+            LIMIT ?4 OFFSET ?5
+            "#
+        );
+        let rows = sqlx::query(&list_sql)
+            .bind(key_id)
+            .bind(period_pat.as_deref())
+            .bind(&q)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(self.pool)
+            .await
+            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+
+        Ok(UsageListPage {
+            rows: rows.into_iter().map(map_row).collect(),
+            total: total.max(0) as u64,
+            limit: opts.limit.clamp(1, 500),
+            offset: opts.offset,
+        })
     }
 
     /// Aggregate spend by downstream key for a calendar period (`YYYY-MM`).
@@ -529,6 +601,100 @@ mod tests {
         assert_eq!(by_key.len(), 1);
         let empty = repo.list(10, Some("other"), None).await.unwrap();
         assert!(empty.is_empty());
+
+        let page = repo
+            .list_page(UsageListOpts {
+                limit: 10,
+                offset: 0,
+                key_id: None,
+                period: None,
+                q: Some("gpt-4o"),
+                sort: UsageListSort::Date,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_page_offset_and_sort() {
+        let pool = open_db("sqlite::memory:").await.unwrap();
+        let repo = UsageRepo::new(&pool);
+
+        for (i, (model, cost, toks)) in [
+            ("cheap", 0.01, 10u32),
+            ("mid", 0.50, 100),
+            ("pricey", 2.00, 50),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut row = new_usage_record(
+                &format!("req-{i}"),
+                Some("dk1".into()),
+                None,
+                None,
+                Some("openai".into()),
+                Some(model.into()),
+                toks,
+                0,
+                toks,
+                0,
+                0,
+                0,
+                cost,
+                false,
+            );
+            // Distinct timestamps so date sort is stable.
+            row.ts = format!("2026-07-{:02}T12:00:00Z", i + 1);
+            repo.insert(&row).await.unwrap();
+        }
+
+        let by_cost = repo
+            .list_page(UsageListOpts {
+                limit: 2,
+                offset: 0,
+                key_id: None,
+                period: Some("2026-07"),
+                q: None,
+                sort: UsageListSort::Cost,
+            })
+            .await
+            .unwrap();
+        assert_eq!(by_cost.total, 3);
+        assert_eq!(by_cost.rows.len(), 2);
+        assert_eq!(by_cost.rows[0].model_id.as_deref(), Some("pricey"));
+        assert_eq!(by_cost.rows[1].model_id.as_deref(), Some("mid"));
+
+        let page2 = repo
+            .list_page(UsageListOpts {
+                limit: 2,
+                offset: 2,
+                key_id: None,
+                period: Some("2026-07"),
+                q: None,
+                sort: UsageListSort::Cost,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page2.total, 3);
+        assert_eq!(page2.rows.len(), 1);
+        assert_eq!(page2.rows[0].model_id.as_deref(), Some("cheap"));
+
+        let q = repo
+            .list_page(UsageListOpts {
+                limit: 10,
+                offset: 0,
+                key_id: None,
+                period: None,
+                q: Some("MID"),
+                sort: UsageListSort::Date,
+            })
+            .await
+            .unwrap();
+        assert_eq!(q.total, 1);
+        assert_eq!(q.rows[0].model_id.as_deref(), Some("mid"));
     }
 
     #[tokio::test]

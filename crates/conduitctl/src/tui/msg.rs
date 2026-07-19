@@ -2,7 +2,7 @@
 
 use crate::dto::{
     CooldownView, HealthResponse, KeyCreateResponse, KeyView, OAuthSessionView, PricingView,
-    ProviderSecretView, ProviderView, QuotaSnapshotView, RouteView, UsageRecordView,
+    ProviderSecretView, ProviderView, QuotaSnapshotView, RouteView, UsageListResponse,
     UsageSummaryView,
 };
 
@@ -12,9 +12,10 @@ pub enum Msg {
     Providers(Result<Vec<ProviderView>, String>),
     Routes(Result<Vec<RouteView>, String>),
     Keys(Result<Vec<KeyView>, String>),
+    /// `summary` / `recent` are independently optional so page flips can skip the rollup.
     Usage {
-        summary: Result<UsageSummaryView, String>,
-        recent: Result<Vec<UsageRecordView>, String>,
+        summary: Option<Result<UsageSummaryView, String>>,
+        recent: Option<Result<UsageListResponse, String>>,
     },
     Pricing(Result<Vec<PricingView>, String>),
     PricingOverrides(Result<Vec<PricingView>, String>),
