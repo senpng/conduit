@@ -18,6 +18,9 @@ pub struct ProviderRow {
     pub upstream_key_ref: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Soft-delete timestamp (RFC 3339). `None` = active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<String>,
 }
 
 /// Resolve the secret-backend id from a provider's `upstream_key_ref`.
@@ -93,6 +96,10 @@ pub struct RouteRow {
     pub enabled: bool,
     pub created_at: String,
     pub updated_at: String,
+    /// Soft-delete timestamp (RFC 3339). `None` = active.
+    /// Distinct from [`Self::enabled`] (operational disable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<String>,
 }
 
 // ── Downstream key ────────────────────────────────────────────────────────────
@@ -113,6 +120,10 @@ pub struct DownstreamKeyRow {
     pub enabled: bool,
     pub created_at: String,
     pub updated_at: String,
+    /// Soft-delete timestamp (RFC 3339). `None` = active.
+    /// Distinct from [`Self::enabled`] (operational disable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<String>,
 }
 
 // ── Pricing ───────────────────────────────────────────────────────────────────

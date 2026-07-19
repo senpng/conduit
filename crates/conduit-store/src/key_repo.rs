@@ -17,8 +17,8 @@ impl<'a> KeyRepo<'a> {
     pub async fn insert(&self, row: &DownstreamKeyRow) -> Result<(), StoreError> {
         sqlx::query(
             r#"INSERT INTO downstream_keys
-               (id, name, key_hash, model_whitelist, monthly_budget_usd, rate_limit_rpm, enabled, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               (id, name, key_hash, model_whitelist, monthly_budget_usd, rate_limit_rpm, enabled, created_at, updated_at, deleted_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&row.id)
         .bind(&row.name)
@@ -29,17 +29,19 @@ impl<'a> KeyRepo<'a> {
         .bind(row.enabled as i32)
         .bind(&row.created_at)
         .bind(&row.updated_at)
+        .bind(&row.deleted_at)
         .execute(self.pool)
         .await
         .map_err(|e| StoreError::Sqlx(e.to_string()))?;
         Ok(())
     }
 
+    /// Active (non-deleted) key by id.
     #[instrument(skip(self))]
     pub async fn get(&self, id: &str) -> Result<Option<DownstreamKeyRow>, StoreError> {
         let row = sqlx::query(
-            "SELECT id, name, key_hash, model_whitelist, monthly_budget_usd, rate_limit_rpm, enabled, created_at, updated_at
-             FROM downstream_keys WHERE id = ?",
+            "SELECT id, name, key_hash, model_whitelist, monthly_budget_usd, rate_limit_rpm, enabled, created_at, updated_at, deleted_at
+             FROM downstream_keys WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(id)
         .fetch_optional(self.pool)
@@ -49,12 +51,12 @@ impl<'a> KeyRepo<'a> {
         Ok(row)
     }
 
-    /// Look up a key by its BLAKE3 hash for fast authentication.
+    /// Look up an enabled, non-deleted key by its BLAKE3 hash for authentication.
     #[instrument(skip(self))]
     pub async fn get_by_hash(&self, hash: &str) -> Result<Option<DownstreamKeyRow>, StoreError> {
         let row = sqlx::query(
-            "SELECT id, name, key_hash, model_whitelist, monthly_budget_usd, rate_limit_rpm, enabled, created_at, updated_at
-             FROM downstream_keys WHERE key_hash = ? AND enabled = 1",
+            "SELECT id, name, key_hash, model_whitelist, monthly_budget_usd, rate_limit_rpm, enabled, created_at, updated_at, deleted_at
+             FROM downstream_keys WHERE key_hash = ? AND enabled = 1 AND deleted_at IS NULL",
         )
         .bind(hash)
         .fetch_optional(self.pool)
@@ -64,11 +66,12 @@ impl<'a> KeyRepo<'a> {
         Ok(row)
     }
 
+    /// Active keys only (includes disabled for console toggle).
     #[instrument(skip(self))]
     pub async fn list(&self) -> Result<Vec<DownstreamKeyRow>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, name, key_hash, model_whitelist, monthly_budget_usd, rate_limit_rpm, enabled, created_at, updated_at
-             FROM downstream_keys ORDER BY created_at DESC",
+            "SELECT id, name, key_hash, model_whitelist, monthly_budget_usd, rate_limit_rpm, enabled, created_at, updated_at, deleted_at
+             FROM downstream_keys WHERE deleted_at IS NULL ORDER BY created_at DESC",
         )
         .fetch_all(self.pool)
         .await
@@ -82,13 +85,16 @@ impl<'a> KeyRepo<'a> {
     #[instrument(skip(self))]
     pub async fn set_enabled(&self, id: &str, enabled: bool) -> Result<(), StoreError> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query("UPDATE downstream_keys SET enabled = ?, updated_at = ? WHERE id = ?")
-            .bind(enabled as i32)
-            .bind(&now)
-            .bind(id)
-            .execute(self.pool)
-            .await
-            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        sqlx::query(
+            "UPDATE downstream_keys SET enabled = ?, updated_at = ?
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(enabled as i32)
+        .bind(&now)
+        .bind(id)
+        .execute(self.pool)
+        .await
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
         Ok(())
     }
 
@@ -100,13 +106,16 @@ impl<'a> KeyRepo<'a> {
         rate_limit_rpm: Option<i64>,
     ) -> Result<(), StoreError> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query("UPDATE downstream_keys SET rate_limit_rpm = ?, updated_at = ? WHERE id = ?")
-            .bind(rate_limit_rpm)
-            .bind(&now)
-            .bind(id)
-            .execute(self.pool)
-            .await
-            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        sqlx::query(
+            "UPDATE downstream_keys SET rate_limit_rpm = ?, updated_at = ?
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(rate_limit_rpm)
+        .bind(&now)
+        .bind(id)
+        .execute(self.pool)
+        .await
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
         Ok(())
     }
 
@@ -116,7 +125,7 @@ impl<'a> KeyRepo<'a> {
         sqlx::query(
             "UPDATE downstream_keys
              SET name = ?, model_whitelist = ?, rate_limit_rpm = ?, enabled = ?, updated_at = ?
-             WHERE id = ?",
+             WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(&row.name)
         .bind(&row.model_whitelist)
@@ -130,13 +139,20 @@ impl<'a> KeyRepo<'a> {
         Ok(())
     }
 
+    /// Soft-delete: set `deleted_at`. Auth and console list ignore the key.
     #[instrument(skip(self))]
     pub async fn delete(&self, id: &str) -> Result<(), StoreError> {
-        sqlx::query("DELETE FROM downstream_keys WHERE id = ?")
-            .bind(id)
-            .execute(self.pool)
-            .await
-            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE downstream_keys SET deleted_at = ?, updated_at = ?
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(id)
+        .execute(self.pool)
+        .await
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
         Ok(())
     }
 }
@@ -154,6 +170,7 @@ fn map_key_row(r: sqlx::sqlite::SqliteRow) -> DownstreamKeyRow {
         enabled: r.get::<i32, _>("enabled") != 0,
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
+        deleted_at: r.get("deleted_at"),
     }
 }
 
@@ -176,6 +193,7 @@ mod tests {
             enabled: true,
             created_at: now.clone(),
             updated_at: now,
+            deleted_at: None,
         }
     }
 
@@ -203,13 +221,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_removes_key() {
+    async fn soft_delete_hides_key() {
         let pool = open_db("sqlite::memory:").await.unwrap();
         let repo = KeyRepo::new(&pool);
 
         repo.insert(&make_key("k3", "ghi789")).await.unwrap();
         repo.delete("k3").await.unwrap();
         assert!(repo.get("k3").await.unwrap().is_none());
+        assert!(repo.get_by_hash("ghi789").await.unwrap().is_none());
+        assert!(repo.list().await.unwrap().is_empty());
+
+        let raw: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM downstream_keys WHERE id = 'k3'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(raw.is_some());
     }
 
     #[tokio::test]

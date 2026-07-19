@@ -692,6 +692,7 @@ mod hotpath_tests {
             enabled: true,
             created_at: "now".into(),
             updated_at: "now".into(),
+            deleted_at: None,
         };
         let provider_map = std::collections::HashMap::from([(
             "codex".into(),
@@ -720,6 +721,7 @@ mod hotpath_tests {
             enabled: true,
             created_at: "now".into(),
             updated_at: "now".into(),
+            deleted_at: None,
         };
         let provider_map =
             std::collections::HashMap::from([("p1".into(), "https://api.example".into())]);

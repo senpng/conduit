@@ -714,6 +714,7 @@ async fn persist_credential(
             .map(|r| r.created_at.clone())
             .unwrap_or_else(|| now.clone()),
         updated_at: now,
+        deleted_at: None,
     };
 
     if existing.is_some() {

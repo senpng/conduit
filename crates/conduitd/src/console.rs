@@ -82,6 +82,7 @@ pub async fn create_provider(
         upstream_key_ref: upstream_key_ref.clone(),
         created_at: now.clone(),
         updated_at: now,
+        deleted_at: None,
     };
 
     let repo = ProviderRepo::new(&state.pool);
@@ -94,8 +95,8 @@ pub async fn create_provider(
         let bytes: Vec<u8> = api_key.into_bytes();
         let secret = secrecy::SecretVec::new(bytes);
         if let Err(e) = state.secret_backend.put("upstream_key", &id, secret).await {
-            // Roll back: delete the provider row we just inserted
-            let _ = repo.delete(&id).await;
+            // Roll back incomplete create (hard delete — never partially exposed).
+            let _ = repo.hard_delete(&id).await;
             return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to store secret: {}", e),
@@ -149,10 +150,15 @@ pub async fn delete_provider(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let repo = ProviderRepo::new(&state.pool);
+    // Soft-delete: keep the row and secret for audit / potential restore.
     match repo.delete(&id).await {
         Ok(()) => {
-            // Best-effort: remove the secret too
-            let _ = state.secret_backend.delete("upstream_key", &id).await;
+            if let Err(e) = reload_routing_table(&state).await {
+                tracing::warn!(
+                    "provider soft-deleted but routing table reload failed: {}",
+                    e
+                );
+            }
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => internal(e).into_response(),
@@ -335,6 +341,7 @@ pub async fn create_route(
         enabled: true,
         created_at: now.clone(),
         updated_at: now,
+        deleted_at: None,
     };
 
     let repo = RouteRepo::new(&state.pool);
@@ -513,6 +520,7 @@ pub async fn create_key(
         enabled: true,
         created_at: now.clone(),
         updated_at: now.clone(),
+        deleted_at: None,
     };
 
     let repo = KeyRepo::new(&state.pool);
