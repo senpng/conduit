@@ -614,21 +614,21 @@ pub async fn messages(
             let resp_id = Ulid::new().to_string();
             let model = alias.clone();
             // CLIProxyAPI-parity stateful Anthropic SSE lifecycle.
+            // Do not pre-emit message_start with input_tokens=0 — Claude Code
+            // reads context from message_start.usage.input_tokens. Anthropic
+            // upstream yields a usage-only IR chunk first; the encoder stamps
+            // real tokens into message_start on that chunk (or on first content).
             let sse_stream = async_stream::stream! {
                 let mut encoder = conduit_codec::anthropic::stream::AnthropicStreamEncoder::new(
                     resp_id.clone(),
                     model.clone(),
                 );
-                // Immediate message_start so clients don't hang waiting for first token.
-                if let Some(start) = encoder.ensure_message_start(0) {
-                    yield Ok::<_, std::convert::Infallible>(start);
-                }
                 let mut stream = stream;
                 while let Some(result) = stream.next().await {
                     match result {
                         Ok(chunk) => {
                             for frame in encoder.push(&chunk) {
-                                yield Ok(frame);
+                                yield Ok::<_, std::convert::Infallible>(frame);
                             }
                         }
                         Err(e) => {

@@ -7,8 +7,9 @@ use conduit_ir::{
     error::CodecError,
 };
 pub use encoder::{
-    encode_message_start_frame, encode_message_stop_frame, finish_reason_to_anthropic,
-    AnthropicStreamEncoder, GPT_THINKING_SIGNATURE,
+    anthropic_usage_json, encode_message_start_frame, encode_message_start_simple,
+    encode_message_stop_frame, finish_reason_to_anthropic, AnthropicStreamEncoder,
+    GPT_THINKING_SIGNATURE,
 };
 use serde_json::Value;
 pub use state::{decode_event, AnthropicStreamState};
@@ -100,13 +101,10 @@ pub fn encode_chunk(chunk: &CanonicalChunk, _resp_id: &str) -> Option<String> {
         let usage_val = chunk
             .usage
             .as_ref()
-            .map(|u| {
-                json!({
-                    "input_tokens": u.prompt_tokens,
-                    "output_tokens": u.completion_tokens,
-                })
-            })
-            .unwrap_or(json!({"input_tokens": 0, "output_tokens": 0}));
+            .map(anthropic_usage_json)
+            .unwrap_or_else(|| {
+                anthropic_usage_json(&conduit_ir::canonical::Usage::default())
+            });
         let data = json!({
             "type": "message_delta",
             "delta": {"stop_reason": stop_str, "stop_sequence": null},
@@ -130,7 +128,7 @@ pub fn encode_chunk(chunk: &CanonicalChunk, _resp_id: &str) -> Option<String> {
 }
 
 pub fn encode_message_start(resp_id: &str, model: &str, prompt_tokens: u32) -> String {
-    encode_message_start_frame(resp_id, model, prompt_tokens)
+    encode_message_start_simple(resp_id, model, prompt_tokens)
 }
 
 pub fn encode_message_stop() -> &'static str {

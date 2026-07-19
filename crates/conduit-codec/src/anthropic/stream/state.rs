@@ -50,13 +50,20 @@ impl AnthropicStreamState {
         let msg = &data["message"];
         self.model = msg["model"].as_str().unwrap_or("").to_string();
 
-        // Seed usage from message_start (input_tokens arrive here).
+        // Seed usage from message_start (input_tokens / cache arrive here).
         let u = decode_usage(&msg["usage"]);
         self.usage.prompt_tokens += u.prompt_tokens;
         self.usage.cache_read_tokens += u.cache_read_tokens;
         self.usage.cache_write_tokens += u.cache_write_tokens;
 
-        Ok(vec![CanonicalChunk::default()])
+        // Emit a usage-only IR chunk so re-encoders can stamp real
+        // `input_tokens` into the client-facing `message_start` (Claude Code
+        // reads context from message_start.usage.input_tokens).
+        let early: conduit_ir::canonical::Usage = self.usage.clone().into();
+        Ok(vec![CanonicalChunk {
+            usage: Some(early),
+            ..Default::default()
+        }])
     }
 
     fn on_content_block_start(&mut self, data: &Value) -> Result<Vec<CanonicalChunk>, CodecError> {
@@ -156,12 +163,25 @@ impl AnthropicStreamState {
         let stop_reason = decode_finish_reason(data["delta"]["stop_reason"].as_str());
 
         // Accumulate output usage from message_delta.
+        // Official Anthropic only puts output_tokens here; some proxies also
+        // echo input_tokens — adopt prompt if we never saw message_start.
         if let Some(u_val) = data.get("usage") {
             let u = decode_usage(u_val);
             self.usage.completion_tokens += u.completion_tokens;
-            // message_delta may also contain cache tokens for output
-            self.usage.cache_read_tokens += u.cache_read_tokens;
-            self.usage.cache_write_tokens += u.cache_write_tokens;
+            if self.usage.prompt_tokens == 0 && u.prompt_tokens > 0 {
+                self.usage.prompt_tokens = u.prompt_tokens;
+            }
+            // message_delta may also contain cache tokens
+            if u.cache_read_tokens > 0 {
+                // Prefer explicit delta values when present (avoid double-count
+                // when start already seeded the same counters).
+                if self.usage.cache_read_tokens == 0 {
+                    self.usage.cache_read_tokens = u.cache_read_tokens;
+                }
+            }
+            if u.cache_write_tokens > 0 && self.usage.cache_write_tokens == 0 {
+                self.usage.cache_write_tokens = u.cache_write_tokens;
+            }
         }
 
         let usage: conduit_ir::canonical::Usage = self.usage.clone().into();
@@ -201,19 +221,51 @@ mod tests {
     }
 
     #[test]
-    fn message_start_emits_chunk() {
+    fn message_start_emits_usage_chunk() {
         let mut s = make_state();
         let data = json!({
             "type": "message_start",
             "message": {
                 "id": "msg_1", "model": "claude-3-5-sonnet", "role": "assistant",
                 "content": [], "stop_reason": null,
-                "usage": {"input_tokens": 25, "output_tokens": 0}
+                "usage": {
+                    "input_tokens": 25,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 10,
+                    "cache_creation_input_tokens": 5
+                }
             }
         });
         let chunks = s.process_event("message_start", &data).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(s.usage.prompt_tokens, 25);
+        let u = chunks[0].usage.as_ref().expect("usage-only chunk");
+        assert_eq!(u.prompt_tokens, 25);
+        assert_eq!(u.cache_read_tokens, 10);
+        assert_eq!(u.cache_write_tokens, 5);
+    }
+
+    #[test]
+    fn message_start_then_delta_preserves_input_tokens() {
+        let mut s = make_state();
+        let start = json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_1", "model": "claude-3-5-sonnet", "role": "assistant",
+                "content": [], "stop_reason": null,
+                "usage": {"input_tokens": 100, "output_tokens": 0}
+            }
+        });
+        let _ = s.process_event("message_start", &start).unwrap();
+        let delta = json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "usage": {"output_tokens": 42}
+        });
+        let chunks = s.process_event("message_delta", &delta).unwrap();
+        let u = chunks[0].usage.as_ref().unwrap();
+        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.completion_tokens, 42);
     }
 
     #[test]

@@ -72,17 +72,38 @@ impl AnthropicStreamEncoder {
         }
     }
 
-    /// Emit `message_start` if not already sent. Call at stream open or let
-    /// [`Self::push`] emit it on the first contentful chunk.
+    /// Emit `message_start` if not already sent.
+    ///
+    /// Prefer tokens from [`Self::pending_usage`] (seeded by an early
+    /// Anthropic `message_start` usage chunk) so Claude Code context is not 0.
+    /// `prompt_tokens` is a fallback when usage is still unknown (e.g. OpenAI
+    /// upstream only reports tokens at the end).
     pub fn ensure_message_start(&mut self, prompt_tokens: u32) -> Option<String> {
         if self.message_started {
             return None;
         }
         self.message_started = true;
+        let (prompt, cache_read, cache_write) = self
+            .pending_usage
+            .as_ref()
+            .map(|u| {
+                (
+                    if u.prompt_tokens > 0 {
+                        u.prompt_tokens
+                    } else {
+                        prompt_tokens
+                    },
+                    u.cache_read_tokens,
+                    u.cache_write_tokens,
+                )
+            })
+            .unwrap_or((prompt_tokens, 0, 0));
         Some(encode_message_start_frame(
             &self.message_id,
             &self.model,
-            prompt_tokens,
+            prompt,
+            cache_read,
+            cache_write,
         ))
     }
 
@@ -90,11 +111,8 @@ impl AnthropicStreamEncoder {
     pub fn push(&mut self, chunk: &CanonicalChunk) -> Vec<String> {
         let mut out = Vec::new();
 
-        if let Some(frame) = self.ensure_message_start(0) {
-            out.push(frame);
-        }
-
-        // Usage-only (no finish yet) — stash for message_delta.
+        // Usage-only (no finish yet) — stash for message_start / message_delta.
+        // Must run *before* ensure_message_start so input_tokens are not zeroed.
         if chunk.finish_reason.is_none()
             && chunk.delta.is_none()
             && chunk.block_kind.is_none()
@@ -102,7 +120,11 @@ impl AnthropicStreamEncoder {
             && chunk.tool_name.is_none()
         {
             if let Some(u) = &chunk.usage {
-                self.pending_usage = Some(u.clone());
+                self.merge_pending_usage(u);
+                // Emit message_start with real input_tokens as soon as we know them.
+                if let Some(frame) = self.ensure_message_start(u.prompt_tokens) {
+                    out.push(frame);
+                }
                 // If we already saw finish_reason, emit message_delta now.
                 if self.finish_reason.is_some() && !self.message_delta_sent {
                     self.close_open_blocks(&mut out);
@@ -111,6 +133,10 @@ impl AnthropicStreamEncoder {
                 }
                 return out;
             }
+        }
+
+        if let Some(frame) = self.ensure_message_start(0) {
+            out.push(frame);
         }
 
         // Explicit content_block_stop from Anthropic-native IR (all None except block_index).
@@ -270,7 +296,7 @@ impl AnthropicStreamEncoder {
                 self.finish_reason = Some(fr.clone());
             }
             if let Some(u) = &chunk.usage {
-                self.pending_usage = Some(u.clone());
+                self.merge_pending_usage(u);
             }
             self.close_open_blocks(&mut out);
             // Emit message_delta when we have usage or immediately (CLIProxyAPI
@@ -301,6 +327,30 @@ impl AnthropicStreamEncoder {
         }
         self.emit_message_stop(&mut out);
         out
+    }
+
+    fn merge_pending_usage(&mut self, u: &Usage) {
+        match &mut self.pending_usage {
+            Some(prev) => {
+                if u.prompt_tokens > 0 {
+                    prev.prompt_tokens = u.prompt_tokens;
+                }
+                if u.completion_tokens > 0 {
+                    prev.completion_tokens = u.completion_tokens;
+                }
+                if u.cache_read_tokens > 0 {
+                    prev.cache_read_tokens = u.cache_read_tokens;
+                }
+                if u.cache_write_tokens > 0 {
+                    prev.cache_write_tokens = u.cache_write_tokens;
+                }
+                if u.reasoning_tokens > 0 {
+                    prev.reasoning_tokens = u.reasoning_tokens;
+                }
+                prev.total_tokens = prev.prompt_tokens + prev.completion_tokens;
+            }
+            None => self.pending_usage = Some(u.clone()),
+        }
     }
 
     fn handle_tool_start(&mut self, chunk: &CanonicalChunk, out: &mut Vec<String>) {
@@ -469,18 +519,16 @@ impl AnthropicStreamEncoder {
         }
         let fr = self.finish_reason.clone().unwrap_or(FinishReason::Stop);
         let stop = finish_reason_to_anthropic(&fr);
-        let (input, output) = self
+        let usage = self
             .pending_usage
-            .as_ref()
-            .map(|u| (u.prompt_tokens, u.completion_tokens))
-            .unwrap_or((0, 0));
+            .clone()
+            .unwrap_or_default();
+        // Include input_tokens (non-standard vs pure Anthropic delta, which is
+        // often output-only) so clients that miss message_start still get context.
         let data = json!({
             "type": "message_delta",
             "delta": {"stop_reason": stop, "stop_sequence": null},
-            "usage": {
-                "input_tokens": input,
-                "output_tokens": output,
-            }
+            "usage": anthropic_usage_json(&usage),
         });
         out.push(format!("event: message_delta\ndata: {data}\n\n"));
         self.message_delta_sent = true;
@@ -497,7 +545,31 @@ impl AnthropicStreamEncoder {
 
 // ── Frame builders ──────────────────────────────────────────────────────────
 
-pub fn encode_message_start_frame(resp_id: &str, model: &str, prompt_tokens: u32) -> String {
+/// Build Anthropic `usage` object (input/output + cache fields).
+pub fn anthropic_usage_json(u: &Usage) -> serde_json::Value {
+    json!({
+        "input_tokens": u.prompt_tokens,
+        "output_tokens": u.completion_tokens,
+        "cache_creation_input_tokens": u.cache_write_tokens,
+        "cache_read_input_tokens": u.cache_read_tokens,
+    })
+}
+
+pub fn encode_message_start_frame(
+    resp_id: &str,
+    model: &str,
+    prompt_tokens: u32,
+    cache_read_tokens: u32,
+    cache_write_tokens: u32,
+) -> String {
+    let usage = Usage {
+        prompt_tokens,
+        completion_tokens: 0,
+        total_tokens: prompt_tokens,
+        reasoning_tokens: 0,
+        cache_read_tokens,
+        cache_write_tokens,
+    };
     let data = json!({
         "type": "message_start",
         "message": {
@@ -508,10 +580,15 @@ pub fn encode_message_start_frame(resp_id: &str, model: &str, prompt_tokens: u32
             "model": model,
             "stop_reason": null,
             "stop_sequence": null,
-            "usage": {"input_tokens": prompt_tokens, "output_tokens": 0},
+            "usage": anthropic_usage_json(&usage),
         }
     });
     format!("event: message_start\ndata: {data}\n\n")
+}
+
+/// Convenience: `message_start` with prompt tokens only (no cache).
+pub fn encode_message_start_simple(resp_id: &str, model: &str, prompt_tokens: u32) -> String {
+    encode_message_start_frame(resp_id, model, prompt_tokens, 0, 0)
 }
 
 pub fn encode_message_stop_frame() -> &'static str {
@@ -647,6 +724,97 @@ mod tests {
         let delta = joined.find("text_delta").unwrap();
         let stop = joined.find("content_block_stop").unwrap();
         assert!(start < delta && delta < stop);
+    }
+
+    #[test]
+    fn early_usage_chunk_sets_message_start_input_tokens() {
+        let mut enc = AnthropicStreamEncoder::new("msg_ctx", "claude-sonnet-4");
+        let early = CanonicalChunk {
+            usage: Some(Usage {
+                prompt_tokens: 18616,
+                completion_tokens: 0,
+                total_tokens: 18616,
+                cache_read_tokens: 1200,
+                cache_write_tokens: 80,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let frames: Vec<String> = enc
+            .push(&early)
+            .into_iter()
+            .chain(enc.push(&text_chunk("hi")))
+            .chain(enc.push(&finish(FinishReason::Stop)))
+            .collect();
+        let joined = frames.join("");
+        // Claude Code reads context from message_start.usage.input_tokens.
+        let start_pos = joined.find("event: message_start").expect("message_start");
+        let start_slice = &joined[start_pos..];
+        let data_line = start_slice
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .expect("data line");
+        let val: serde_json::Value =
+            serde_json::from_str(data_line.strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(
+            val["message"]["usage"]["input_tokens"].as_u64().unwrap(),
+            18616
+        );
+        assert_eq!(
+            val["message"]["usage"]["cache_read_input_tokens"]
+                .as_u64()
+                .unwrap(),
+            1200
+        );
+        assert_eq!(
+            val["message"]["usage"]["cache_creation_input_tokens"]
+                .as_u64()
+                .unwrap(),
+            80
+        );
+        // message_start must keep the early input count even if a later finish
+        // chunk revises usage for message_delta.
+        assert!(
+            joined.contains("\"input_tokens\":18616"),
+            "expected early input_tokens in stream:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn finish_without_prompt_does_not_clobber_early_input() {
+        let mut enc = AnthropicStreamEncoder::new("msg_1", "m");
+        let early = CanonicalChunk {
+            usage: Some(Usage {
+                prompt_tokens: 50,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Finish with only output tokens (prompt=0), as some OpenAI frames do mid-stream.
+        let fin = CanonicalChunk::finish(
+            FinishReason::Stop,
+            Some(Usage {
+                prompt_tokens: 0,
+                completion_tokens: 9,
+                total_tokens: 9,
+                ..Default::default()
+            }),
+        );
+        let joined: String = enc
+            .push(&early)
+            .into_iter()
+            .chain(enc.push(&text_chunk("x")))
+            .chain(enc.push(&fin))
+            .collect();
+        let delta_pos = joined.find("event: message_delta").unwrap();
+        let delta_data = joined[delta_pos..]
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .unwrap();
+        let val: serde_json::Value =
+            serde_json::from_str(delta_data.strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(val["usage"]["input_tokens"].as_u64().unwrap(), 50);
+        assert_eq!(val["usage"]["output_tokens"].as_u64().unwrap(), 9);
     }
 
     #[test]

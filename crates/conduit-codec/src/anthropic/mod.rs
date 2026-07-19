@@ -85,10 +85,7 @@ impl WireCodec for AnthropicCodec {
             "model": resp.model,
             "stop_reason": stop_reason,
             "stop_sequence": null,
-            "usage": {
-                "input_tokens": resp.usage.prompt_tokens,
-                "output_tokens": resp.usage.completion_tokens,
-            }
+            "usage": stream::anthropic_usage_json(&resp.usage),
         })
     }
 
@@ -97,17 +94,26 @@ impl WireCodec for AnthropicCodec {
     }
 
     fn decode_chunk(data: &str) -> Result<(Vec<CanonicalChunk>, LossReport), CodecError> {
+        let mut state = stream::AnthropicStreamState::new();
+        Self::decode_chunk_stateful(&mut state, data)
+    }
+
+    type StreamState = stream::AnthropicStreamState;
+
+    fn decode_chunk_stateful(
+        state: &mut Self::StreamState,
+        data: &str,
+    ) -> Result<(Vec<CanonicalChunk>, LossReport), CodecError> {
         if data.trim().is_empty() {
             return Ok((vec![], LossReport::default()));
         }
         let val: Value = serde_json::from_str(data.trim())?;
+        // Prefer JSON `type` (Anthropic puts it in the data payload). Fall back
+        // is unused today because upstream SSE only forwards data lines.
         let event_type = val["type"].as_str().unwrap_or("");
-        let mut state = stream::AnthropicStreamState::new();
-        let chunks = stream::decode_event(&mut state, event_type, &val)?;
+        let chunks = stream::decode_event(state, event_type, &val)?;
         Ok((chunks, LossReport::default()))
     }
-
-    type StreamState = ();
 
     fn error_body(type_: &str, _code: Option<&str>, message: &str) -> Value {
         let normalized = match type_ {
@@ -173,6 +179,8 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                cache_read_tokens: 4,
+                cache_write_tokens: 2,
                 ..Default::default()
             },
             created_at: chrono::Utc::now(),
@@ -181,6 +189,108 @@ mod tests {
         assert_eq!(wire["id"].as_str().unwrap(), "msg_1");
         assert_eq!(wire["stop_reason"].as_str().unwrap(), "end_turn");
         assert_eq!(wire["content"][0]["text"].as_str().unwrap(), "Hello!");
+        assert_eq!(wire["usage"]["input_tokens"].as_u64().unwrap(), 10);
+        assert_eq!(wire["usage"]["output_tokens"].as_u64().unwrap(), 5);
+        assert_eq!(
+            wire["usage"]["cache_read_input_tokens"].as_u64().unwrap(),
+            4
+        );
+        assert_eq!(
+            wire["usage"]["cache_creation_input_tokens"]
+                .as_u64()
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn stream_stateful_decode_preserves_input_tokens_and_reencodes() {
+        use serde_json::json;
+
+        let frames = [
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_up",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "claude-sonnet-4",
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {
+                        "input_tokens": 1234,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": 100,
+                        "cache_creation_input_tokens": 0
+                    }
+                }
+            }),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "ok"}
+            }),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                "usage": {"output_tokens": 7}
+            }),
+            json!({"type": "message_stop"}),
+        ];
+
+        let mut state = stream::AnthropicStreamState::new();
+        let mut enc = AnthropicStreamEncoder::new("msg_client", "claude-sonnet-4");
+        let mut out = String::new();
+        for frame in frames {
+            let data = serde_json::to_string(&frame).unwrap();
+            let (chunks, _) = AnthropicCodec::decode_chunk_stateful(&mut state, &data).unwrap();
+            for chunk in chunks {
+                for f in enc.push(&chunk) {
+                    out.push_str(&f);
+                }
+            }
+        }
+        for f in enc.finish() {
+            out.push_str(&f);
+        }
+
+        let start_pos = out.find("event: message_start").expect("client message_start");
+        let start_data = out[start_pos..]
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .unwrap();
+        let start_val: Value =
+            serde_json::from_str(start_data.strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(
+            start_val["message"]["usage"]["input_tokens"]
+                .as_u64()
+                .unwrap(),
+            1234,
+            "Claude Code context depends on message_start input_tokens; got:\n{out}"
+        );
+        assert_eq!(
+            start_val["message"]["usage"]["cache_read_input_tokens"]
+                .as_u64()
+                .unwrap(),
+            100
+        );
+
+        let delta_pos = out.find("event: message_delta").unwrap();
+        let delta_data = out[delta_pos..]
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .unwrap();
+        let delta_val: Value =
+            serde_json::from_str(delta_data.strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(delta_val["usage"]["input_tokens"].as_u64().unwrap(), 1234);
+        assert_eq!(delta_val["usage"]["output_tokens"].as_u64().unwrap(), 7);
     }
 
     #[test]
