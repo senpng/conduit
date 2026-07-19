@@ -14,10 +14,7 @@ secrecy = { version = "0.8", features = ["serde"] }
 zeroize = { version = "1", features = ["derive"] }
 argon2 = "0.5"
 aes-gcm = "0.10"
-keyring = { version = "2" }
 rand = "0.8"
-hex = "0.4"
-base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]

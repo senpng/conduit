@@ -40,6 +40,7 @@ pub enum Command {
     /// Key management
     Key(cmd::key::KeyArgs),
     /// OAuth login (Claude / Codex / Grok)
+    #[command(name = "oauth")]
     OAuth(cmd::oauth::OAuthArgs),
     /// Check daemon health
     Status,

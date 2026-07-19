@@ -200,9 +200,6 @@ Conduit works without a configuration file. To override the defaults, create `co
 [gateway]
 port = 4000
 console_port = 4001
-
-[security]
-backend = "keychain"
 ```
 
 ### Environment variables
@@ -212,6 +209,7 @@ backend = "keychain"
 | `CONDUIT_CONFIG` | `conduitd` | `conduit.toml` | Configuration file path |
 | `CONDUIT_PORT` | `conduitd` | `4000` | Gateway port override |
 | `CONDUIT_DATA_DIR` | `conduitd` | `~/.conduit` | Local state directory |
+| `CONDUIT_MASTER_PASSWORD` | `conduitd` | _(empty)_ | Master password for secret encryption |
 | `CONDUIT_LOG` | `conduitd` | `info` | Log filter, for example `debug` |
 | `CONDUIT_LOG_FORMAT` | `conduitd` | `pretty` | `pretty` or `json` |
 | `CONDUIT_CONSOLE_ADDR` | `conduitctl` | `http://127.0.0.1:4001` | Console API base URL |
@@ -229,9 +227,9 @@ By default, Conduit stores its state under `~/.conduit`:
 | --- | --- |
 | Providers, routes, keys | SQLite |
 | Usage records | SQLite |
-| Provider secrets | Selected secret backend plus the documented local mirror behavior |
+| Provider secrets | AES-256-GCM files under `{data_dir}/secrets/` (Argon2id KEK from master password) |
 
-Secret handling currently makes an explicit local-first trade-off: the keychain-backed path mirrors secrets to a mode-`0600` file so the daemon can operate without interactive keychain prompts. Treat the data directory as sensitive and read the full [security model](ARCHITECTURE.md#security-model) before evaluating Conduit for production use.
+Set `CONDUIT_MASTER_PASSWORD` (or `--master-password`) before storing production API keys. An empty password is allowed for local development only and is warned at startup. Treat the data directory as sensitive and read the full [security model](ARCHITECTURE.md#security-model).
 
 ## Development
 

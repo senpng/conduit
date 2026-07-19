@@ -512,7 +512,7 @@ async fn persist_credential(
         .clone()
         .unwrap_or_else(|| kind.default_base_url().to_string());
     let now = Utc::now().to_rfc3339();
-    let upstream_key_ref = format!("keyring://upstream_key/{id}");
+    let upstream_key_ref = format!("secret://upstream_key/{id}");
 
     let repo = ProviderRepo::new(&state.pool);
     let existing = repo

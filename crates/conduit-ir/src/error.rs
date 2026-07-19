@@ -86,7 +86,7 @@ pub enum CodecError {
 // Secret errors — returned by secret backends
 // ---------------------------------------------------------------------------
 
-/// Errors from secret storage backends (keyring, env, vault, etc.).
+/// Errors from secret storage backends (encrypted files, etc.).
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SecretError {

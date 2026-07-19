@@ -41,7 +41,6 @@ secrecy = { version = "0.8", features = ["serde"] }
 zeroize = { version = "1", features = ["derive"] }
 argon2 = "0.5"
 aes-gcm = "0.10"
-keyring = { version = "2" }
 age = { version = "0.10", features = ["armor"] }
 
 # Error handling

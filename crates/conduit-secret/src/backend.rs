@@ -4,22 +4,12 @@ use secrecy::SecretVec;
 
 /// The security tier of a secret backend.
 ///
-/// Ordered weakest-last is intentional: `Hardware` is the strongest tier,
-/// `PlaintextFile` the weakest. Callers that surface the level to the user
-/// must treat `PlaintextFile` as "no encryption at rest".
+/// Currently only master-password encrypted files are supported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecurityLevel {
-    /// S1: OS keychain — hardware-backed where available (Secure Enclave on macOS,
-    /// Windows DPAPI + Credential Manager, libsecret on Linux).
-    Hardware,
-    /// S2: AES-256-GCM encrypted file, key derived from a user-provided master password
-    /// via Argon2id.
+    /// AES-256-GCM encrypted file, key derived from a user-provided master
+    /// password via Argon2id.
     MasterPassword,
-    /// S0: plaintext (base64) file mirror, protected only by filesystem
-    /// permissions (mode 0600). **No encryption at rest.** This is the effective
-    /// level whenever secrets are read back from an unencrypted on-disk mirror,
-    /// regardless of what the primary (keychain) backend would report.
-    PlaintextFile,
 }
 
 /// Core secret-storage contract.  All implementations must be `Send + Sync` for

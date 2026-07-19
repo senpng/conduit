@@ -38,7 +38,12 @@ use crate::{
     usage_wire::make_record_fn,
 };
 
-pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
+pub async fn run(
+    cfg: Config,
+    port: u16,
+    data_dir: PathBuf,
+    master_password: Option<secrecy::SecretString>,
+) -> Result<()> {
     // Ensure data directories exist
     std::fs::create_dir_all(&data_dir)?;
 
@@ -46,9 +51,9 @@ pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
     let db_url = format!("sqlite:///{}", data_dir.join("conduit.db").display());
     let pool = conduit_store::open_db(&db_url).await?;
 
-    // ── Secret backend (S1 keychain → S2 master password fallback) ───────────
-    let backend_result = conduit_secret::build_backend("conduit", &data_dir, None).await;
-    if let Some(ref w) = backend_result.downgrade_warning {
+    // ── Secret backend (master-password AES-256-GCM) ─────────────────────────
+    let backend_result = conduit_secret::build_backend(&data_dir, master_password);
+    if let Some(ref w) = backend_result.warning {
         warn!("{}", w);
     }
     let secret_backend = backend_result.backend;
@@ -134,7 +139,7 @@ pub async fn run(cfg: Config, port: u16, data_dir: PathBuf) -> Result<()> {
                     tracing::warn!(
                         key_id = %key_id,
                         "credential resolve timed out after 25s \
-                         (macOS Keychain ACL? re-run: conduitctl oauth start <provider>)"
+                         (re-run: conduitctl oauth start <provider>)"
                     );
                     Err(GatewayError::Internal(format!(
                         "credential resolve timed out for upstream_key_id '{key_id}'"

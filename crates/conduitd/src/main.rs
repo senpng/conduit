@@ -23,6 +23,11 @@ pub struct Args {
     #[arg(long, env = "CONDUIT_DATA_DIR", default_value = "~/.conduit")]
     pub data_dir: std::path::PathBuf,
 
+    /// Master password for AES-256-GCM secret encryption (Argon2id KEK).
+    /// Prefer the env var so the password is not visible in process listings.
+    #[arg(long, env = "CONDUIT_MASTER_PASSWORD")]
+    pub master_password: Option<String>,
+
     /// Log format: "json" or "pretty"
     #[arg(long, env = "CONDUIT_LOG_FORMAT", default_value = "pretty")]
     pub log_format: String,
@@ -47,8 +52,11 @@ async fn main() -> Result<()> {
 
     let port = args.port.unwrap_or(cfg.gateway.port);
     let data_dir = expand_tilde(&args.data_dir);
+    let master_password = args
+        .master_password
+        .map(|s| secrecy::SecretString::new(s));
 
-    server::run(cfg, port, data_dir).await
+    server::run(cfg, port, data_dir, master_password).await
 }
 
 fn init_tracing(format: &str, level: &str) {

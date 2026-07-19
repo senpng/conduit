@@ -72,7 +72,7 @@ pub async fn create_provider(
     }
     let id = Ulid::new().to_string();
     let now = Utc::now().to_rfc3339();
-    let upstream_key_ref = format!("keyring://upstream_key/{}", id);
+    let upstream_key_ref = format!("secret://upstream_key/{}", id);
 
     let row = ProviderRow {
         id: id.clone(),

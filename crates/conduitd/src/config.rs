@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub gateway: GatewayConfig,
-    pub security: SecurityConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,21 +13,12 @@ pub struct GatewayConfig {
     pub console_port: u16,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SecurityConfig {
-    /// "keychain" | "master_password"
-    pub backend: String,
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
             gateway: GatewayConfig {
                 port: 4000,
                 console_port: 4001,
-            },
-            security: SecurityConfig {
-                backend: "keychain".to_string(),
             },
         }
     }
@@ -59,11 +49,23 @@ mod tests {
 [gateway]
 port = 4000
 console_port = 4001
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.gateway.port, 4000);
+    }
+
+    #[test]
+    fn ignores_legacy_security_section() {
+        // Older configs may still contain [security] backend = "keychain".
+        // Serde ignores unknown tables by default.
+        let toml = r#"
+[gateway]
+port = 4000
+console_port = 4001
 [security]
 backend = "keychain"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.gateway.port, 4000);
-        assert_eq!(cfg.security.backend, "keychain");
     }
 }

@@ -35,8 +35,9 @@ const ARGON2_PARALLELISM: u32 = 1;
 
 // ── Backend ──────────────────────────────────────────────────────────────────
 
-/// S2 backend: AES-256-GCM encryption of each secret, with the key encryption
-/// key (KEK) derived from a user-provided master password via Argon2id.
+/// Master-password backend: AES-256-GCM encryption of each secret, with the
+/// key encryption key (KEK) derived from a user-provided master password via
+/// Argon2id.
 ///
 /// On-disk layout for each secret at `{data_dir}/secrets/{scope}/{id}.enc`:
 /// ```text
