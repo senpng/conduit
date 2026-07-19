@@ -1,88 +1,160 @@
 //! Usage ledger wiring used by the daemon quota engine.
 //!
-//! Records every finished request (tokens, cost, outcome, timing, routing) into
-//! `usage_records` and optional per-try rows into `usage_attempts`.
+//! Gateway hot path **enqueues** finished requests; a single background worker
+//! batches inserts into `usage_records` / `usage_attempts`. That keeps SQLite
+//! writes off the request path and avoids connection-pool stampede under load.
 
 use std::sync::Arc;
 
 use conduit_ir::error::QuotaError;
 use conduit_quota::check::{QuotaRecordRequest, RecordFn};
 use conduit_store::{new_usage_attempt, new_usage_record, StorePool, UsageRepo};
+use tokio::sync::mpsc;
+use tracing::warn;
+
+/// Bound on in-flight ledger records waiting for the writer.
+const USAGE_QUEUE_CAP: usize = 16_384;
+/// Max rows flushed per SQLite transaction.
+const USAGE_BATCH_MAX: usize = 64;
 
 /// Build the `record_fn` injected into [`InMemoryQuotaEngine`](conduit_quota::InMemoryQuotaEngine).
 ///
-/// Always inserts a main row (including zero-token / error outcomes). DB errors
-/// fail closed (propagated as [`QuotaError::Backend`]).
+/// Enqueues the record and returns immediately. Persistence errors are logged
+/// by the background worker (hot path must not block on SQLite under load).
 pub fn make_record_fn(pool: StorePool) -> RecordFn {
+    let (tx, rx) = mpsc::channel::<QuotaRecordRequest>(USAGE_QUEUE_CAP);
+    tokio::spawn(usage_writer_loop(pool, rx));
+
     Arc::new(move |req: QuotaRecordRequest| {
-        let pool = pool.clone();
+        let tx = tx.clone();
         Box::pin(async move {
-            let key_id = {
-                let id = req.downstream_key_id.trim();
-                if id.is_empty() || id == "_anonymous" || id == "_local" {
-                    None
-                } else {
-                    Some(id.to_string())
-                }
-            };
-
-            let mut row = new_usage_record(
-                req.request_id.clone(),
-                key_id,
-                req.alias,
-                req.provider_id,
-                req.provider_kind,
-                req.model_id,
-                req.prompt_tokens,
-                req.completion_tokens,
-                req.total_tokens,
-                req.reasoning_tokens,
-                req.cache_read_tokens,
-                req.cache_write_tokens,
-                req.cost_usd,
-                req.stream,
-            );
-            row.status = req.status;
-            row.error_class = req.error_class;
-            row.http_status = req.http_status;
-            row.finish_reason = req.finish_reason;
-            row.duration_ms = req.duration_ms;
-            row.ttfb_ms = req.ttfb_ms;
-            row.route_strategy = req.route_strategy;
-            row.attempt_no = req.attempt_no;
-            row.attempt_count = req.attempt_count.max(1);
-            row.session_id = req.session_id;
-            row.affinity_hit = req.affinity_hit;
-            row.pool_id = req.pool_id;
-            row.selected_reason = req.selected_reason;
-
-            let repo = UsageRepo::new(&pool);
-            repo.insert(&row)
-                .await
-                .map_err(|e| QuotaError::Backend(format!("usage record: {e}")))?;
-
-            for a in req.attempts {
-                let attempt = new_usage_attempt(
-                    req.request_id.clone(),
-                    a.attempt_no,
-                    a.provider_id,
-                    a.provider_kind,
-                    a.model_id,
-                    a.status,
-                    a.error_class,
-                    a.http_status,
-                    a.duration_ms,
-                    a.ttfb_ms,
-                    a.reason,
-                );
-                repo.insert_attempt(&attempt)
+            match tx.try_send(req) {
+                Ok(()) => Ok(()),
+                Err(mpsc::error::TrySendError::Full(req)) => {
+                    // Brief backpressure instead of dropping under burst.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        tx.send(req),
+                    )
                     .await
-                    .map_err(|e| QuotaError::Backend(format!("usage attempt: {e}")))?;
+                    {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(_)) => Err(QuotaError::Backend(
+                            "usage ledger writer stopped".into(),
+                        )),
+                        Err(_) => Err(QuotaError::Backend(
+                            "usage ledger queue full (backpressure)".into(),
+                        )),
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => Err(QuotaError::Backend(
+                    "usage ledger writer stopped".into(),
+                )),
             }
-
-            Ok(())
         })
     })
+}
+
+/// Synchronous insert (tests / tools that need fail-closed on DB errors).
+pub async fn persist_request(pool: &StorePool, req: QuotaRecordRequest) -> Result<(), QuotaError> {
+    let (row, attempts) = build_ledger_rows(req);
+    UsageRepo::new(pool)
+        .insert_ledger(&row, &attempts)
+        .await
+        .map_err(|e| QuotaError::Backend(format!("usage record: {e}")))
+}
+
+async fn usage_writer_loop(pool: StorePool, mut rx: mpsc::Receiver<QuotaRecordRequest>) {
+    loop {
+        let Some(first) = rx.recv().await else {
+            break;
+        };
+        let mut batch = vec![first];
+        while batch.len() < USAGE_BATCH_MAX {
+            match rx.try_recv() {
+                Ok(r) => batch.push(r),
+                Err(_) => break,
+            }
+        }
+
+        let items: Vec<_> = batch.into_iter().map(build_ledger_rows).collect();
+        let n = items.len();
+        if let Err(e) = UsageRepo::new(&pool).insert_ledger_batch(&items).await {
+            warn!(
+                error = %e,
+                batch_size = n,
+                "usage ledger batch write failed"
+            );
+        }
+    }
+}
+
+fn build_ledger_rows(
+    req: QuotaRecordRequest,
+) -> (
+    conduit_store::UsageRecordRow,
+    Vec<conduit_store::UsageAttemptRow>,
+) {
+    let key_id = {
+        let id = req.downstream_key_id.trim();
+        if id.is_empty() || id == "_anonymous" || id == "_local" {
+            None
+        } else {
+            Some(id.to_string())
+        }
+    };
+
+    let mut row = new_usage_record(
+        req.request_id.clone(),
+        key_id,
+        req.alias,
+        req.provider_id,
+        req.provider_kind,
+        req.model_id,
+        req.prompt_tokens,
+        req.completion_tokens,
+        req.total_tokens,
+        req.reasoning_tokens,
+        req.cache_read_tokens,
+        req.cache_write_tokens,
+        req.cost_usd,
+        req.stream,
+    );
+    row.status = req.status;
+    row.error_class = req.error_class;
+    row.http_status = req.http_status;
+    row.finish_reason = req.finish_reason;
+    row.duration_ms = req.duration_ms;
+    row.ttfb_ms = req.ttfb_ms;
+    row.route_strategy = req.route_strategy;
+    row.attempt_no = req.attempt_no;
+    row.attempt_count = req.attempt_count.max(1);
+    row.session_id = req.session_id;
+    row.affinity_hit = req.affinity_hit;
+    row.pool_id = req.pool_id;
+    row.selected_reason = req.selected_reason;
+
+    let attempts: Vec<_> = req
+        .attempts
+        .into_iter()
+        .map(|a| {
+            new_usage_attempt(
+                req.request_id.clone(),
+                a.attempt_no,
+                a.provider_id,
+                a.provider_kind,
+                a.model_id,
+                a.status,
+                a.error_class,
+                a.http_status,
+                a.duration_ms,
+                a.ttfb_ms,
+                a.reason,
+            )
+        })
+        .collect();
+
+    (row, attempts)
 }
 
 #[cfg(test)]
@@ -125,12 +197,35 @@ mod tests {
         }
     }
 
+    async fn wait_for_rows(pool: &StorePool, min: usize) {
+        for _ in 0..200 {
+            let n = UsageRepo::new(pool)
+                .list_page(conduit_store::UsageListOpts {
+                    limit: min.max(1),
+                    offset: 0,
+                    key_id: None,
+                    period: None,
+                    q: None,
+                    sort: Default::default(),
+                })
+                .await
+                .map(|p| p.total as usize)
+                .unwrap_or(0);
+            if n >= min {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {min} usage rows");
+    }
+
     #[tokio::test]
     async fn record_writes_usage_row() {
         let pool = open_db("sqlite::memory:").await.unwrap();
         let record_fn = make_record_fn(pool.clone());
 
         (record_fn)(base_req()).await.unwrap();
+        wait_for_rows(&pool, 1).await;
 
         let rows = UsageRepo::new(&pool).list(10, None, None).await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -196,6 +291,7 @@ mod tests {
             },
         ];
         (record_fn)(err).await.unwrap();
+        wait_for_rows(&pool, 2).await;
 
         let repo = UsageRepo::new(&pool);
         let rows = repo.list(10, None, None).await.unwrap();
@@ -236,6 +332,7 @@ mod tests {
         req.route_strategy = None;
         req.selected_reason = None;
         (record_fn)(req).await.unwrap();
+        wait_for_rows(&pool, 1).await;
 
         let rows = UsageRepo::new(&pool).list(10, None, None).await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -244,13 +341,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn db_error_fails_closed() {
+    async fn persist_request_fails_closed_on_db_error() {
         let pool = open_db("sqlite::memory:").await.unwrap();
         pool.close().await;
-        let record_fn = make_record_fn(pool);
-        let err = (record_fn)(base_req())
+        let err = persist_request(&pool, base_req())
             .await
             .expect_err("must fail closed");
         assert!(matches!(err, QuotaError::Backend(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn enqueue_returns_quickly_under_load() {
+        let pool = open_db("sqlite::memory:").await.unwrap();
+        let record_fn = make_record_fn(pool.clone());
+        let start = std::time::Instant::now();
+        for i in 0..200 {
+            let mut r = base_req();
+            r.request_id = format!("burst-{i}");
+            (record_fn)(r).await.unwrap();
+        }
+        // Enqueue path must not wait on SQLite for each row.
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "enqueue of 200 rows took {:?}",
+            start.elapsed()
+        );
+        wait_for_rows(&pool, 200).await;
     }
 }

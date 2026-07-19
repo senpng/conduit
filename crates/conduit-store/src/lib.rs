@@ -8,7 +8,10 @@ pub mod route_repo;
 pub mod schema;
 pub mod usage_repo;
 
-use std::str::FromStr;
+use std::{
+    str::FromStr,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 pub use key_repo::KeyRepo;
 pub use litellm::{
@@ -63,7 +66,31 @@ pub type StorePool = SqlitePool;
 /// `url` may be:
 /// - `"sqlite:///abs/path/to/conduit.db"` for a file-backed database.
 /// - `"sqlite::memory:"` for an in-process ephemeral database (tests).
+///
+/// Pool sizing is intentionally modest: SQLite has a single writer. Gateway
+/// usage inserts are offloaded to a single async writer (see conduitd
+/// `usage_wire`), so the pool is mostly for short console/auth reads. Too many
+/// connections increase lock contention and slow-acquire warnings under load.
+/// Sequence for unique shared-cache in-memory DB names (isolates parallel tests).
+static MEMORY_DB_SEQ: AtomicU64 = AtomicU64::new(1);
+
 pub async fn open_db(url: &str) -> Result<StorePool, StoreError> {
+    // Private `sqlite::memory:` is per-connection (broken with pool size > 1).
+    // Map to a *unique* shared-cache memory URI so one open_db() pool shares one
+    // DB across connections, without cross-talk between concurrent tests.
+    let is_memory = matches!(
+        url.trim(),
+        "sqlite::memory:" | "sqlite://:memory:" | ":memory:"
+    );
+    let memory_url;
+    let url = if is_memory {
+        let n = MEMORY_DB_SEQ.fetch_add(1, Ordering::Relaxed);
+        memory_url = format!("sqlite:file:conduit_mem_{n}?mode=memory&cache=shared");
+        memory_url.as_str()
+    } else {
+        url
+    };
+
     let opts = SqliteConnectOptions::from_str(url)
         .map_err(|e| StoreError::Migration(e.to_string()))?
         .create_if_missing(true)
@@ -73,13 +100,30 @@ pub async fn open_db(url: &str) -> Result<StorePool, StoreError> {
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
         // NORMAL: flush after each transaction; safe with WAL.
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
-        // Wait up to 5 s before returning SQLITE_BUSY.
-        .busy_timeout(std::time::Duration::from_secs(5))
+        // Bound SQLITE_BUSY waits (usage writer is serialized; readers should
+        // not sit for multi-second acquires under normal load).
+        .busy_timeout(std::time::Duration::from_secs(3))
         // Keep temp tables in memory, not on disk.
-        .pragma("temp_store", "MEMORY");
+        .pragma("temp_store", "MEMORY")
+        // ~64 MiB page cache (negative = KiB units).
+        .pragma("cache_size", "-65536")
+        // Memory-map the DB for faster reads on large usage tables.
+        .pragma("mmap_size", "268435456")
+        // Checkpoint more eagerly so WAL does not grow unbounded under write load.
+        .pragma("wal_autocheckpoint", "1000");
+
+    let (max_connections, min_connections) = if is_memory {
+        // Small multi-conn pool so async usage writer + list() can overlap in tests.
+        (4, 1)
+    } else {
+        // Console reads + auth lookups; usage inserts are batched on one writer task.
+        (12, 2)
+    };
 
     let pool = SqlitePoolOptions::new()
-        .max_connections(8)
+        .max_connections(max_connections)
+        .min_connections(min_connections)
+        .acquire_timeout(std::time::Duration::from_secs(8))
         .connect_with(opts)
         .await
         .map_err(|e| StoreError::Sqlx(e.to_string()))?;

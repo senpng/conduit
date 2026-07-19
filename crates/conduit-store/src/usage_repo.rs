@@ -71,82 +71,60 @@ impl<'a> UsageRepo<'a> {
     /// Insert one request ledger row (success, zero-token, or terminal failure).
     #[instrument(skip(self, row))]
     pub async fn insert(&self, row: &UsageRecordRow) -> Result<(), StoreError> {
-        sqlx::query(
-            r#"INSERT INTO usage_records (
-                   id, ts, request_id, downstream_key_id, alias,
-                   provider_id, provider_kind, model_id,
-                   prompt_tokens, completion_tokens, total_tokens,
-                   reasoning_tokens, cache_read_tokens, cache_write_tokens,
-                   cost_usd, stream,
-                   status, error_class, http_status, finish_reason,
-                   duration_ms, ttfb_ms, route_strategy,
-                   attempt_no, attempt_count, session_id, affinity_hit,
-                   pool_id, selected_reason
-               ) VALUES (
-                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-               )"#,
-        )
-        .bind(&row.id)
-        .bind(&row.ts)
-        .bind(&row.request_id)
-        .bind(&row.downstream_key_id)
-        .bind(&row.alias)
-        .bind(&row.provider_id)
-        .bind(&row.provider_kind)
-        .bind(&row.model_id)
-        .bind(row.prompt_tokens)
-        .bind(row.completion_tokens)
-        .bind(row.total_tokens)
-        .bind(row.reasoning_tokens)
-        .bind(row.cache_read_tokens)
-        .bind(row.cache_write_tokens)
-        .bind(row.cost_usd)
-        .bind(row.stream as i32)
-        .bind(&row.status)
-        .bind(&row.error_class)
-        .bind(row.http_status.map(|s| s as i64))
-        .bind(&row.finish_reason)
-        .bind(row.duration_ms.map(|d| d as i64))
-        .bind(row.ttfb_ms.map(|d| d as i64))
-        .bind(&row.route_strategy)
-        .bind(row.attempt_no as i64)
-        .bind(row.attempt_count as i64)
-        .bind(&row.session_id)
-        .bind(row.affinity_hit.map(|b| b as i32))
-        .bind(&row.pool_id)
-        .bind(&row.selected_reason)
-        .execute(self.pool)
-        .await
-        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
-        Ok(())
+        self.insert_ledger(row, &[]).await
     }
 
     /// Insert one per-try attempt row.
     #[instrument(skip(self, row))]
     pub async fn insert_attempt(&self, row: &UsageAttemptRow) -> Result<(), StoreError> {
-        sqlx::query(
-            r#"INSERT INTO usage_attempts (
-                   id, request_id, attempt_no, provider_id, provider_kind, model_id,
-                   status, error_class, http_status, duration_ms, ttfb_ms, reason, ts
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
-        )
-        .bind(&row.id)
-        .bind(&row.request_id)
-        .bind(row.attempt_no as i64)
-        .bind(&row.provider_id)
-        .bind(&row.provider_kind)
-        .bind(&row.model_id)
-        .bind(&row.status)
-        .bind(&row.error_class)
-        .bind(row.http_status.map(|s| s as i64))
-        .bind(row.duration_ms.map(|d| d as i64))
-        .bind(row.ttfb_ms.map(|d| d as i64))
-        .bind(&row.reason)
-        .bind(&row.ts)
-        .execute(self.pool)
-        .await
-        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        insert_attempt_on(self.pool, row).await
+    }
+
+    /// Insert a main row + optional attempts in a single transaction.
+    #[instrument(skip(self, row, attempts))]
+    pub async fn insert_ledger(
+        &self,
+        row: &UsageRecordRow,
+        attempts: &[UsageAttemptRow],
+    ) -> Result<(), StoreError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        insert_row_on(&mut *tx, row).await?;
+        for a in attempts {
+            insert_attempt_on(&mut *tx, a).await?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Insert many ledger entries in one transaction (async writer batching).
+    #[instrument(skip(self, items))]
+    pub async fn insert_ledger_batch(
+        &self,
+        items: &[(UsageRecordRow, Vec<UsageAttemptRow>)],
+    ) -> Result<(), StoreError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        for (row, attempts) in items {
+            insert_row_on(&mut *tx, row).await?;
+            for a in attempts {
+                insert_attempt_on(&mut *tx, a).await?;
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
         Ok(())
     }
 
@@ -737,6 +715,90 @@ pub struct UsageProviderRow {
     pub avg_ttfb_ms: Option<f64>,
     pub avg_duration_ms: Option<f64>,
     pub total_usd: f64,
+}
+
+async fn insert_row_on<'e, E>(ex: E, row: &UsageRecordRow) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        r#"INSERT INTO usage_records (
+               id, ts, request_id, downstream_key_id, alias,
+               provider_id, provider_kind, model_id,
+               prompt_tokens, completion_tokens, total_tokens,
+               reasoning_tokens, cache_read_tokens, cache_write_tokens,
+               cost_usd, stream,
+               status, error_class, http_status, finish_reason,
+               duration_ms, ttfb_ms, route_strategy,
+               attempt_no, attempt_count, session_id, affinity_hit,
+               pool_id, selected_reason
+           ) VALUES (
+               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           )"#,
+    )
+    .bind(&row.id)
+    .bind(&row.ts)
+    .bind(&row.request_id)
+    .bind(&row.downstream_key_id)
+    .bind(&row.alias)
+    .bind(&row.provider_id)
+    .bind(&row.provider_kind)
+    .bind(&row.model_id)
+    .bind(row.prompt_tokens)
+    .bind(row.completion_tokens)
+    .bind(row.total_tokens)
+    .bind(row.reasoning_tokens)
+    .bind(row.cache_read_tokens)
+    .bind(row.cache_write_tokens)
+    .bind(row.cost_usd)
+    .bind(row.stream as i32)
+    .bind(&row.status)
+    .bind(&row.error_class)
+    .bind(row.http_status.map(|s| s as i64))
+    .bind(&row.finish_reason)
+    .bind(row.duration_ms.map(|d| d as i64))
+    .bind(row.ttfb_ms.map(|d| d as i64))
+    .bind(&row.route_strategy)
+    .bind(row.attempt_no as i64)
+    .bind(row.attempt_count as i64)
+    .bind(&row.session_id)
+    .bind(row.affinity_hit.map(|b| b as i32))
+    .bind(&row.pool_id)
+    .bind(&row.selected_reason)
+    .execute(ex)
+    .await
+    .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+    Ok(())
+}
+
+async fn insert_attempt_on<'e, E>(ex: E, row: &UsageAttemptRow) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        r#"INSERT INTO usage_attempts (
+               id, request_id, attempt_no, provider_id, provider_kind, model_id,
+               status, error_class, http_status, duration_ms, ttfb_ms, reason, ts
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+    )
+    .bind(&row.id)
+    .bind(&row.request_id)
+    .bind(row.attempt_no as i64)
+    .bind(&row.provider_id)
+    .bind(&row.provider_kind)
+    .bind(&row.model_id)
+    .bind(&row.status)
+    .bind(&row.error_class)
+    .bind(row.http_status.map(|s| s as i64))
+    .bind(row.duration_ms.map(|d| d as i64))
+    .bind(row.ttfb_ms.map(|d| d as i64))
+    .bind(&row.reason)
+    .bind(&row.ts)
+    .execute(ex)
+    .await
+    .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+    Ok(())
 }
 
 fn map_row(r: sqlx::sqlite::SqliteRow) -> UsageRecordRow {
