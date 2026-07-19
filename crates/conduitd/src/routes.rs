@@ -17,7 +17,7 @@ use conduit_ir::error::GatewayError;
 use conduit_store::ResponseContinuationRepo;
 use futures::StreamExt;
 use serde_json::{json, Value};
-use tracing::{instrument, warn};
+use tracing::{debug, info, instrument, warn};
 use ulid::Ulid;
 
 use crate::{
@@ -121,12 +121,27 @@ fn extract_key_id(headers: &HeaderMap) -> Option<String> {
         }
     }
     let auth = headers.get("authorization")?;
-    let s = auth.to_str().ok()?;
-    if let Some(stripped) = s.strip_prefix("Bearer ") {
-        Some(stripped.trim().to_string())
-    } else {
-        Some(s.trim().to_string())
+    let s = auth.to_str().ok()?.trim();
+    if s.is_empty() {
+        return None;
     }
+    // RFC 7235: auth-scheme is case-insensitive (`Bearer` / `bearer` / `BEARER`).
+    // HTTP header values often trim trailing spaces, so bare `Bearer` has no token.
+    if s.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    if let Some(rest) = s
+        .get(..7)
+        .filter(|p| p.eq_ignore_ascii_case("bearer "))
+        .and_then(|_| s.get(7..))
+    {
+        let t = rest.trim();
+        if t.is_empty() {
+            return None;
+        }
+        return Some(t.to_string());
+    }
+    Some(s.to_string())
 }
 
 /// Gateway route paths registered for the public LLM surface (used by tests).
@@ -141,7 +156,7 @@ pub fn gateway_public_paths() -> &'static [&'static str] {
 }
 
 /// POST /v1/responses — OpenAI Responses API endpoint.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(endpoint = "/v1/responses"))]
 pub async fn responses(
     State(state): State<Arc<DaemonState>>,
     headers: HeaderMap,
@@ -157,6 +172,7 @@ pub async fn responses(
     let alias = match body.get("model").and_then(|v| v.as_str()) {
         Some(model) if !model.is_empty() => model.to_string(),
         _ => {
+            debug!(endpoint = "/v1/responses", "reject: model field required");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(OpenAiResponsesCodec::error_body(
@@ -168,6 +184,14 @@ pub async fn responses(
                 .into_response();
         }
     };
+    debug!(
+        endpoint = "/v1/responses",
+        alias = %alias,
+        stream,
+        has_key = key_id.is_some(),
+        store_continuation,
+        "gateway request accept"
+    );
 
     let continuation_repo = ResponseContinuationRepo::new(&state.pool);
     let adapted_body = match apply_continuation(
@@ -206,16 +230,24 @@ pub async fn responses(
     };
     let continuation_input = adapted_body.get("input").cloned().unwrap_or(Value::Null);
 
+    let client_request_id = Ulid::new().to_string();
     let canonical_req = match OpenAiResponsesCodec::decode_request(
         adapted_body,
         alias.clone(),
         stream,
-        Ulid::new().to_string(),
+        client_request_id.clone(),
         key_id.clone().unwrap_or_default(),
     ) {
         Ok(request) => request,
         Err(error) => {
             let msg = error.to_string();
+            debug!(
+                endpoint = "/v1/responses",
+                alias = %alias,
+                client_request_id = %client_request_id,
+                error = %msg,
+                "gateway request decode failed"
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(OpenAiResponsesCodec::error_body(
@@ -243,6 +275,13 @@ pub async fn responses(
         .await
     {
         Ok(conduit_pipeline::handle::PipelineResult::Complete(response)) => {
+            info!(
+                endpoint = "/v1/responses",
+                alias = %alias,
+                client_request_id = %client_request_id,
+                stream = false,
+                "gateway response complete"
+            );
             let mut response = OpenAiResponsesCodec::encode_response(&response);
             response["store"] = Value::Bool(store_continuation);
             if store_continuation {
@@ -264,6 +303,13 @@ pub async fn responses(
             Json(response).into_response()
         }
         Ok(conduit_pipeline::handle::PipelineResult::Streaming(stream)) => {
+            info!(
+                endpoint = "/v1/responses",
+                alias = %alias,
+                client_request_id = %client_request_id,
+                stream = true,
+                "gateway stream response begin"
+            );
             let resp_id = format!("resp_{}", Ulid::new());
             let continuation_pool = state.pool.clone();
             let continuation_scope = continuation_scope.clone();
@@ -282,7 +328,15 @@ pub async fn responses(
                     let is_terminal = matches!(&result, Ok(chunk) if chunk.finish_reason.is_some());
                     let frames = match result {
                         Ok(chunk) => encoder.push(&chunk),
-                        Err(error) => vec![OpenAiResponsesCodec::stream_error_sse(&error.to_string())],
+                        Err(error) => {
+                            debug!(
+                                endpoint = "/v1/responses",
+                                resp_id = %resp_id,
+                                error = %error,
+                                "gateway responses stream chunk error"
+                            );
+                            vec![OpenAiResponsesCodec::stream_error_sse(&error.to_string())]
+                        }
                     };
                     if is_terminal && store_continuation {
                         let repo = ResponseContinuationRepo::new(&continuation_pool);
@@ -318,6 +372,14 @@ pub async fn responses(
         }
         Err(error) => {
             let status = status_for_gateway_error(&error);
+            warn!(
+                endpoint = "/v1/responses",
+                alias = %alias,
+                client_request_id = %client_request_id,
+                status = %status,
+                error = %error,
+                "gateway request failed"
+            );
             (
                 status,
                 Json(OpenAiResponsesCodec::error_body(
@@ -383,7 +445,7 @@ pub async fn health(State(state): State<Arc<DaemonState>>) -> impl IntoResponse 
 }
 
 /// POST /v1/chat/completions — OpenAI-compatible endpoint
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(endpoint = "/v1/chat/completions"))]
 pub async fn chat_completions(
     State(state): State<Arc<DaemonState>>,
     headers: HeaderMap,
@@ -397,6 +459,10 @@ pub async fn chat_completions(
     let alias = match body.get("model").and_then(|v| v.as_str()) {
         Some(a) if !a.is_empty() => a.to_string(),
         _ => {
+            debug!(
+                endpoint = "/v1/chat/completions",
+                "reject: model field required"
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(OpenAiCodec::error_body(
@@ -410,6 +476,14 @@ pub async fn chat_completions(
     };
 
     let request_id = Ulid::new().to_string();
+    debug!(
+        endpoint = "/v1/chat/completions",
+        alias = %alias,
+        stream,
+        has_key = key_id.is_some(),
+        client_request_id = %request_id,
+        "gateway request accept"
+    );
 
     let canonical_req = match OpenAiCodec::decode_request(
         body.clone(),
@@ -421,6 +495,13 @@ pub async fn chat_completions(
         Ok(r) => r,
         Err(e) => {
             let msg = e.to_string();
+            debug!(
+                endpoint = "/v1/chat/completions",
+                alias = %alias,
+                client_request_id = %request_id,
+                error = %msg,
+                "gateway request decode failed"
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(OpenAiCodec::error_body(
@@ -445,20 +526,53 @@ pub async fn chat_completions(
         .await
     {
         Ok(conduit_pipeline::handle::PipelineResult::Complete(resp)) => {
+            info!(
+                endpoint = "/v1/chat/completions",
+                alias = %alias,
+                client_request_id = %request_id,
+                stream = false,
+                "gateway response complete"
+            );
             let body = OpenAiCodec::encode_response(&resp);
             Json(body).into_response()
         }
         Ok(conduit_pipeline::handle::PipelineResult::Streaming(stream)) => {
-            let resp_id = Ulid::new().to_string();
-            let sse_stream = stream.filter_map(move |result| {
-                let rid = resp_id.clone();
-                async move {
+            info!(
+                endpoint = "/v1/chat/completions",
+                alias = %alias,
+                client_request_id = %request_id,
+                stream = true,
+                "gateway stream response begin"
+            );
+            // CLIProxyAPI-parity stateful encoder: fixed created, role kickoff, [DONE].
+            let resp_id = format!("chatcmpl_{}", Ulid::new());
+            let model = alias.clone();
+            let sse_stream = async_stream::stream! {
+                let mut encoder =
+                    conduit_codec::openai::OpenAiStreamEncoder::new(resp_id.clone(), model);
+                let mut stream = stream;
+                while let Some(result) = stream.next().await {
                     match result {
-                        Ok(chunk) => OpenAiCodec::encode_chunk(&chunk, &rid).0.map(Ok),
-                        Err(e) => Some(Ok(OpenAiCodec::stream_error_sse(&e.to_string()))),
+                        Ok(chunk) => {
+                            for frame in encoder.push(&chunk) {
+                                yield Ok::<_, std::convert::Infallible>(frame);
+                            }
+                        }
+                        Err(e) => {
+                            debug!(
+                                endpoint = "/v1/chat/completions",
+                                resp_id = %resp_id,
+                                error = %e,
+                                "gateway stream chunk error"
+                            );
+                            yield Ok(OpenAiCodec::stream_error_sse(&e.to_string()));
+                        }
                     }
                 }
-            });
+                for frame in encoder.finish() {
+                    yield Ok(frame);
+                }
+            };
 
             let body = Body::from_stream(sse_stream.map(
                 |r: Result<String, std::convert::Infallible>| {
@@ -492,10 +606,24 @@ pub async fn chat_completions(
                     OpenAiCodec::error_body("permission_error", None, &qe.to_string())
                 }
                 other => {
-                    warn!("pipeline error: {}", other);
+                    warn!(
+                        endpoint = "/v1/chat/completions",
+                        alias = %alias,
+                        client_request_id = %request_id,
+                        error = %other,
+                        "pipeline error"
+                    );
                     OpenAiCodec::error_body("upstream_error", None, &other.to_string())
                 }
             };
+            debug!(
+                endpoint = "/v1/chat/completions",
+                alias = %alias,
+                client_request_id = %request_id,
+                status = %status,
+                error = %e,
+                "gateway request failed"
+            );
             (status, Json(body)).into_response()
         }
     }
@@ -504,7 +632,7 @@ pub async fn chat_completions(
 /// POST /v1/messages — Anthropic Messages API (native ingress).
 ///
 /// Shares the same pipeline as chat completions; only the wire codec differs.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(endpoint = "/v1/messages"))]
 pub async fn messages(
     State(state): State<Arc<DaemonState>>,
     headers: HeaderMap,
@@ -519,6 +647,7 @@ pub async fn messages(
     let alias = match body.get("model").and_then(|v| v.as_str()) {
         Some(a) if !a.is_empty() => a.to_string(),
         _ => {
+            debug!(endpoint = "/v1/messages", "reject: model field required");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(AnthropicCodec::error_body(
@@ -533,6 +662,11 @@ pub async fn messages(
 
     // Anthropic Messages API requires max_tokens.
     if body.get("max_tokens").and_then(|v| v.as_u64()).is_none() {
+        debug!(
+            endpoint = "/v1/messages",
+            alias = %alias,
+            "reject: max_tokens required"
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(AnthropicCodec::error_body(
@@ -545,6 +679,11 @@ pub async fn messages(
     }
 
     if body.get("messages").and_then(|v| v.as_array()).is_none() {
+        debug!(
+            endpoint = "/v1/messages",
+            alias = %alias,
+            "reject: messages required"
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(AnthropicCodec::error_body(
@@ -557,6 +696,14 @@ pub async fn messages(
     }
 
     let request_id = Ulid::new().to_string();
+    debug!(
+        endpoint = "/v1/messages",
+        alias = %alias,
+        stream,
+        has_key = key_id.is_some(),
+        client_request_id = %request_id,
+        "gateway request accept"
+    );
 
     let canonical_req = match AnthropicCodec::decode_request(
         body.clone(),
@@ -568,6 +715,13 @@ pub async fn messages(
         Ok(r) => r,
         Err(e) => {
             let msg = e.to_string();
+            debug!(
+                endpoint = "/v1/messages",
+                alias = %alias,
+                client_request_id = %request_id,
+                error = %msg,
+                "gateway request decode failed"
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(AnthropicCodec::error_body(
@@ -591,10 +745,24 @@ pub async fn messages(
         .await
     {
         Ok(conduit_pipeline::handle::PipelineResult::Complete(resp)) => {
+            info!(
+                endpoint = "/v1/messages",
+                alias = %alias,
+                client_request_id = %request_id,
+                stream = false,
+                "gateway response complete"
+            );
             let body = AnthropicCodec::encode_response(&resp);
             Json(body).into_response()
         }
         Ok(conduit_pipeline::handle::PipelineResult::Streaming(stream)) => {
+            info!(
+                endpoint = "/v1/messages",
+                alias = %alias,
+                client_request_id = %request_id,
+                stream = true,
+                "gateway stream response begin"
+            );
             let resp_id = Ulid::new().to_string();
             let model = alias.clone();
             // CLIProxyAPI-parity stateful Anthropic SSE lifecycle.
@@ -616,6 +784,12 @@ pub async fn messages(
                             }
                         }
                         Err(e) => {
+                            debug!(
+                                endpoint = "/v1/messages",
+                                resp_id = %resp_id,
+                                error = %e,
+                                "gateway messages stream chunk error"
+                            );
                             yield Ok(AnthropicCodec::stream_error_sse(&e.to_string()));
                         }
                     }
@@ -659,10 +833,24 @@ pub async fn messages(
                     AnthropicCodec::error_body("permission_error", None, &qe.to_string())
                 }
                 other => {
-                    warn!("pipeline error (messages): {}", other);
+                    warn!(
+                        endpoint = "/v1/messages",
+                        alias = %alias,
+                        client_request_id = %request_id,
+                        error = %other,
+                        "pipeline error (messages)"
+                    );
                     AnthropicCodec::error_body("api_error", None, &other.to_string())
                 }
             };
+            debug!(
+                endpoint = "/v1/messages",
+                alias = %alias,
+                client_request_id = %request_id,
+                status = %status,
+                error = %e,
+                "gateway request failed"
+            );
             (status, Json(body)).into_response()
         }
     }
@@ -717,6 +905,31 @@ mod auth_status_tests {
         let mut h = HeaderMap::new();
         h.insert("x-api-key", "ck_test_secret".parse().unwrap());
         assert_eq!(extract_key_id(&h).as_deref(), Some("ck_test_secret"));
+    }
+
+    #[test]
+    fn extract_key_accepts_bearer_case_insensitive() {
+        for auth in [
+            "Bearer sk_live_abc",
+            "bearer sk_live_abc",
+            "BEARER sk_live_abc",
+            "Bearer  sk_live_abc",
+        ] {
+            let mut h = HeaderMap::new();
+            h.insert("authorization", auth.parse().unwrap());
+            assert_eq!(
+                extract_key_id(&h).as_deref(),
+                Some("sk_live_abc"),
+                "auth={auth}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_key_rejects_empty_bearer() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer ".parse().unwrap());
+        assert_eq!(extract_key_id(&h), None);
     }
 
     /// Live path: daemon header filter → pipeline session resolve → affinity pin key.

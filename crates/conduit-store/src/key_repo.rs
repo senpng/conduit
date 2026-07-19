@@ -66,6 +66,21 @@ impl<'a> KeyRepo<'a> {
         Ok(row)
     }
 
+    /// Look up a key by hash ignoring enabled/deleted filters (auth diagnostics only).
+    #[instrument(skip(self))]
+    pub async fn get_by_hash_any(&self, hash: &str) -> Result<Option<DownstreamKeyRow>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, name, key_hash, model_whitelist, monthly_budget_usd, rate_limit_rpm, enabled, created_at, updated_at, deleted_at
+             FROM downstream_keys WHERE key_hash = ?",
+        )
+        .bind(hash)
+        .fetch_optional(self.pool)
+        .await
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?
+        .map(map_key_row);
+        Ok(row)
+    }
+
     /// Active keys only (includes disabled for console toggle).
     #[instrument(skip(self))]
     pub async fn list(&self) -> Result<Vec<DownstreamKeyRow>, StoreError> {
@@ -218,6 +233,10 @@ mod tests {
 
         let got = repo.get_by_hash("def456").await.unwrap();
         assert!(got.is_none());
+        // Diagnostic path still sees the disabled row.
+        let any = repo.get_by_hash_any("def456").await.unwrap().unwrap();
+        assert!(!any.enabled);
+        assert_eq!(any.id, "k2");
     }
 
     #[tokio::test]

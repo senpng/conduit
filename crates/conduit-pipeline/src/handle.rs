@@ -12,7 +12,7 @@ use conduit_router::{
     AffinityStore, PoolCursorStore, ProviderCooldownStore, UpstreamQuotaStore,
 };
 use futures::stream::BoxStream;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use super::{
     context::{IngressWire, PipelineContext, ResolvedProvider},
@@ -81,32 +81,97 @@ impl PipelineHandle {
         let stream = request.stream;
         let wire_format = ingress_wire.format;
         let session_id = resolve_session_id(&client_headers, &request);
+        let message_count = request.messages.len();
         let mut ctx = PipelineContext::new(request, None, table_snap, wire_format)
             .with_ingress_wire(ingress_wire)
             .with_client_headers(client_headers.clone());
-        ctx.session_id = session_id;
+        ctx.session_id = session_id.clone();
 
-        if let Err((_error_type, _http_status, err)) =
+        debug!(
+            request_id = %ctx.request_id,
+            client_request_id = %ctx.request.id,
+            alias = %ctx.request.alias,
+            stream,
+            wire = %wire_format.as_str(),
+            message_count,
+            session_id = session_id.as_deref().unwrap_or(""),
+            has_bearer = downstream_bearer.as_ref().is_some_and(|s| !s.trim().is_empty()),
+            client_header_count = client_headers.len(),
+            "pipeline request start"
+        );
+
+        if let Err((error_type, http_status, err)) =
             self.run_ingress_checks(&mut ctx, downstream_bearer).await
         {
+            debug!(
+                request_id = %ctx.request_id,
+                alias = %ctx.request.alias,
+                error_type,
+                http_status,
+                error = %err,
+                "pipeline ingress rejected"
+            );
             return Err(err);
         }
 
         let preferred = self.session_preferred(&ctx);
         let skip = self.deps.cooldown.cooling_ids();
+        if !skip.is_empty() {
+            debug!(
+                request_id = %ctx.request_id,
+                cooling = ?skip,
+                preferred = preferred.as_deref().unwrap_or(""),
+                "pipeline routing with cooldown skip set"
+            );
+        }
         if let Err(e) = route_request_with_skip(
             &mut ctx,
             preferred.as_deref(),
             Some(&skip),
             Some(self.deps.pool_cursors.as_ref()),
         ) {
+            debug!(
+                request_id = %ctx.request_id,
+                alias = %ctx.request.alias,
+                error = %e,
+                "pipeline routing failed"
+            );
             return Err(e);
         }
 
         let resolved = ctx.resolved.as_ref().unwrap().clone();
+        debug!(
+            request_id = %ctx.request_id,
+            alias = %ctx.request.alias,
+            provider_id = %resolved.provider_id,
+            provider_kind = %resolved.provider_kind,
+            model_id = %resolved.model_id,
+            base_url = resolved.base_url.as_deref().unwrap_or(""),
+            attempt_no = resolved.attempt_no,
+            preferred = preferred.as_deref().unwrap_or(""),
+            "pipeline route resolved"
+        );
+
         let mut auth = match self.resolve_auth(&resolved.provider_id).await {
-            Ok(a) => a,
-            Err(e) => return Err(e),
+            Ok(a) => {
+                debug!(
+                    request_id = %ctx.request_id,
+                    provider_id = %resolved.provider_id,
+                    extra_header_count = a.extra_headers.len(),
+                    using_api = a.using_api,
+                    "pipeline credential resolved"
+                );
+                a
+            }
+            Err(e) => {
+                debug!(
+                    request_id = %ctx.request_id,
+                    provider_id = %resolved.provider_id,
+                    error = %e,
+                    "pipeline credential resolve failed"
+                );
+                return Err(e);
+            }
         };
         auth.client_headers = client_headers;
 
@@ -140,6 +205,13 @@ impl PipelineHandle {
                 e,
             )
         })?;
+        debug!(
+            request_id = %ctx.request_id,
+            key_id = %policy.key_id,
+            rate_limit_rpm = ?policy.rate_limit_rpm,
+            whitelist_len = policy.model_whitelist.len(),
+            "pipeline key policy accepted"
+        );
         policy
             .check_model_allowed(&ctx.request.alias)
             .map_err(|e| ("ModelNotAllowed", 403u16, e))?;
@@ -152,6 +224,12 @@ impl PipelineHandle {
             };
             ("QuotaError", status, GatewayError::from(e))
         })?;
+        debug!(
+            request_id = %ctx.request_id,
+            key_id = %policy.key_id,
+            alias = %ctx.request.alias,
+            "pipeline quota check passed"
+        );
 
         ctx.downstream_key_id = Some(policy.key_id.clone());
         Ok(())
@@ -167,6 +245,15 @@ impl PipelineHandle {
         loop {
             let attempt_started = chrono::Utc::now();
             let upstream_req = request_for_upstream(&ctx.request, &resolved);
+            debug!(
+                request_id = %ctx.request_id,
+                provider_id = %resolved.provider_id,
+                provider_kind = %resolved.provider_kind,
+                model_id = %resolved.model_id,
+                attempt_no = resolved.attempt_no,
+                stream = false,
+                "pipeline upstream attempt start"
+            );
             let result = dispatch_non_stream(
                 &resolved,
                 &upstream_req,
@@ -197,6 +284,21 @@ impl PipelineHandle {
                         // leave per-try ttfb null (main row uses duration only).
                         None,
                     ));
+                    info!(
+                        request_id = %ctx.request_id,
+                        alias = %ctx.request.alias,
+                        provider_id = %resolved.provider_id,
+                        model_id = %resolved.model_id,
+                        attempt_no = resolved.attempt_no,
+                        attempt_ms,
+                        duration_ms = ctx.latency_ms(),
+                        prompt_tokens = ctx.usage.prompt_tokens,
+                        completion_tokens = ctx.usage.completion_tokens,
+                        total_tokens = ctx.usage.total_tokens,
+                        cost_usd,
+                        finish_reason = %finish_reason_str(&resp.finish_reason),
+                        "pipeline non-stream complete"
+                    );
                     self.record_usage(
                         &ctx,
                         &resolved,
@@ -217,17 +319,30 @@ impl PipelineHandle {
 
                 Err(e) => {
                     let attempt_ms = elapsed_ms(attempt_started);
+                    let error_class = provider_error_class(&e);
+                    let http_status = e.http_status_hint();
                     self.note_upstream_error(&resolved, &e);
                     attempts.push(attempt_record(
                         &resolved,
                         "error",
-                        Some(provider_error_class(&e)),
-                        e.http_status_hint(),
+                        Some(error_class.clone()),
+                        http_status,
                         Some(attempt_ms),
                         None,
                     ));
                     let table = ctx.routing_table.clone();
                     if should_retry(&mut ctx, &table, &e) {
+                        debug!(
+                            request_id = %ctx.request_id,
+                            provider_id = %resolved.provider_id,
+                            attempt_no = resolved.attempt_no,
+                            next_attempt = ctx.attempt_no,
+                            attempt_ms,
+                            error_class = %error_class,
+                            http_status = ?http_status,
+                            error = %e,
+                            "pipeline will retry after upstream error"
+                        );
                         let preferred = self.session_preferred(&ctx);
                         let skip = self.deps.cooldown.cooling_ids();
                         if let Err(routing_err) = route_request_with_skip(
@@ -236,6 +351,11 @@ impl PipelineHandle {
                             Some(&skip),
                             Some(self.deps.pool_cursors.as_ref()),
                         ) {
+                            warn!(
+                                request_id = %ctx.request_id,
+                                error = %routing_err,
+                                "pipeline retry routing failed"
+                            );
                             self.record_usage(
                                 &ctx,
                                 &resolved,
@@ -253,6 +373,14 @@ impl PipelineHandle {
                             return Err(routing_err);
                         }
                         let new_resolved = ctx.resolved.as_ref().unwrap().clone();
+                        debug!(
+                            request_id = %ctx.request_id,
+                            from_provider = %resolved.provider_id,
+                            to_provider = %new_resolved.provider_id,
+                            to_model = %new_resolved.model_id,
+                            attempt_no = new_resolved.attempt_no,
+                            "pipeline retry re-routed"
+                        );
                         let client_headers = auth.client_headers.clone();
                         auth = match self.resolve_auth(&new_resolved.provider_id).await {
                             Ok(mut s) => {
@@ -260,6 +388,12 @@ impl PipelineHandle {
                                 s
                             }
                             Err(ae) => {
+                                debug!(
+                                    request_id = %ctx.request_id,
+                                    provider_id = %new_resolved.provider_id,
+                                    error = %ae,
+                                    "pipeline retry credential resolve failed"
+                                );
                                 self.record_usage(
                                     &ctx,
                                     &resolved,
@@ -279,14 +413,24 @@ impl PipelineHandle {
                         };
                         resolved = new_resolved;
                     } else {
+                        warn!(
+                            request_id = %ctx.request_id,
+                            provider_id = %resolved.provider_id,
+                            attempt_no = resolved.attempt_no,
+                            attempt_ms,
+                            error_class = %error_class,
+                            http_status = ?http_status,
+                            error = %e,
+                            "pipeline non-stream failed (no more retries)"
+                        );
                         self.record_usage(
                             &ctx,
                             &resolved,
                             0.0,
                             false,
                             "error",
-                            Some(provider_error_class(&e)),
-                            e.http_status_hint(),
+                            Some(error_class),
+                            http_status,
                             None,
                             Some(ctx.latency_ms()),
                             None,
@@ -310,6 +454,15 @@ impl PipelineHandle {
         loop {
             let attempt_started = chrono::Utc::now();
             let upstream_req = request_for_upstream(&ctx.request, &resolved);
+            debug!(
+                request_id = %ctx.request_id,
+                provider_id = %resolved.provider_id,
+                provider_kind = %resolved.provider_kind,
+                model_id = %resolved.model_id,
+                attempt_no = resolved.attempt_no,
+                stream = true,
+                "pipeline upstream attempt start"
+            );
             let result = dispatch_stream(
                 &resolved,
                 &upstream_req,
@@ -327,6 +480,17 @@ impl PipelineHandle {
                     let route_meta =
                         route_observability(&ctx, &resolved, preferred.as_deref());
                     let attempt_count = (resolved.attempt_no + 1).max(1);
+                    let open_ms = elapsed_ms(attempt_started);
+                    info!(
+                        request_id = %ctx.request_id,
+                        alias = %ctx.request.alias,
+                        provider_id = %resolved.provider_id,
+                        model_id = %resolved.model_id,
+                        attempt_no = resolved.attempt_no,
+                        open_ms,
+                        selected_reason = route_meta.selected_reason.as_deref().unwrap_or(""),
+                        "pipeline stream opened"
+                    );
                     let instrumented = UsageTrackingStream::new(
                         stream,
                         self.deps.pricing_fn.clone(),
@@ -355,17 +519,30 @@ impl PipelineHandle {
 
                 Err(e) => {
                     let attempt_ms = elapsed_ms(attempt_started);
+                    let error_class = provider_error_class(&e);
+                    let http_status = e.http_status_hint();
                     self.note_upstream_error(&resolved, &e);
                     prior_attempts.push(attempt_record(
                         &resolved,
                         "error",
-                        Some(provider_error_class(&e)),
-                        e.http_status_hint(),
+                        Some(error_class.clone()),
+                        http_status,
                         Some(attempt_ms),
                         None,
                     ));
                     let table = ctx.routing_table.clone();
                     if should_retry(&mut ctx, &table, &e) {
+                        debug!(
+                            request_id = %ctx.request_id,
+                            provider_id = %resolved.provider_id,
+                            attempt_no = resolved.attempt_no,
+                            next_attempt = ctx.attempt_no,
+                            attempt_ms,
+                            error_class = %error_class,
+                            http_status = ?http_status,
+                            error = %e,
+                            "pipeline stream will retry after upstream error"
+                        );
                         let preferred = self.session_preferred(&ctx);
                         let skip = self.deps.cooldown.cooling_ids();
                         if let Err(routing_err) = route_request_with_skip(
@@ -374,6 +551,11 @@ impl PipelineHandle {
                             Some(&skip),
                             Some(self.deps.pool_cursors.as_ref()),
                         ) {
+                            warn!(
+                                request_id = %ctx.request_id,
+                                error = %routing_err,
+                                "pipeline stream retry routing failed"
+                            );
                             self.record_usage(
                                 &ctx,
                                 &resolved,
@@ -391,6 +573,14 @@ impl PipelineHandle {
                             return Err(routing_err);
                         }
                         let new_resolved = ctx.resolved.as_ref().unwrap().clone();
+                        debug!(
+                            request_id = %ctx.request_id,
+                            from_provider = %resolved.provider_id,
+                            to_provider = %new_resolved.provider_id,
+                            to_model = %new_resolved.model_id,
+                            attempt_no = new_resolved.attempt_no,
+                            "pipeline stream retry re-routed"
+                        );
                         let client_headers = auth.client_headers.clone();
                         auth = match self.resolve_auth(&new_resolved.provider_id).await {
                             Ok(mut s) => {
@@ -398,6 +588,12 @@ impl PipelineHandle {
                                 s
                             }
                             Err(ae) => {
+                                debug!(
+                                    request_id = %ctx.request_id,
+                                    provider_id = %new_resolved.provider_id,
+                                    error = %ae,
+                                    "pipeline stream retry credential resolve failed"
+                                );
                                 self.record_usage(
                                     &ctx,
                                     &resolved,
@@ -417,14 +613,24 @@ impl PipelineHandle {
                         };
                         resolved = new_resolved;
                     } else {
+                        warn!(
+                            request_id = %ctx.request_id,
+                            provider_id = %resolved.provider_id,
+                            attempt_no = resolved.attempt_no,
+                            attempt_ms,
+                            error_class = %error_class,
+                            http_status = ?http_status,
+                            error = %e,
+                            "pipeline stream open failed (no more retries)"
+                        );
                         self.record_usage(
                             &ctx,
                             &resolved,
                             0.0,
                             true,
                             "error",
-                            Some(provider_error_class(&e)),
-                            e.http_status_hint(),
+                            Some(error_class),
+                            http_status,
                             None,
                             Some(ctx.latency_ms()),
                             None,
@@ -538,6 +744,13 @@ impl PipelineHandle {
         if !uses_affinity {
             return;
         }
+        debug!(
+            request_id = %ctx.request_id,
+            session_id = %sid,
+            alias,
+            provider_id = %resolved.provider_id,
+            "pipeline session affinity remembered"
+        );
         self.deps
             .affinity
             .remember(sid, alias, &resolved.provider_id);

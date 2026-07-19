@@ -9,7 +9,7 @@ use conduit_ir::{canonical::CanonicalChatRequest, error::ProviderError};
 use futures::stream::{StreamExt, TryStreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Map, Value};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::{
     body::prepare_oauth_body,
@@ -107,6 +107,19 @@ pub async fn chat_oauth<C: WireCodec + 'static>(
     };
     let prepared = prepare_oauth_body(body, model_for_cloak, secret.expose_secret(), opts);
 
+    debug!(
+        provider_id,
+        kind,
+        url = %url,
+        upstream_model,
+        stream = false,
+        message_count = req.messages.len(),
+        body_bytes = prepared.body.to_string().len(),
+        extra_betas = prepared.extra_betas.len(),
+        overall_ms,
+        "claude_oauth chat request"
+    );
+
     let builder = chrome_client()
         .post(&url)
         .timeout(Duration::from_millis(overall_ms))
@@ -115,7 +128,16 @@ pub async fn chat_oauth<C: WireCodec + 'static>(
         oauth_request_headers(secret.expose_secret(), false, &prepared.extra_betas, opts);
     let builder = apply_headers(builder, &request_headers);
 
+    let started = std::time::Instant::now();
     let resp = builder.send().await.map_err(|e| {
+        debug!(
+            provider_id,
+            url = %url,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            error = %e,
+            is_timeout = e.is_timeout(),
+            "claude_oauth chat transport error"
+        );
         if e.is_timeout() {
             ProviderError::Timeout
         } else {
@@ -133,6 +155,13 @@ pub async fn chat_oauth<C: WireCodec + 'static>(
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
         let text = resp.text().await.unwrap_or_default();
+        debug!(
+            provider_id,
+            status,
+            body_preview = %crate::provider::truncate_for_log(&text, 400),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "claude_oauth chat non-success"
+        );
         return Err(map_status(status, &text));
     }
 
@@ -144,6 +173,14 @@ pub async fn chat_oauth<C: WireCodec + 'static>(
 
     let (response, decode_loss) = C::decode_response(val, &req.alias)
         .map_err(|e| ProviderError::Serialization(e.to_string()))?;
+    debug!(
+        provider_id,
+        status,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        prompt_tokens = response.usage.prompt_tokens,
+        completion_tokens = response.usage.completion_tokens,
+        "claude_oauth chat ok"
+    );
     let mut combined = encode_loss;
     combined.merge(decode_loss);
     Ok((response, combined))
@@ -174,12 +211,33 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
     let prepared = prepare_oauth_body(body, model_for_cloak, secret.expose_secret(), opts);
     let tool_reverse: HashMap<String, String> = prepared.tool_reverse_map;
 
+    debug!(
+        provider_id,
+        kind,
+        url = %url,
+        upstream_model,
+        stream = true,
+        message_count = req.messages.len(),
+        body_bytes = prepared.body.to_string().len(),
+        extra_betas = prepared.extra_betas.len(),
+        "claude_oauth chat_stream request"
+    );
+
     let builder = chrome_client().post(&url).json(&prepared.body);
     let request_headers =
         oauth_request_headers(secret.expose_secret(), true, &prepared.extra_betas, opts);
     let builder = apply_headers(builder, &request_headers);
 
+    let started = std::time::Instant::now();
     let resp = builder.send().await.map_err(|e| {
+        debug!(
+            provider_id,
+            url = %url,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            error = %e,
+            is_timeout = e.is_timeout(),
+            "claude_oauth chat_stream transport error"
+        );
         if e.is_timeout() {
             ProviderError::Timeout
         } else {
@@ -196,8 +254,22 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
         let text = resp.text().await.unwrap_or_default();
+        debug!(
+            provider_id,
+            status,
+            body_preview = %crate::provider::truncate_for_log(&text, 400),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "claude_oauth chat_stream non-success"
+        );
         return Err(map_status(status, &text));
     }
+
+    debug!(
+        provider_id,
+        status,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "claude_oauth chat_stream headers ok; beginning SSE"
+    );
 
     use eventsource_stream::Eventsource;
 
@@ -206,6 +278,7 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
         .map_err(|e| ProviderError::Network(e.to_string()));
 
     let mut decode_state = C::StreamState::default();
+    let provider_id = provider_id.to_string();
     let stream = byte_stream
         .eventsource()
         .map_err(|e| ProviderError::Network(e.to_string()))
@@ -228,12 +301,24 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
                     match C::decode_chunk_stateful(&mut decode_state, &data) {
                         Ok((chunks, _loss)) => Ok(chunks),
                         Err(e) => {
-                            warn!("codec decode error: {}", e);
+                            warn!(
+                                provider_id = %provider_id,
+                                error = %e,
+                                data_preview = %crate::provider::truncate_for_log(&data, 200),
+                                "claude_oauth codec decode error"
+                            );
                             Err(ProviderError::Serialization(e.to_string()))
                         }
                     }
                 }
-                Err(e) => Err(e),
+                Err(e) => {
+                    debug!(
+                        provider_id = %provider_id,
+                        error = %e,
+                        "claude_oauth SSE event error"
+                    );
+                    Err(e)
+                }
             }
         })
         .map(|result| match result {

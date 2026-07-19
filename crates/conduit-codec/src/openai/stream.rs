@@ -275,11 +275,117 @@ fn collect_reasoning_node(node: &Value, out: &mut Vec<String>) {
     }
 }
 
+/// Stateful OpenAI Chat Completions SSE encoder (CLIProxyAPI parity).
+///
+/// - Fixes `created` once for the whole stream (not per-chunk `now()`).
+/// - Stamps `id` / `object` / `model` on every chunk.
+/// - Emits a role-only first frame (`delta.role = "assistant"`) before content.
+/// - Ends with `data: [DONE]` via [`Self::finish`].
+pub struct OpenAiStreamEncoder {
+    resp_id: String,
+    model: String,
+    /// Unix seconds, captured at stream open and reused for every frame.
+    created: i64,
+    role_sent: bool,
+    finished: bool,
+}
+
+impl OpenAiStreamEncoder {
+    pub fn new(resp_id: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            resp_id: resp_id.into(),
+            model: model.into(),
+            created: chrono::Utc::now().timestamp(),
+            role_sent: false,
+            finished: false,
+        }
+    }
+
+    /// Encode one IR chunk into zero or more SSE frames.
+    pub fn push(&mut self, chunk: &CanonicalChunk) -> Vec<String> {
+        if self.finished {
+            return vec![];
+        }
+        let Some(payload) = encode_chunk_inner(chunk, &self.resp_id, &self.model, self.created)
+        else {
+            return vec![];
+        };
+
+        let mut out = Vec::with_capacity(2);
+        // CLIProxyAPI message_start equivalent: role kickoff before first content.
+        if !self.role_sent {
+            out.push(self.role_frame());
+            self.role_sent = true;
+        }
+        out.push(payload);
+        out
+    }
+
+    /// Terminal OpenAI stream sentinel (CLIProxyAPI handler parity).
+    pub fn finish(&mut self) -> Vec<String> {
+        if self.finished {
+            return vec![];
+        }
+        self.finished = true;
+        // Ensure clients that require a role frame still get one on empty streams.
+        let mut out = Vec::new();
+        if !self.role_sent {
+            out.push(self.role_frame());
+            self.role_sent = true;
+        }
+        out.push("data: [DONE]\n\n".to_string());
+        out
+    }
+
+    pub fn created(&self) -> i64 {
+        self.created
+    }
+
+    fn role_frame(&self) -> String {
+        let v = serde_json::json!({
+            "id": self.resp_id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant"},
+                "finish_reason": null
+            }]
+        });
+        format!("data: {v}\n\n")
+    }
+}
+
 /// Encode a canonical chunk into an OpenAI SSE `data: {...}\n\n` line.
+///
+/// Stateless helper (each call uses `Utc::now()` for `created`). Prefer
+/// [`OpenAiStreamEncoder`] on the gateway hot path for fixed `created` + role.
 pub fn encode_chunk(chunk: &CanonicalChunk, resp_id: &str) -> Option<String> {
+    encode_chunk_with_model(chunk, resp_id, "")
+}
+
+/// Like [`encode_chunk`] but stamps the client-facing model / route alias.
+pub fn encode_chunk_with_model(
+    chunk: &CanonicalChunk,
+    resp_id: &str,
+    model: &str,
+) -> Option<String> {
+    encode_chunk_inner(chunk, resp_id, model, chrono::Utc::now().timestamp())
+}
+
+fn encode_chunk_inner(
+    chunk: &CanonicalChunk,
+    resp_id: &str,
+    model: &str,
+    created: i64,
+) -> Option<String> {
     let base = serde_json::json!({
         "id": resp_id,
         "object": "chat.completion.chunk",
+        // Required by strict OpenAI-compatible deserializers (e.g. Grok Build).
+        "created": created,
+        "model": model,
     });
 
     match chunk {
@@ -414,6 +520,55 @@ fn finish_reason_to_str(fr: &FinishReason) -> &'static str {
 mod tests {
     use super::*;
     use crate::anthropic::stream::AnthropicStreamEncoder;
+
+    #[test]
+    fn encode_chunk_includes_created_and_model() {
+        let chunk = CanonicalChunk::text_delta("hi");
+        let sse = encode_chunk_with_model(&chunk, "chatcmpl_test", "grok-4.5").unwrap();
+        assert!(sse.starts_with("data: "));
+        let data = sse.trim_start_matches("data: ").trim();
+        let v: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(v["object"], "chat.completion.chunk");
+        assert_eq!(v["id"], "chatcmpl_test");
+        assert_eq!(v["model"], "grok-4.5");
+        assert!(
+            v.get("created").and_then(|c| c.as_i64()).is_some(),
+            "OpenAI clients require `created` on every chunk: {v}"
+        );
+        assert_eq!(v["choices"][0]["delta"]["content"], "hi");
+    }
+
+    #[test]
+    fn stream_encoder_fixes_created_emits_role_and_done() {
+        let mut enc = OpenAiStreamEncoder::new("chatcmpl_1", "grok-4.5");
+        let created = enc.created();
+
+        let frames = enc.push(&CanonicalChunk::text_delta("hi"));
+        assert_eq!(frames.len(), 2, "role kickoff + content");
+
+        let role: serde_json::Value =
+            serde_json::from_str(frames[0].trim_start_matches("data: ").trim()).unwrap();
+        assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(role["created"], created);
+        assert_eq!(role["model"], "grok-4.5");
+        assert_eq!(role["id"], "chatcmpl_1");
+
+        let content: serde_json::Value =
+            serde_json::from_str(frames[1].trim_start_matches("data: ").trim()).unwrap();
+        assert_eq!(content["choices"][0]["delta"]["content"], "hi");
+        assert_eq!(content["created"], created, "created must be fixed for stream");
+        assert!(content["choices"][0]["delta"].get("role").is_none());
+
+        let more = enc.push(&CanonicalChunk::text_delta("!"));
+        assert_eq!(more.len(), 1, "no second role frame");
+        let more_v: serde_json::Value =
+            serde_json::from_str(more[0].trim_start_matches("data: ").trim()).unwrap();
+        assert_eq!(more_v["created"], created);
+
+        let fin = enc.finish();
+        assert_eq!(fin, vec!["data: [DONE]\n\n".to_string()]);
+        assert!(enc.finish().is_empty(), "finish is idempotent");
+    }
 
     #[test]
     fn done_returns_empty() {

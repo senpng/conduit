@@ -16,6 +16,7 @@ use conduit_upstream::provider::{ProviderClient, ProviderClientConfig};
 use conduit_upstream::RateLimitHeaderSink;
 use futures::stream::{BoxStream, StreamExt};
 use secrecy::SecretString;
+use tracing::debug;
 
 use super::context::ResolvedProvider;
 
@@ -104,7 +105,16 @@ pub async fn dispatch_non_stream(
     auth: &UpstreamAuth,
     rate_limit_sink: Option<RateLimitHeaderSink>,
 ) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
-    match resolve_kind(&resolved.provider_kind)? {
+    let kind = resolve_kind(&resolved.provider_kind)?;
+    debug!(
+        provider_id = %resolved.provider_id,
+        provider_kind = %kind,
+        model_id = %resolved.model_id,
+        upstream_alias = %request.alias,
+        stream = false,
+        "dispatch non-stream"
+    );
+    match kind {
         ProviderKind::OpenAi => openai_non_stream(resolved, request, auth, rate_limit_sink).await,
         ProviderKind::Anthropic => {
             anthropic_non_stream(resolved, request, auth, rate_limit_sink).await
@@ -134,7 +144,16 @@ pub async fn dispatch_stream(
     ),
     ProviderError,
 > {
-    match resolve_kind(&resolved.provider_kind)? {
+    let kind = resolve_kind(&resolved.provider_kind)?;
+    debug!(
+        provider_id = %resolved.provider_id,
+        provider_kind = %kind,
+        model_id = %resolved.model_id,
+        upstream_alias = %request.alias,
+        stream = true,
+        "dispatch stream"
+    );
+    match kind {
         ProviderKind::OpenAi => openai_stream(resolved, request, auth, rate_limit_sink).await,
         ProviderKind::Anthropic => anthropic_stream(resolved, request, auth, rate_limit_sink).await,
         ProviderKind::ClaudeOAuth => {

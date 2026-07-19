@@ -130,6 +130,25 @@ impl WireCodec for OpenAiCodec {
     }
 }
 
+impl OpenAiCodec {
+    /// Encode a stream chunk with an explicit model / route alias.
+    ///
+    /// Prefer [`OpenAiStreamEncoder`] on the gateway path for CLIProxyAPI-parity
+    /// (fixed `created`, role kickoff, `[DONE]`).
+    pub fn encode_chunk_with_model(
+        chunk: &CanonicalChunk,
+        resp_id: &str,
+        model: &str,
+    ) -> (Option<String>, LossReport) {
+        (
+            stream::encode_chunk_with_model(chunk, resp_id, model),
+            LossReport::default(),
+        )
+    }
+}
+
+pub use stream::OpenAiStreamEncoder;
+
 /// If `tool_choice` is `AnyOf`, degrade to `Required` on the cloned request
 /// and return the loss.
 fn degrade_tool_choice(req: &mut CanonicalChatRequest) -> LossReport {

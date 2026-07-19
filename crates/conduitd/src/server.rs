@@ -96,15 +96,81 @@ pub async fn run(
     let key_policy_fn: KeyPolicyFn = Arc::new(move |raw_key: String| {
         let pool = key_pool.clone();
         Box::pin(async move {
+            // Diagnostic fields only — never log the raw secret.
+            let key_len = raw_key.len();
+            let key_prefix: String = raw_key.chars().take(4).collect();
             let hash = hex::encode(blake3::hash(raw_key.as_bytes()).as_bytes());
+            let hash_prefix: String = hash.chars().take(12).collect();
             let repo = KeyRepo::new(&pool);
             match repo.get_by_hash(&hash).await {
-                Ok(Some(row)) => Ok(Some(KeyPolicy {
-                    key_id: row.id,
-                    model_whitelist: serde_json::from_str(&row.model_whitelist).unwrap_or_default(),
-                    rate_limit_rpm: row.rate_limit_rpm.map(|v| v as u32),
-                })),
-                Ok(None) => Ok(None),
+                Ok(Some(row)) => {
+                    tracing::debug!(
+                        key_id = %row.id,
+                        key_len,
+                        key_prefix = %key_prefix,
+                        hash_prefix = %hash_prefix,
+                        rate_limit_rpm = ?row.rate_limit_rpm,
+                        "downstream key auth ok"
+                    );
+                    Ok(Some(KeyPolicy {
+                        key_id: row.id,
+                        model_whitelist: serde_json::from_str(&row.model_whitelist)
+                            .unwrap_or_default(),
+                        rate_limit_rpm: row.rate_limit_rpm.map(|v| v as u32),
+                    }))
+                }
+                Ok(None) => {
+                    // Distinguish unknown vs disabled/revoked for easier ops debugging.
+                    match repo.get_by_hash_any(&hash).await {
+                        Ok(Some(row)) if row.deleted_at.is_some() => {
+                            tracing::debug!(
+                                key_id = %row.id,
+                                key_len,
+                                key_prefix = %key_prefix,
+                                hash_prefix = %hash_prefix,
+                                deleted_at = ?row.deleted_at,
+                                "downstream key auth rejected: revoked/deleted"
+                            );
+                        }
+                        Ok(Some(row)) if !row.enabled => {
+                            tracing::debug!(
+                                key_id = %row.id,
+                                key_len,
+                                key_prefix = %key_prefix,
+                                hash_prefix = %hash_prefix,
+                                "downstream key auth rejected: disabled"
+                            );
+                        }
+                        Ok(Some(row)) => {
+                            tracing::debug!(
+                                key_id = %row.id,
+                                key_len,
+                                key_prefix = %key_prefix,
+                                hash_prefix = %hash_prefix,
+                                enabled = row.enabled,
+                                "downstream key auth rejected: not usable"
+                            );
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                key_len,
+                                key_prefix = %key_prefix,
+                                hash_prefix = %hash_prefix,
+                                "downstream key auth rejected: hash not in database \
+                                 (use a conduit downstream key from `conduitctl key create`, \
+                                 not an upstream provider token)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                hash_prefix = %hash_prefix,
+                                "downstream key diagnostic lookup failed"
+                            );
+                        }
+                    }
+                    Ok(None)
+                }
                 Err(e) => Err(GatewayError::Internal(format!(
                     "key policy lookup failed: {e}"
                 ))),

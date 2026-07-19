@@ -16,7 +16,7 @@ use futures::stream::{BoxStream, StreamExt};
 use reqwest::StatusCode;
 use secrecy::SecretString;
 use serde_json::{json, Map, Value};
-use tracing::{instrument, warn};
+use tracing::{debug, instrument, warn};
 
 use crate::{
     auth::{AuthStrategy, BearerAuth, CompositeAuth, HeaderAuth},
@@ -274,14 +274,23 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
     }
 
     fn map_status_error(&self, status: StatusCode, body: &str) -> ProviderError {
-        match status.as_u16() {
+        let err = match status.as_u16() {
             401 | 403 => ProviderError::Unauthorized(body.to_string()),
             429 => ProviderError::RateLimited(body.to_string()),
             400 | 422 => ProviderError::InvalidRequest(body.to_string()),
             413 => ProviderError::ContextLengthExceeded,
             s if s >= 500 => ProviderError::Upstream5xx(format!("{}: {}", s, body)),
             s => ProviderError::InvalidRequest(format!("HTTP {}: {}", s, body)),
-        }
+        };
+        debug!(
+            provider = %self.config.id,
+            kind = %self.config.kind,
+            status = status.as_u16(),
+            body_preview = %truncate_for_log(body, 400),
+            error = %err,
+            "upstream non-success status"
+        );
+        err
     }
 
     #[instrument(skip(self, req, secret), fields(provider = %self.config.id, alias = %req.alias))]
@@ -320,6 +329,19 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         }
         apply_request_overrides(&mut body, &self.config.request_overrides);
 
+        let body_bytes = body.to_string().len();
+        debug!(
+            provider = %self.config.id,
+            kind = %self.config.kind,
+            url = %url,
+            alias = %req.alias,
+            stream = false,
+            body_bytes,
+            message_count = req.messages.len(),
+            overall_ms = self.config.timeouts.overall_ms,
+            "upstream chat request"
+        );
+
         let mut builder = self
             .client()
             .post(&url)
@@ -328,7 +350,16 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         builder = self.apply_auth(builder, secret);
         builder = self.apply_provider_headers(builder);
 
+        let started = std::time::Instant::now();
         let resp = builder.send().await.map_err(|e| {
+            debug!(
+                provider = %self.config.id,
+                url = %url,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %e,
+                is_timeout = e.is_timeout(),
+                "upstream chat transport error"
+            );
             if e.is_timeout() {
                 ProviderError::Timeout
             } else {
@@ -352,10 +383,35 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         let val: Value = resp
             .json()
             .await
-            .map_err(|e| ProviderError::Serialization(e.to_string()))?;
+            .map_err(|e| {
+                debug!(
+                    provider = %self.config.id,
+                    error = %e,
+                    "upstream chat response json parse failed"
+                );
+                ProviderError::Serialization(e.to_string())
+            })?;
 
         let (response, decode_loss) = C::decode_response(val, &req.alias)
-            .map_err(|e| ProviderError::Serialization(e.to_string()))?;
+            .map_err(|e| {
+                debug!(
+                    provider = %self.config.id,
+                    error = %e,
+                    "upstream chat response decode failed"
+                );
+                ProviderError::Serialization(e.to_string())
+            })?;
+
+        debug!(
+            provider = %self.config.id,
+            kind = %self.config.kind,
+            status = status.as_u16(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            prompt_tokens = response.usage.prompt_tokens,
+            completion_tokens = response.usage.completion_tokens,
+            finish_reason = ?response.finish_reason,
+            "upstream chat response ok"
+        );
 
         let mut combined = encode_loss;
         combined.merge(decode_loss);
@@ -392,17 +448,47 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         }
         apply_request_overrides(&mut body, &self.config.request_overrides);
 
+        let body_bytes = body.to_string().len();
+        debug!(
+            provider = %self.config.id,
+            kind = %self.config.kind,
+            url = %url,
+            alias = %req.alias,
+            stream = true,
+            body_bytes,
+            message_count = req.messages.len(),
+            first_byte_ms = self.config.timeouts.first_byte_ms,
+            "upstream chat_stream request"
+        );
+
         let mut builder = self.client().post(&url).json(&body);
         builder = self.apply_auth(builder, secret);
         builder = self.apply_provider_headers(builder);
 
+        let started = std::time::Instant::now();
         let resp = tokio::time::timeout(
             Duration::from_millis(self.config.timeouts.first_byte_ms),
             builder.send(),
         )
         .await
-        .map_err(|_| ProviderError::Timeout)?
+        .map_err(|_| {
+            debug!(
+                provider = %self.config.id,
+                url = %url,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "upstream chat_stream first-byte timeout"
+            );
+            ProviderError::Timeout
+        })?
         .map_err(|e| {
+            debug!(
+                provider = %self.config.id,
+                url = %url,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %e,
+                is_timeout = e.is_timeout(),
+                "upstream chat_stream transport error"
+            );
             if e.is_timeout() {
                 ProviderError::Timeout
             } else {
@@ -422,8 +508,17 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
             return Err(self.map_status_error(status, &text));
         }
 
+        debug!(
+            provider = %self.config.id,
+            kind = %self.config.kind,
+            status = status.as_u16(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "upstream chat_stream headers ok; beginning SSE"
+        );
+
         let sse = response_to_sse(resp);
         let mut decode_state = C::StreamState::default();
+        let provider_id = self.config.id.clone();
         let stream = sse
             .map(move |result| match result {
                 Ok(data) => {
@@ -433,12 +528,24 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
                     match C::decode_chunk_stateful(&mut decode_state, &data) {
                         Ok((chunks, _loss)) => Ok(chunks),
                         Err(e) => {
-                            warn!("codec decode error: {}", e);
+                            warn!(
+                                provider = %provider_id,
+                                error = %e,
+                                data_preview = %truncate_for_log(&data, 200),
+                                "codec decode error"
+                            );
                             Err(ProviderError::Serialization(e.to_string()))
                         }
                     }
                 }
-                Err(e) => Err(e),
+                Err(e) => {
+                    debug!(
+                        provider = %provider_id,
+                        error = %e,
+                        "upstream SSE event error"
+                    );
+                    Err(e)
+                }
             })
             .map(|result| match result {
                 Ok(chunks) => chunks.into_iter().map(Ok).collect::<Vec<_>>(),
@@ -506,6 +613,19 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
             Err(_) => HealthStatus::Unhealthy,
         }
     }
+}
+
+/// Truncate a string for log fields without panicking on multi-byte UTF-8.
+pub(crate) fn truncate_for_log(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn apply_codex_service_tier(body: &mut Value, request: &CanonicalChatRequest) {

@@ -480,6 +480,7 @@ impl ResponsesStreamEncoder {
         json!({
             "id": self.response_id,
             "object": "response",
+            "created_at": chrono::Utc::now().timestamp(),
             "model": self.model,
             "status": status,
             "store": self.store,
@@ -1083,6 +1084,7 @@ impl WireCodec for OpenAiResponsesCodec {
         json!({
             "id": resp.id,
             "object": "response",
+            "created_at": resp.created_at.timestamp(),
             "model": resp.model,
             "status": "completed",
             "output": output,

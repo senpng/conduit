@@ -236,7 +236,7 @@ console_port = 4001
 | `CONDUIT_PORT` | `conduitd` | `4000` | Gateway port override |
 | `CONDUIT_DATA_DIR` | `conduitd` | `~/.conduit` | Local state directory |
 | `CONDUIT_MASTER_PASSWORD` | `conduitd` | _(empty)_ | Master password for secret encryption |
-| `CONDUIT_LOG` | `conduitd` | `info` | Log filter, for example `debug` |
+| `CONDUIT_LOG` | `conduitd` | `info` | Log filter, for example `debug,sqlx::query=off` |
 | `CONDUIT_LOG_FORMAT` | `conduitd` | `pretty` | `pretty` or `json` |
 | `CONDUIT_CONSOLE_ADDR` | `conduitctl` | `http://127.0.0.1:4001` | Console API base URL |
 | `CONDUIT_OUTPUT` | `conduitctl` | `human` | `human` or `json` where supported |

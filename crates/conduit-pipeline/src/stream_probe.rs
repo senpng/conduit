@@ -13,7 +13,7 @@ use conduit_ir::{
 };
 use conduit_quota::{engine::QuotaEngine, QuotaAttemptRecord, QuotaRecordRequest};
 use futures::Stream;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use super::egress::{compute_cost, ModelPricing};
 
@@ -185,6 +185,25 @@ impl UsageTrackingStream {
             }),
         });
 
+        info!(
+            request_id = %self.meta.request_id,
+            alias = %self.meta.alias,
+            provider_id = %self.meta.provider_id,
+            model_id = %self.meta.model_id,
+            status = %status,
+            error_class = error_class.as_deref().unwrap_or(""),
+            http_status = ?http_status,
+            duration_ms,
+            ttfb_ms = ?self.ttfb_ms,
+            attempt_no = self.meta.attempt_no,
+            prompt_tokens = self.usage_acc.prompt_tokens,
+            completion_tokens = self.usage_acc.completion_tokens,
+            total_tokens = self.usage_acc.total_tokens,
+            cost_usd,
+            finish_reason = self.finish_reason.as_deref().unwrap_or(""),
+            "pipeline stream complete"
+        );
+
         let record = QuotaRecordRequest {
             request_id: self.meta.request_id.clone(),
             downstream_key_id: key_id,
@@ -218,7 +237,16 @@ impl UsageTrackingStream {
         let quota = self.quota.clone();
         tokio::spawn(async move {
             if let Err(e) = quota.record(&record).await {
-                warn!(error = %e, "stream usage record failed");
+                warn!(
+                    error = %e,
+                    request_id = %record.request_id,
+                    "stream usage record failed"
+                );
+            } else {
+                debug!(
+                    request_id = %record.request_id,
+                    "stream usage record written"
+                );
             }
         });
     }
@@ -230,12 +258,27 @@ impl Stream for UsageTrackingStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
+                let first_byte = self.ttfb_ms.is_none();
                 self.stamp_ttfb();
+                if first_byte {
+                    debug!(
+                        request_id = %self.meta.request_id,
+                        provider_id = %self.meta.provider_id,
+                        ttfb_ms = ?self.ttfb_ms,
+                        "stream first chunk"
+                    );
+                }
                 self.merge_chunk(&chunk);
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(e))) => {
                 // Clone error for ledger; still surface original to client.
+                debug!(
+                    request_id = %self.meta.request_id,
+                    provider_id = %self.meta.provider_id,
+                    error = %e,
+                    "stream terminal error"
+                );
                 self.terminal_error = Some(clone_provider_error(&e));
                 self.finalize();
                 Poll::Ready(Some(Err(e)))

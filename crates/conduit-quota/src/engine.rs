@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use conduit_ir::error::QuotaError;
+use tracing::debug;
 
 use crate::check::{QuotaCheckRequest, QuotaRecordRequest, RecordFn};
 
@@ -93,10 +94,28 @@ impl QuotaEngine for InMemoryQuotaEngine {
                 .check_and_increment(&req.downstream_key_id, limit as u64)
                 .await
             {
+                debug!(
+                    key_id = %req.downstream_key_id,
+                    alias = %req.model_alias,
+                    limit,
+                    "quota rpm exceeded"
+                );
                 return Err(QuotaError::RateLimitExceeded {
                     requests_per_minute: limit,
                 });
             }
+            debug!(
+                key_id = %req.downstream_key_id,
+                alias = %req.model_alias,
+                limit,
+                "quota rpm check ok"
+            );
+        } else {
+            debug!(
+                key_id = %req.downstream_key_id,
+                alias = %req.model_alias,
+                "quota check skipped (no rpm limit)"
+            );
         }
         Ok(())
     }
@@ -104,6 +123,22 @@ impl QuotaEngine for InMemoryQuotaEngine {
     async fn record(&self, req: &QuotaRecordRequest) -> Result<(), QuotaError> {
         // Always persist: request ledger needs zero-token success and errors
         // for success-rate / latency / routing observability.
+        debug!(
+            request_id = %req.request_id,
+            key_id = %req.downstream_key_id,
+            alias = req.alias.as_deref().unwrap_or(""),
+            provider_id = req.provider_id.as_deref().unwrap_or(""),
+            status = %req.status,
+            stream = req.stream,
+            prompt_tokens = req.prompt_tokens,
+            completion_tokens = req.completion_tokens,
+            total_tokens = req.total_tokens,
+            cost_usd = req.cost_usd,
+            duration_ms = ?req.duration_ms,
+            attempt_no = req.attempt_no,
+            attempt_count = req.attempt_count,
+            "quota record"
+        );
         (self.record_fn)(req.clone()).await
     }
 }

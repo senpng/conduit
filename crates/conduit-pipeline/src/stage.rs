@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use conduit_ir::error::GatewayError;
 use conduit_router::{decision::route_with_options, table::RoutingTable, PoolCursorStore};
+use tracing::debug;
 
 use super::context::{PipelineContext, ResolvedProvider};
 
@@ -23,6 +24,15 @@ pub fn route_request_with_skip(
     pool_cursors: Option<&PoolCursorStore>,
 ) -> Result<(), GatewayError> {
     let alias = ctx.request.alias.clone();
+    let skip_count = skip_provider_ids.map(|s| s.len()).unwrap_or(0);
+    debug!(
+        request_id = %ctx.request_id,
+        alias = %alias,
+        attempt_no = ctx.attempt_no,
+        preferred = preferred_provider_id.unwrap_or(""),
+        skip_count,
+        "route decision start"
+    );
     let decision = route_with_options(
         &alias,
         &ctx.routing_table,
@@ -33,8 +43,27 @@ pub fn route_request_with_skip(
         pool_cursors,
     )
     .map_err(|e| {
+        debug!(
+            request_id = %ctx.request_id,
+            alias = %alias,
+            attempt_no = ctx.attempt_no,
+            error = %e,
+            "route decision failed"
+        );
         GatewayError::Routing(format!("routing failed for '{}': {}", alias, e))
     })?;
+
+    debug!(
+        request_id = %ctx.request_id,
+        alias = %alias,
+        provider_id = %decision.provider_id,
+        provider_kind = %decision.provider_kind,
+        model_id = %decision.model_id,
+        base_url = decision.base_url.as_deref().unwrap_or(""),
+        attempt_no = decision.attempt_no,
+        override_keys = decision.request_overrides.len(),
+        "route decision ok"
+    );
 
     ctx.resolved = Some(ResolvedProvider {
         provider_id: decision.provider_id.clone(),
@@ -57,14 +86,32 @@ pub fn should_retry(
     let alias = &ctx.request.alias;
     let route = match table.get(alias) {
         Some(r) => r,
-        None => return false,
+        None => {
+            debug!(
+                request_id = %ctx.request_id,
+                alias,
+                "should_retry: no route for alias"
+            );
+            return false;
+        }
     };
 
-    let should = error
-        .http_status_hint()
+    let status_hint = error.http_status_hint();
+    let should = status_hint
         .map(|s| route.retry_policy.should_retry_status(s))
         .unwrap_or(false)
         && ctx.attempt_no < route.retry_policy.max_retries;
+
+    debug!(
+        request_id = %ctx.request_id,
+        alias,
+        attempt_no = ctx.attempt_no,
+        max_retries = route.retry_policy.max_retries,
+        status_hint = ?status_hint,
+        retryable = should,
+        error = %error,
+        "should_retry decision"
+    );
 
     if should {
         ctx.attempt_no += 1;
