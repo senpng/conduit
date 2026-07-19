@@ -21,7 +21,7 @@ pub use response_continuation_repo::{ResponseContinuationRepo, RESPONSE_CONTINUA
 pub use route_repo::RouteRepo;
 pub use schema::{
     secret_key_id_from_ref, AppEventRow, DownstreamKeyRow, PricingRow, ProviderRow, RouteRow,
-    UsageRecordRow,
+    UsageAttemptRow, UsageRecordRow,
 };
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -29,8 +29,8 @@ use sqlx::{
 };
 use thiserror::Error;
 pub use usage_repo::{
-    new_usage_record, UsageDayRow, UsageListOpts, UsageListPage, UsageListSort, UsageModelRow,
-    UsageRepo, UsageSummaryRow,
+    new_usage_attempt, new_usage_record, UsageDayRow, UsageListOpts, UsageListPage, UsageListSort,
+    UsageModelRow, UsageOutcomeSummary, UsageProviderRow, UsageRepo, UsageSummaryRow,
 };
 
 // ── Error type ────────────────────────────────────────────────────────────────

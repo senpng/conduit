@@ -20,7 +20,9 @@ use super::{
     ingress::{self, KeyPolicy},
     provider::{dispatch_non_stream, dispatch_stream, UpstreamAuth},
     stage::{route_request_with_skip, should_retry},
-    stream_probe::UsageTrackingStream,
+    stream_probe::{
+        finish_reason_str, provider_error_class, StreamRecordMeta, UsageTrackingStream,
+    },
 };
 
 // ── Async dependency types ────────────────────────────────────────────────────
@@ -161,7 +163,9 @@ impl PipelineHandle {
         mut resolved: ResolvedProvider,
         mut auth: UpstreamAuth,
     ) -> Result<PipelineResult, GatewayError> {
+        let mut attempts: Vec<conduit_quota::QuotaAttemptRecord> = Vec::new();
         loop {
+            let attempt_started = chrono::Utc::now();
             let upstream_req = request_for_upstream(&ctx.request, &resolved);
             let result = dispatch_non_stream(
                 &resolved,
@@ -173,6 +177,7 @@ impl PipelineHandle {
 
             match result {
                 Ok((resp, loss)) => {
+                    let attempt_ms = elapsed_ms(attempt_started);
                     ctx.loss_report = loss;
                     ctx.merge_usage(&resp.usage);
                     let cost_usd = egress::compute_cost(
@@ -182,13 +187,45 @@ impl PipelineHandle {
                         |pk, mid| (self.deps.pricing_fn)(pk, mid),
                     );
 
-                    self.record_usage(&ctx, &resolved, cost_usd, false).await;
+                    attempts.push(attempt_record(
+                        &resolved,
+                        "ok",
+                        None,
+                        None,
+                        Some(attempt_ms),
+                        // Non-stream: header TTFB is not exposed by the HTTP client;
+                        // leave per-try ttfb null (main row uses duration only).
+                        None,
+                    ));
+                    self.record_usage(
+                        &ctx,
+                        &resolved,
+                        cost_usd,
+                        false,
+                        "ok",
+                        None,
+                        None,
+                        Some(finish_reason_str(&resp.finish_reason)),
+                        Some(ctx.latency_ms()),
+                        None,
+                        &attempts,
+                    )
+                    .await;
                     self.remember_session_affinity(&ctx, &resolved);
                     return Ok(PipelineResult::Complete(resp));
                 }
 
                 Err(e) => {
+                    let attempt_ms = elapsed_ms(attempt_started);
                     self.note_upstream_error(&resolved, &e);
+                    attempts.push(attempt_record(
+                        &resolved,
+                        "error",
+                        Some(provider_error_class(&e)),
+                        e.http_status_hint(),
+                        Some(attempt_ms),
+                        None,
+                    ));
                     let table = ctx.routing_table.clone();
                     if should_retry(&mut ctx, &table, &e) {
                         let preferred = self.session_preferred(&ctx);
@@ -199,6 +236,20 @@ impl PipelineHandle {
                             Some(&skip),
                             Some(self.deps.pool_cursors.as_ref()),
                         ) {
+                            self.record_usage(
+                                &ctx,
+                                &resolved,
+                                0.0,
+                                false,
+                                "error",
+                                Some("routing".into()),
+                                None,
+                                None,
+                                Some(ctx.latency_ms()),
+                                None,
+                                &attempts,
+                            )
+                            .await;
                             return Err(routing_err);
                         }
                         let new_resolved = ctx.resolved.as_ref().unwrap().clone();
@@ -208,10 +259,40 @@ impl PipelineHandle {
                                 s.client_headers = client_headers;
                                 s
                             }
-                            Err(ae) => return Err(ae),
+                            Err(ae) => {
+                                self.record_usage(
+                                    &ctx,
+                                    &resolved,
+                                    0.0,
+                                    false,
+                                    "error",
+                                    Some("unauthorized".into()),
+                                    Some(401),
+                                    None,
+                                    Some(ctx.latency_ms()),
+                                    None,
+                                    &attempts,
+                                )
+                                .await;
+                                return Err(ae);
+                            }
                         };
                         resolved = new_resolved;
                     } else {
+                        self.record_usage(
+                            &ctx,
+                            &resolved,
+                            0.0,
+                            false,
+                            "error",
+                            Some(provider_error_class(&e)),
+                            e.http_status_hint(),
+                            None,
+                            Some(ctx.latency_ms()),
+                            None,
+                            &attempts,
+                        )
+                        .await;
                         return Err(GatewayError::Provider(e));
                     }
                 }
@@ -225,7 +306,9 @@ impl PipelineHandle {
         mut resolved: ResolvedProvider,
         mut auth: UpstreamAuth,
     ) -> Result<PipelineResult, GatewayError> {
+        let mut prior_attempts: Vec<conduit_quota::QuotaAttemptRecord> = Vec::new();
         loop {
+            let attempt_started = chrono::Utc::now();
             let upstream_req = request_for_upstream(&ctx.request, &resolved);
             let result = dispatch_stream(
                 &resolved,
@@ -240,23 +323,46 @@ impl PipelineHandle {
                     ctx.loss_report = loss;
                     self.remember_session_affinity(&ctx, &resolved);
 
+                    let preferred = self.session_preferred(&ctx);
+                    let route_meta =
+                        route_observability(&ctx, &resolved, preferred.as_deref());
+                    let attempt_count = (resolved.attempt_no + 1).max(1);
                     let instrumented = UsageTrackingStream::new(
                         stream,
                         self.deps.pricing_fn.clone(),
                         self.deps.quota.clone(),
-                        ctx.request_id.clone(),
-                        ctx.downstream_key_id.clone(),
-                        ctx.started_at,
-                        ctx.request.alias.clone(),
-                        resolved.provider_id.clone(),
-                        resolved.provider_kind.clone(),
-                        resolved.model_id.clone(),
+                        StreamRecordMeta {
+                            request_id: ctx.request_id.clone(),
+                            downstream_key_id: ctx.downstream_key_id.clone(),
+                            alias: ctx.request.alias.clone(),
+                            provider_id: resolved.provider_id.clone(),
+                            provider_kind: resolved.provider_kind.clone(),
+                            model_id: resolved.model_id.clone(),
+                            started_at: ctx.started_at,
+                            route_strategy: route_meta.route_strategy,
+                            attempt_no: resolved.attempt_no,
+                            attempt_count,
+                            session_id: ctx.session_id.clone(),
+                            affinity_hit: route_meta.affinity_hit,
+                            pool_id: route_meta.pool_id,
+                            selected_reason: route_meta.selected_reason,
+                            prior_attempts,
+                        },
                     );
                     return Ok(PipelineResult::Streaming(Box::pin(instrumented)));
                 }
 
                 Err(e) => {
+                    let attempt_ms = elapsed_ms(attempt_started);
                     self.note_upstream_error(&resolved, &e);
+                    prior_attempts.push(attempt_record(
+                        &resolved,
+                        "error",
+                        Some(provider_error_class(&e)),
+                        e.http_status_hint(),
+                        Some(attempt_ms),
+                        None,
+                    ));
                     let table = ctx.routing_table.clone();
                     if should_retry(&mut ctx, &table, &e) {
                         let preferred = self.session_preferred(&ctx);
@@ -267,6 +373,20 @@ impl PipelineHandle {
                             Some(&skip),
                             Some(self.deps.pool_cursors.as_ref()),
                         ) {
+                            self.record_usage(
+                                &ctx,
+                                &resolved,
+                                0.0,
+                                true,
+                                "error",
+                                Some("routing".into()),
+                                None,
+                                None,
+                                Some(ctx.latency_ms()),
+                                None,
+                                &prior_attempts,
+                            )
+                            .await;
                             return Err(routing_err);
                         }
                         let new_resolved = ctx.resolved.as_ref().unwrap().clone();
@@ -276,10 +396,40 @@ impl PipelineHandle {
                                 s.client_headers = client_headers;
                                 s
                             }
-                            Err(ae) => return Err(ae),
+                            Err(ae) => {
+                                self.record_usage(
+                                    &ctx,
+                                    &resolved,
+                                    0.0,
+                                    true,
+                                    "error",
+                                    Some("unauthorized".into()),
+                                    Some(401),
+                                    None,
+                                    Some(ctx.latency_ms()),
+                                    None,
+                                    &prior_attempts,
+                                )
+                                .await;
+                                return Err(ae);
+                            }
                         };
                         resolved = new_resolved;
                     } else {
+                        self.record_usage(
+                            &ctx,
+                            &resolved,
+                            0.0,
+                            true,
+                            "error",
+                            Some(provider_error_class(&e)),
+                            e.http_status_hint(),
+                            None,
+                            Some(ctx.latency_ms()),
+                            None,
+                            &prior_attempts,
+                        )
+                        .await;
                         return Err(GatewayError::Provider(e));
                     }
                 }
@@ -392,18 +542,35 @@ impl PipelineHandle {
             .remember(sid, alias, &resolved.provider_id);
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn record_usage(
         &self,
         ctx: &PipelineContext,
         resolved: &ResolvedProvider,
         cost_usd: f64,
         stream: bool,
+        status: &str,
+        error_class: Option<String>,
+        http_status: Option<u16>,
+        finish_reason: Option<String>,
+        duration_ms: Option<u64>,
+        ttfb_ms: Option<u64>,
+        attempts: &[conduit_quota::QuotaAttemptRecord],
     ) {
         let key_id = ctx
             .downstream_key_id
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "_anonymous".into());
+        let preferred = self.session_preferred(ctx);
+        let route_meta = route_observability(ctx, resolved, preferred.as_deref());
+        let attempt_no = resolved.attempt_no;
+        let attempt_count = attempts
+            .iter()
+            .map(|a| a.attempt_no + 1)
+            .max()
+            .unwrap_or(attempt_no + 1)
+            .max(1);
         let req = conduit_quota::QuotaRecordRequest {
             request_id: ctx.request_id.clone(),
             downstream_key_id: key_id,
@@ -419,11 +586,117 @@ impl PipelineHandle {
             cache_write_tokens: ctx.usage.cache_write_tokens,
             cost_usd,
             stream,
+            status: status.into(),
+            error_class,
+            http_status,
+            finish_reason,
+            duration_ms,
+            ttfb_ms,
+            route_strategy: route_meta.route_strategy,
+            attempt_no,
+            attempt_count,
+            session_id: ctx.session_id.clone(),
+            affinity_hit: route_meta.affinity_hit,
+            pool_id: route_meta.pool_id,
+            selected_reason: route_meta.selected_reason,
+            attempts: attempts.to_vec(),
         };
         if let Err(e) = self.deps.quota.record(&req).await {
             warn!(error = %e, request_id = %ctx.request_id, "usage record failed");
         }
     }
+}
+
+struct RouteObs {
+    route_strategy: Option<String>,
+    affinity_hit: Option<bool>,
+    pool_id: Option<String>,
+    selected_reason: Option<String>,
+}
+
+fn route_observability(
+    ctx: &PipelineContext,
+    resolved: &ResolvedProvider,
+    session_preferred: Option<&str>,
+) -> RouteObs {
+    let route = ctx.routing_table.get(&ctx.request.alias);
+    let has_pool = route
+        .map(|r| r.targets.iter().any(|t| t.is_pool_target()))
+        .unwrap_or(false);
+    let pool_id = route.and_then(|r| {
+        r.targets
+            .iter()
+            .find_map(|t| t.pool_id.clone().or_else(|| t.pool_kind.clone()))
+    });
+    let route_strategy = route.map(|r| {
+        if has_pool {
+            "pool".to_string()
+        } else {
+            match r.strategy {
+                conduit_router::table::RoutingStrategy::Fixed => "fixed".into(),
+                conduit_router::table::RoutingStrategy::Fallback => "fallback".into(),
+                conduit_router::table::RoutingStrategy::Weighted => "weighted".into(),
+            }
+        }
+    });
+
+    let pin_match = session_preferred
+        .map(|p| p == resolved.provider_id.as_str())
+        .unwrap_or(false);
+    let affinity_hit = if session_preferred.is_some() && resolved.attempt_no == 0 {
+        Some(pin_match)
+    } else if session_preferred.is_some() {
+        Some(false)
+    } else {
+        None
+    };
+
+    let selected_reason = if resolved.attempt_no > 0 {
+        Some("retry".into())
+    } else if pin_match {
+        Some("session_pin".into())
+    } else if has_pool {
+        Some("pool".into())
+    } else {
+        route_strategy.clone()
+    };
+
+    RouteObs {
+        route_strategy,
+        affinity_hit,
+        pool_id,
+        selected_reason,
+    }
+}
+
+fn attempt_record(
+    resolved: &ResolvedProvider,
+    status: &str,
+    error_class: Option<String>,
+    http_status: Option<u16>,
+    duration_ms: Option<u64>,
+    ttfb_ms: Option<u64>,
+) -> conduit_quota::QuotaAttemptRecord {
+    conduit_quota::QuotaAttemptRecord {
+        attempt_no: resolved.attempt_no,
+        provider_id: Some(resolved.provider_id.clone()),
+        provider_kind: Some(resolved.provider_kind.clone()),
+        model_id: Some(resolved.model_id.clone()),
+        status: status.into(),
+        error_class,
+        http_status,
+        duration_ms,
+        ttfb_ms,
+        reason: Some(if resolved.attempt_no == 0 {
+            "initial".into()
+        } else {
+            "retry".into()
+        }),
+    }
+}
+
+fn elapsed_ms(started: chrono::DateTime<chrono::Utc>) -> u64 {
+    (chrono::Utc::now() - started).num_milliseconds().max(0) as u64
 }
 
 fn request_for_upstream(

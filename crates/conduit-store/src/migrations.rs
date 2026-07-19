@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS downstream_keys (
 CREATE INDEX IF NOT EXISTS idx_downstream_keys_hash
     ON downstream_keys(key_hash);
 
--- Per-request consumption ledger.
+-- Per-request ledger (tokens/cost + outcome/timing/routing).
 CREATE TABLE IF NOT EXISTS usage_records (
     id                   TEXT PRIMARY KEY,
     ts                   TEXT NOT NULL,
@@ -73,7 +73,20 @@ CREATE TABLE IF NOT EXISTS usage_records (
     cache_read_tokens    INTEGER NOT NULL DEFAULT 0,
     cache_write_tokens   INTEGER NOT NULL DEFAULT 0,
     cost_usd             REAL NOT NULL DEFAULT 0,
-    stream               INTEGER NOT NULL DEFAULT 0
+    stream               INTEGER NOT NULL DEFAULT 0,
+    status               TEXT NOT NULL DEFAULT 'ok',
+    error_class          TEXT,
+    http_status          INTEGER,
+    finish_reason        TEXT,
+    duration_ms          INTEGER,
+    ttfb_ms              INTEGER,
+    route_strategy       TEXT,
+    attempt_no           INTEGER NOT NULL DEFAULT 0,
+    attempt_count        INTEGER NOT NULL DEFAULT 1,
+    session_id           TEXT,
+    affinity_hit         INTEGER,
+    pool_id              TEXT,
+    selected_reason      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_usage_ts
@@ -84,6 +97,32 @@ CREATE INDEX IF NOT EXISTS idx_usage_key_ts
 
 CREATE INDEX IF NOT EXISTS idx_usage_request
     ON usage_records(request_id);
+
+CREATE INDEX IF NOT EXISTS idx_usage_provider_ts
+    ON usage_records(provider_id, ts DESC);
+
+CREATE INDEX IF NOT EXISTS idx_usage_status_ts
+    ON usage_records(status, ts DESC);
+
+-- Per-upstream-try rows linked by request_id (retry / fallback chain).
+CREATE TABLE IF NOT EXISTS usage_attempts (
+    id                   TEXT PRIMARY KEY,
+    request_id           TEXT NOT NULL,
+    attempt_no           INTEGER NOT NULL,
+    provider_id          TEXT,
+    provider_kind        TEXT,
+    model_id             TEXT,
+    status               TEXT NOT NULL,
+    error_class          TEXT,
+    http_status          INTEGER,
+    duration_ms          INTEGER,
+    ttfb_ms              INTEGER,
+    reason               TEXT,
+    ts                   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_attempts_request
+    ON usage_attempts(request_id, attempt_no);
 
 CREATE TABLE IF NOT EXISTS pricing (
     provider_kind           TEXT NOT NULL,
@@ -153,7 +192,80 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StoreError> {
     remove_legacy_response_function_calls_column(pool).await?;
     add_soft_delete_columns(pool).await?;
     migrate_routes_soft_delete_unique(pool).await?;
+    migrate_usage_request_ledger(pool).await?;
     info!("conduit-store schema up to date");
+    Ok(())
+}
+
+/// Expand pre-ledger `usage_records` and ensure `usage_attempts` exists.
+async fn migrate_usage_request_ledger(pool: &SqlitePool) -> Result<(), StoreError> {
+    for sql in [
+        "ALTER TABLE usage_records ADD COLUMN status TEXT NOT NULL DEFAULT 'ok'",
+        "ALTER TABLE usage_records ADD COLUMN error_class TEXT",
+        "ALTER TABLE usage_records ADD COLUMN http_status INTEGER",
+        "ALTER TABLE usage_records ADD COLUMN finish_reason TEXT",
+        "ALTER TABLE usage_records ADD COLUMN duration_ms INTEGER",
+        "ALTER TABLE usage_records ADD COLUMN ttfb_ms INTEGER",
+        "ALTER TABLE usage_records ADD COLUMN route_strategy TEXT",
+        "ALTER TABLE usage_records ADD COLUMN attempt_no INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE usage_records ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE usage_records ADD COLUMN session_id TEXT",
+        "ALTER TABLE usage_records ADD COLUMN affinity_hit INTEGER",
+        "ALTER TABLE usage_records ADD COLUMN pool_id TEXT",
+        "ALTER TABLE usage_records ADD COLUMN selected_reason TEXT",
+    ] {
+        if let Err(error) = sqlx::query(sql).execute(pool).await {
+            if !error.to_string().contains("duplicate column name") {
+                return Err(StoreError::Migration(error.to_string()));
+            }
+        }
+    }
+
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS usage_attempts (
+            id                   TEXT PRIMARY KEY,
+            request_id           TEXT NOT NULL,
+            attempt_no           INTEGER NOT NULL,
+            provider_id          TEXT,
+            provider_kind        TEXT,
+            model_id             TEXT,
+            status               TEXT NOT NULL,
+            error_class          TEXT,
+            http_status          INTEGER,
+            duration_ms          INTEGER,
+            ttfb_ms              INTEGER,
+            reason               TEXT,
+            ts                   TEXT NOT NULL
+        )"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StoreError::Migration(e.to_string()))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_usage_attempts_request \
+         ON usage_attempts(request_id, attempt_no)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StoreError::Migration(e.to_string()))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_usage_provider_ts \
+         ON usage_records(provider_id, ts DESC)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StoreError::Migration(e.to_string()))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_usage_status_ts \
+         ON usage_records(status, ts DESC)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| StoreError::Migration(e.to_string()))?;
+
     Ok(())
 }
 

@@ -8,16 +8,37 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use conduit_ir::{
-    canonical::{BlockDelta, CanonicalChunk, Usage},
+    canonical::{BlockDelta, CanonicalChunk, FinishReason, Usage},
     error::ProviderError,
 };
-use conduit_quota::{engine::QuotaEngine, QuotaRecordRequest};
+use conduit_quota::{engine::QuotaEngine, QuotaAttemptRecord, QuotaRecordRequest};
 use futures::Stream;
 use tracing::warn;
 
 use super::egress::{compute_cost, ModelPricing};
 
 pub type PricingFn = Arc<dyn Fn(&str, &str) -> Option<ModelPricing> + Send + Sync>;
+
+/// Metadata captured at stream start for the request ledger.
+#[derive(Debug, Clone)]
+pub struct StreamRecordMeta {
+    pub request_id: String,
+    pub downstream_key_id: Option<String>,
+    pub alias: String,
+    pub provider_id: String,
+    pub provider_kind: String,
+    pub model_id: String,
+    pub started_at: DateTime<Utc>,
+    pub route_strategy: Option<String>,
+    pub attempt_no: u32,
+    pub attempt_count: u32,
+    pub session_id: Option<String>,
+    pub affinity_hit: Option<bool>,
+    pub pool_id: Option<String>,
+    pub selected_reason: Option<String>,
+    /// Failed (or prior) attempts before this stream was opened.
+    pub prior_attempts: Vec<QuotaAttemptRecord>,
+}
 
 /// Wraps a provider stream; on completion records usage/cost to the quota ledger.
 pub struct UsageTrackingStream {
@@ -26,30 +47,20 @@ pub struct UsageTrackingStream {
     usage_acc: Usage,
     pricing_fn: PricingFn,
     quota: Arc<dyn QuotaEngine>,
-    request_id: String,
-    downstream_key_id: Option<String>,
-    alias: String,
-    provider_id: String,
-    provider_kind: String,
-    model_id: String,
-    /// Retained for API compatibility / future cost features.
-    #[allow(dead_code)]
-    started_at: DateTime<Utc>,
+    meta: StreamRecordMeta,
+    /// Set on first successful upstream chunk (TTFB).
+    ttfb_ms: Option<u64>,
+    finish_reason: Option<String>,
+    /// Last terminal stream error, if any.
+    terminal_error: Option<ProviderError>,
 }
 
 impl UsageTrackingStream {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         inner: futures::stream::BoxStream<'static, Result<CanonicalChunk, ProviderError>>,
         pricing_fn: PricingFn,
         quota: Arc<dyn QuotaEngine>,
-        request_id: String,
-        downstream_key_id: Option<String>,
-        started_at: DateTime<Utc>,
-        alias: String,
-        provider_id: String,
-        provider_kind: String,
-        model_id: String,
+        meta: StreamRecordMeta,
     ) -> Self {
         Self {
             inner,
@@ -57,13 +68,10 @@ impl UsageTrackingStream {
             usage_acc: Usage::default(),
             pricing_fn,
             quota,
-            request_id,
-            downstream_key_id,
-            alias,
-            provider_id,
-            provider_kind,
-            model_id,
-            started_at,
+            meta,
+            ttfb_ms: None,
+            finish_reason: None,
+            terminal_error: None,
         }
     }
 
@@ -81,11 +89,23 @@ impl UsageTrackingStream {
                     self.usage_acc.prompt_tokens + self.usage_acc.completion_tokens;
             }
         }
+        if let Some(fr) = &chunk.finish_reason {
+            self.finish_reason = Some(finish_reason_str(fr));
+        }
         // Text deltas do not affect usage ledger; ignored here.
         let _ = chunk.delta.as_ref().and_then(|d| match d {
             BlockDelta::TextDelta { .. } => Some(()),
             _ => None,
         });
+    }
+
+    fn stamp_ttfb(&mut self) {
+        if self.ttfb_ms.is_none() {
+            let ms = (Utc::now() - self.meta.started_at)
+                .num_milliseconds()
+                .max(0) as u64;
+            self.ttfb_ms = Some(ms);
+        }
     }
 
     fn finalize(&mut self) {
@@ -96,22 +116,65 @@ impl UsageTrackingStream {
 
         let pf = &*self.pricing_fn;
         let cost_usd =
-            compute_cost(&self.provider_kind, &self.model_id, &self.usage_acc, |pk, mid| {
+            compute_cost(&self.meta.provider_kind, &self.meta.model_id, &self.usage_acc, |pk, mid| {
                 pf(pk, mid)
             });
 
+        let duration_ms = (Utc::now() - self.meta.started_at)
+            .num_milliseconds()
+            .max(0) as u64;
+
+        let (status, error_class, http_status) = match &self.terminal_error {
+            None => ("ok".to_string(), None, None),
+            Some(e) => {
+                let has_tokens = self.usage_acc.total_tokens > 0
+                    || self.usage_acc.prompt_tokens > 0
+                    || self.usage_acc.completion_tokens > 0;
+                let status = if has_tokens {
+                    "partial".to_string()
+                } else {
+                    "error".to_string()
+                };
+                (
+                    status,
+                    Some(provider_error_class(e)),
+                    e.http_status_hint(),
+                )
+            }
+        };
+
         let key_id = self
+            .meta
             .downstream_key_id
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "_anonymous".into());
+
+        let mut attempts = self.meta.prior_attempts.clone();
+        attempts.push(QuotaAttemptRecord {
+            attempt_no: self.meta.attempt_no,
+            provider_id: Some(self.meta.provider_id.clone()),
+            provider_kind: Some(self.meta.provider_kind.clone()),
+            model_id: Some(self.meta.model_id.clone()),
+            status: status.clone(),
+            error_class: error_class.clone(),
+            http_status,
+            duration_ms: Some(duration_ms),
+            ttfb_ms: self.ttfb_ms,
+            reason: Some(if self.meta.attempt_no == 0 {
+                "initial".into()
+            } else {
+                "retry".into()
+            }),
+        });
+
         let record = QuotaRecordRequest {
-            request_id: self.request_id.clone(),
+            request_id: self.meta.request_id.clone(),
             downstream_key_id: key_id,
-            alias: Some(self.alias.clone()),
-            provider_id: Some(self.provider_id.clone()),
-            provider_kind: Some(self.provider_kind.clone()),
-            model_id: Some(self.model_id.clone()),
+            alias: Some(self.meta.alias.clone()),
+            provider_id: Some(self.meta.provider_id.clone()),
+            provider_kind: Some(self.meta.provider_kind.clone()),
+            model_id: Some(self.meta.model_id.clone()),
             prompt_tokens: self.usage_acc.prompt_tokens,
             completion_tokens: self.usage_acc.completion_tokens,
             total_tokens: self.usage_acc.total_tokens,
@@ -120,6 +183,20 @@ impl UsageTrackingStream {
             cache_write_tokens: self.usage_acc.cache_write_tokens,
             cost_usd,
             stream: true,
+            status,
+            error_class,
+            http_status,
+            finish_reason: self.finish_reason.clone(),
+            duration_ms: Some(duration_ms),
+            ttfb_ms: self.ttfb_ms,
+            route_strategy: self.meta.route_strategy.clone(),
+            attempt_no: self.meta.attempt_no,
+            attempt_count: self.meta.attempt_count.max(1),
+            session_id: self.meta.session_id.clone(),
+            affinity_hit: self.meta.affinity_hit,
+            pool_id: self.meta.pool_id.clone(),
+            selected_reason: self.meta.selected_reason.clone(),
+            attempts,
         };
         let quota = self.quota.clone();
         tokio::spawn(async move {
@@ -136,10 +213,13 @@ impl Stream for UsageTrackingStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
+                self.stamp_ttfb();
                 self.merge_chunk(&chunk);
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(e))) => {
+                // Clone error for ledger; still surface original to client.
+                self.terminal_error = Some(clone_provider_error(&e));
                 self.finalize();
                 Poll::Ready(Some(Err(e)))
             }
@@ -157,6 +237,46 @@ impl Drop for UsageTrackingStream {
         if !self.finalized {
             self.finalize();
         }
+    }
+}
+
+pub(crate) fn provider_error_class(e: &ProviderError) -> String {
+    match e {
+        ProviderError::RateLimited(_) => "rate_limited".into(),
+        ProviderError::Unauthorized(_) => "unauthorized".into(),
+        ProviderError::InvalidRequest(_) => "invalid_request".into(),
+        ProviderError::Upstream5xx(_) => "upstream_5xx".into(),
+        ProviderError::Network(_) => "network".into(),
+        ProviderError::Serialization(_) => "serialization".into(),
+        ProviderError::Timeout => "timeout".into(),
+        ProviderError::ContextLengthExceeded => "context_length_exceeded".into(),
+        _ => "upstream_error".into(),
+    }
+}
+
+pub(crate) fn finish_reason_str(fr: &FinishReason) -> String {
+    match fr {
+        FinishReason::Stop => "stop".into(),
+        FinishReason::Length => "length".into(),
+        FinishReason::ToolCalls => "tool_calls".into(),
+        FinishReason::ContentFilter => "content_filter".into(),
+        FinishReason::Other(s) => s.clone(),
+        _ => "other".into(),
+    }
+}
+
+fn clone_provider_error(e: &ProviderError) -> ProviderError {
+    match e {
+        ProviderError::RateLimited(s) => ProviderError::RateLimited(s.clone()),
+        ProviderError::Unauthorized(s) => ProviderError::Unauthorized(s.clone()),
+        ProviderError::InvalidRequest(s) => ProviderError::InvalidRequest(s.clone()),
+        ProviderError::Upstream5xx(s) => ProviderError::Upstream5xx(s.clone()),
+        ProviderError::Network(s) => ProviderError::Network(s.clone()),
+        ProviderError::Serialization(s) => ProviderError::Serialization(s.clone()),
+        ProviderError::Timeout => ProviderError::Timeout,
+        ProviderError::ContextLengthExceeded => ProviderError::ContextLengthExceeded,
+        // non_exhaustive: best-effort string preserve for ledger status path
+        other => ProviderError::Network(other.to_string()),
     }
 }
 
@@ -185,6 +305,26 @@ mod tests {
         ) -> Result<(), conduit_ir::error::QuotaError> {
             self.recorded.lock().unwrap().push(req.clone());
             Ok(())
+        }
+    }
+
+    fn meta(request_id: &str) -> StreamRecordMeta {
+        StreamRecordMeta {
+            request_id: request_id.into(),
+            downstream_key_id: Some("dk1".into()),
+            alias: "gpt".into(),
+            provider_id: "openai".into(),
+            provider_kind: "openai".into(),
+            model_id: "gpt-4o".into(),
+            started_at: Utc::now(),
+            route_strategy: Some("fixed".into()),
+            attempt_no: 0,
+            attempt_count: 1,
+            session_id: None,
+            affinity_hit: None,
+            pool_id: None,
+            selected_reason: Some("fixed".into()),
+            prior_attempts: Vec::new(),
         }
     }
 
@@ -219,13 +359,7 @@ mod tests {
                 })
             }),
             quota,
-            "req-stream-1".into(),
-            Some("dk1".into()),
-            Utc::now(),
-            "gpt".into(),
-            "openai".into(),
-            "openai".into(),
-            "gpt-4o".into(),
+            meta("req-stream-1"),
         );
 
         while stream.next().await.is_some() {}
@@ -240,5 +374,114 @@ mod tests {
         assert_eq!(rows[0].completion_tokens, 5);
         assert!(rows[0].stream);
         assert!(rows[0].cost_usd > 0.0);
+        assert_eq!(rows[0].status, "ok");
+        assert!(rows[0].ttfb_ms.is_some());
+        assert!(rows[0].duration_ms.is_some());
+        assert!(rows[0].duration_ms.unwrap() >= rows[0].ttfb_ms.unwrap());
+    }
+
+    #[tokio::test]
+    async fn stream_first_chunk_stamps_ttfb_then_finalize_duration() {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let quota = Arc::new(CapturingQuota {
+            recorded: recorded.clone(),
+        });
+
+        let started = Utc::now() - chrono::Duration::milliseconds(50);
+        let mut m = meta("req-ttfb");
+        m.started_at = started;
+
+        let c1 = CanonicalChunk::text_delta("a");
+        let c2 = CanonicalChunk {
+            usage: Some(Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+                ..Usage::default()
+            }),
+            ..CanonicalChunk::text_delta("b")
+        };
+        let mut stream = UsageTrackingStream::new(
+            Box::pin(stream::iter(vec![Ok(c1), Ok(c2)])),
+            Arc::new(|_, _| None),
+            quota,
+            m,
+        );
+        while stream.next().await.is_some() {}
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let rows = recorded.lock().unwrap().clone();
+        assert_eq!(rows.len(), 1);
+        let ttfb = rows[0].ttfb_ms.expect("ttfb");
+        let duration = rows[0].duration_ms.expect("duration");
+        assert!(ttfb >= 50, "ttfb={ttfb}");
+        assert!(duration >= ttfb, "duration={duration} ttfb={ttfb}");
+    }
+
+    #[tokio::test]
+    async fn stream_error_records_error_status() {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let quota = Arc::new(CapturingQuota {
+            recorded: recorded.clone(),
+        });
+        let mut stream = UsageTrackingStream::new(
+            Box::pin(stream::iter(vec![Err(ProviderError::Timeout)])),
+            Arc::new(|_, _| None),
+            quota,
+            meta("req-err-stream"),
+        );
+        let _ = stream.next().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let rows = recorded.lock().unwrap().clone();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "error");
+        assert_eq!(rows[0].error_class.as_deref(), Some("timeout"));
+        assert!(rows[0].ttfb_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_includes_prior_attempts() {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let quota = Arc::new(CapturingQuota {
+            recorded: recorded.clone(),
+        });
+        let mut m = meta("req-multi");
+        m.attempt_no = 1;
+        m.attempt_count = 2;
+        m.prior_attempts = vec![QuotaAttemptRecord {
+            attempt_no: 0,
+            provider_id: Some("p0".into()),
+            provider_kind: Some("openai".into()),
+            model_id: Some("gpt-4o".into()),
+            status: "error".into(),
+            error_class: Some("rate_limited".into()),
+            http_status: Some(429),
+            duration_ms: Some(15),
+            ttfb_ms: None,
+            reason: Some("initial".into()),
+        }];
+        let chunk = CanonicalChunk {
+            usage: Some(Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+                ..Usage::default()
+            }),
+            ..CanonicalChunk::text_delta("ok")
+        };
+        let mut stream = UsageTrackingStream::new(
+            Box::pin(stream::iter(vec![Ok(chunk)])),
+            Arc::new(|_, _| None),
+            quota,
+            m,
+        );
+        while stream.next().await.is_some() {}
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let rows = recorded.lock().unwrap().clone();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].attempts.len(), 2);
+        assert_eq!(rows[0].attempts[0].provider_id.as_deref(), Some("p0"));
+        assert_eq!(rows[0].attempts[1].status, "ok");
+        assert_eq!(rows[0].attempt_count, 2);
     }
 }

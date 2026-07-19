@@ -972,17 +972,22 @@ fn draw_usage(frame: &mut Frame, area: Rect, app: &App) {
         ])
         .split(area);
 
-    let (period, total_usd, requests, tokens) = if let Some(s) = &app.usage_summary {
-        let tokens: u64 = s.entries.iter().map(|e| e.total_tokens).sum();
-        let tokens = if tokens > 0 {
-            tokens
+    let (period, total_usd, requests, success_pct, avg_ttfb) =
+        if let Some(s) = &app.usage_summary {
+            let ttfb = s
+                .avg_ttfb_ms
+                .map(|ms| format!("{ms:.0}ms"))
+                .unwrap_or_else(|| "—".into());
+            (
+                s.period.clone(),
+                s.total_usd,
+                s.request_count,
+                format!("{:.0}%", s.success_rate * 100.0),
+                ttfb,
+            )
         } else {
-            s.by_day.iter().map(|d| d.total_tokens).sum()
+            (app.usage_period.clone(), 0.0, 0, "—".into(), "—".into())
         };
-        (s.period.clone(), s.total_usd, s.request_count, tokens)
-    } else {
-        (app.usage_period.clone(), 0.0, 0, 0)
-    };
 
     super::widgets::metric_strip(
         frame,
@@ -992,7 +997,8 @@ fn draw_usage(frame: &mut Frame, area: Rect, app: &App) {
             ("PERIOD", period, theme.accent_bold()),
             ("COST", format_usd(total_usd), theme.success()),
             ("REQUESTS", requests.to_string(), theme.warning()),
-            ("TOKENS", format_tokens(tokens), Style::default().fg(theme.chart[4])),
+            ("SUCCESS", success_pct, theme.success()),
+            ("TTFB", avg_ttfb, Style::default().fg(theme.chart[4])),
         ],
     );
 
@@ -1089,6 +1095,7 @@ fn draw_usage_detail(frame: &mut Frame, area: Rect, app: &App) {
         UsageDetail::ByModel => draw_usage_by_model(frame, area, app, sel, period_total),
         UsageDetail::ByKey => draw_usage_by_key(frame, area, app, sel, period_total),
         UsageDetail::ByDay => draw_usage_by_day(frame, area, app, sel, period_total),
+        UsageDetail::ByProvider => draw_usage_by_provider(frame, area, app, sel),
     }
 }
 
@@ -1517,6 +1524,161 @@ fn resolve_key_name(keys: &[crate::dto::KeyView], id: &str) -> String {
     }
 }
 
+/// Map provider id → human name from the Providers list.
+fn resolve_provider_name(providers: &[crate::dto::ProviderView], id: &str) -> String {
+    if id.is_empty() {
+        return "(unknown)".into();
+    }
+    if let Some(p) = providers.iter().find(|p| p.id == id) {
+        if p.name.is_empty() {
+            id.to_string()
+        } else {
+            p.name.clone()
+        }
+    } else {
+        // Soft-deleted / removed provider — keep a short id tail for correlation.
+        format!("(gone) {}", truncate(id, 12))
+    }
+}
+
+/// Provider health pane: success rate + TTFB (not cost-only).
+fn draw_usage_by_provider(frame: &mut Frame, area: Rect, app: &App, sel: usize) {
+    let theme = &app.theme;
+    let filtered = app.filtered_indices();
+    // (display_name, provider_id, kind, reqs, success_rate, ttfb, cost)
+    let mut rows_data: Vec<(String, String, String, u64, f64, Option<f64>, f64)> = app
+        .usage_summary
+        .as_ref()
+        .map(|s| {
+            filtered
+                .iter()
+                .filter_map(|&i| {
+                    s.by_provider.get(i).map(|p| {
+                        (
+                            resolve_provider_name(&app.providers, &p.provider_id),
+                            p.provider_id.clone(),
+                            p.provider_kind.clone(),
+                            p.request_count,
+                            p.success_rate,
+                            p.avg_ttfb_ms,
+                            p.total_usd,
+                        )
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if rows_data.is_empty() {
+        let hint = if !app.filter.is_empty() {
+            "no matches for filter"
+        } else {
+            "no provider rows"
+        };
+        empty_state(frame, area, theme, "By provider", hint);
+        return;
+    }
+    // Prefer success rate / TTFB ordering for health; cost sort still available.
+    match app.usage_sort {
+        super::app::UsageSort::Cost => {
+            rows_data.sort_by(|a, b| b.6.partial_cmp(&a.6).unwrap_or(std::cmp::Ordering::Equal))
+        }
+        super::app::UsageSort::Tokens => {
+            // Reuse tokens sort key as request volume for this pane.
+            rows_data.sort_by(|a, b| b.3.cmp(&a.3))
+        }
+        super::app::UsageSort::Date => {
+            // Default health view: worst success rate first, then slowest TTFB.
+            rows_data.sort_by(|a, b| {
+                a.4.partial_cmp(&b.4)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        let ta = a.5.unwrap_or(f64::MAX);
+                        let tb = b.5.unwrap_or(f64::MAX);
+                        tb.partial_cmp(&ta).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            })
+        }
+    }
+    let sel = sel.min(rows_data.len().saturating_sub(1));
+    let (list_area, detail_area, show_detail) = usage_master_detail(area);
+
+    // Name column takes remaining width; kind gets room for "claude-oauth".
+    let name_w = (list_area.width as usize)
+        .saturating_sub(6 + 8 + 8 + 14 + 4)
+        .clamp(12, 36);
+
+    let rows: Vec<Row> = rows_data
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _id, kind, req, rate, ttfb, _cost))| {
+            let ttfb_s = ttfb
+                .map(|ms| format!("{ms:.0}ms"))
+                .unwrap_or_else(|| "—".into());
+            let row = Row::new(vec![
+                Cell::from(truncate(name, name_w)),
+                Cell::from(truncate(kind, 12)),
+                Cell::from(req.to_string()),
+                Cell::from(format!("{:.0}%", rate * 100.0)),
+                Cell::from(ttfb_s),
+            ]);
+            if i == sel {
+                row.style(theme.selection())
+            } else {
+                row
+            }
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(name_w as u16),
+            Constraint::Length(12),
+            Constraint::Length(6),
+            Constraint::Length(8),
+            Constraint::Length(8),
+        ],
+    )
+    .header(
+        Row::new(vec!["name", "kind", "reqs", "success", "ttfb"]).style(theme.header_cell()),
+    )
+    .block(panel_block(
+        theme,
+        &format!(
+            "Provider health  [{}]  t cycle · c sort",
+            app.usage_detail.label()
+        ),
+        true,
+    ))
+    .column_spacing(1);
+    frame.render_widget(table, list_area);
+
+    if show_detail {
+        if let Some((name, id, kind, req, rate, ttfb, cost)) = rows_data.get(sel) {
+            let ttfb_s = ttfb
+                .map(|ms| format!("{ms:.0}ms"))
+                .unwrap_or_else(|| "—".into());
+            draw_usage_rollup_detail(
+                frame,
+                detail_area,
+                theme,
+                "Provider health",
+                name,
+                &[
+                    ("name", name.clone()),
+                    ("id", id.clone()),
+                    ("kind", kind.clone()),
+                    ("success", format!("{:.1}%", rate * 100.0)),
+                    ("avg ttfb", ttfb_s),
+                    ("requests", req.to_string()),
+                    ("cost", format_usd(*cost)),
+                ],
+                *rate,
+                &[],
+            );
+        }
+    }
+}
+
 fn draw_usage_by_day(frame: &mut Frame, area: Rect, app: &App, sel: usize, period_total: f64) {
     let theme = &app.theme;
     let filtered = app.filtered_indices();
@@ -1788,6 +1950,23 @@ fn draw_usage_record_detail(
     lines.extend(detail_kv(
         theme,
         &[
+            ("status", u.status.clone()),
+            (
+                "error",
+                u.error_class.clone().unwrap_or_else(|| "—".into()),
+            ),
+            (
+                "duration",
+                u.duration_ms
+                    .map(|ms| format!("{ms}ms"))
+                    .unwrap_or_else(|| "—".into()),
+            ),
+            (
+                "ttfb",
+                u.ttfb_ms
+                    .map(|ms| format!("{ms}ms"))
+                    .unwrap_or_else(|| "—".into()),
+            ),
             ("cost", format_usd(u.cost_usd)),
             ("stream", if u.stream { "yes" } else { "no" }.into()),
             (
@@ -1796,7 +1975,18 @@ fn draw_usage_record_detail(
             ),
             (
                 "provider",
-                u.provider_kind.clone().unwrap_or_else(|| "—".into()),
+                u.provider_id
+                    .clone()
+                    .or_else(|| u.provider_kind.clone())
+                    .unwrap_or_else(|| "—".into()),
+            ),
+            (
+                "strategy",
+                u.route_strategy.clone().unwrap_or_else(|| "—".into()),
+            ),
+            (
+                "attempts",
+                format!("{}/{}", u.attempt_no + 1, u.attempt_count.max(1)),
             ),
             (
                 "key",

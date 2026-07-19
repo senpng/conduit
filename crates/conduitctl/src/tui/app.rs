@@ -134,6 +134,8 @@ pub enum UsageDetail {
     ByModel,
     ByKey,
     ByDay,
+    /// Provider health: success rate + TTFB (not cost-only).
+    ByProvider,
 }
 
 impl UsageDetail {
@@ -142,7 +144,8 @@ impl UsageDetail {
             UsageDetail::Recent => UsageDetail::ByModel,
             UsageDetail::ByModel => UsageDetail::ByKey,
             UsageDetail::ByKey => UsageDetail::ByDay,
-            UsageDetail::ByDay => UsageDetail::Recent,
+            UsageDetail::ByDay => UsageDetail::ByProvider,
+            UsageDetail::ByProvider => UsageDetail::Recent,
         }
     }
 
@@ -152,6 +155,7 @@ impl UsageDetail {
             UsageDetail::ByModel => "by model",
             UsageDetail::ByKey => "by key",
             UsageDetail::ByDay => "by day",
+            UsageDetail::ByProvider => "by provider",
         }
     }
 }
@@ -707,6 +711,29 @@ impl App {
                             .iter()
                             .enumerate()
                             .filter(|(_, d)| match_q(&d.day))
+                            .map(|(i, _)| i)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                UsageDetail::ByProvider => self
+                    .usage_summary
+                    .as_ref()
+                    .map(|s| {
+                        s.by_provider
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, p)| {
+                                let name = self
+                                    .providers
+                                    .iter()
+                                    .find(|x| x.id == p.provider_id)
+                                    .map(|x| x.name.as_str())
+                                    .unwrap_or("");
+                                match_q(&p.provider_id)
+                                    || match_q(name)
+                                    || match_q(&p.provider_kind)
+                                    || match_q(&format!("{:.0}%", p.success_rate * 100.0))
+                            })
                             .map(|(i, _)| i)
                             .collect()
                     })

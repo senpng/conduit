@@ -14,8 +14,8 @@ use crate::check::{QuotaCheckRequest, QuotaRecordRequest, RecordFn};
 /// Two concerns are separated:
 ///
 /// * **`check`** — may reject the request before it reaches the upstream (RPM).
-/// * **`record`** — called *after* a successful response to persist consumption
-///   (tokens + cost).
+/// * **`record`** — called after a request finishes to persist the ledger row
+///   (tokens, cost, outcome, timing, routing attempts).
 ///
 /// Implementations must be `Send + Sync` so they can be shared across async
 /// tasks via `Arc<dyn QuotaEngine>`.
@@ -25,7 +25,8 @@ pub trait QuotaEngine: Send + Sync {
     /// appropriate [`QuotaError`] variant if it should be rejected.
     async fn check(&self, req: &QuotaCheckRequest) -> Result<(), QuotaError>;
 
-    /// Persist the actual consumption of a completed request.
+    /// Persist a finished request's ledger entry (always, including zero-token
+    /// success and terminal failures).
     async fn record(&self, req: &QuotaRecordRequest) -> Result<(), QuotaError>;
 }
 
@@ -101,9 +102,8 @@ impl QuotaEngine for InMemoryQuotaEngine {
     }
 
     async fn record(&self, req: &QuotaRecordRequest) -> Result<(), QuotaError> {
-        if !req.has_consumption() {
-            return Ok(());
-        }
+        // Always persist: request ledger needs zero-token success and errors
+        // for success-rate / latency / routing observability.
         (self.record_fn)(req.clone()).await
     }
 }
@@ -144,6 +144,20 @@ mod tests {
             cache_write_tokens: 0,
             cost_usd: 0.05,
             stream: false,
+            status: "ok".into(),
+            error_class: None,
+            http_status: None,
+            finish_reason: None,
+            duration_ms: Some(42),
+            ttfb_ms: Some(10),
+            route_strategy: Some("fixed".into()),
+            attempt_no: 0,
+            attempt_count: 1,
+            session_id: None,
+            affinity_hit: None,
+            pool_id: None,
+            selected_reason: Some("fixed".into()),
+            attempts: Vec::new(),
         }
     }
 
@@ -207,7 +221,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_skips_zero_consumption() {
+    async fn record_always_persists_zero_consumption() {
         use std::sync::atomic::{AtomicU64, Ordering};
         let called = Arc::new(AtomicU64::new(0));
         let called2 = called.clone();
@@ -224,6 +238,6 @@ mod tests {
         zero.total_tokens = 0;
         zero.cost_usd = 0.0;
         engine.record(&zero).await.unwrap();
-        assert_eq!(called.load(Ordering::SeqCst), 0);
+        assert_eq!(called.load(Ordering::SeqCst), 1);
     }
 }

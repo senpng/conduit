@@ -142,9 +142,9 @@ pub struct PricingRow {
     pub effective_from: String,
 }
 
-// ── Usage record (per-request consumption ledger) ─────────────────────────────
+// ── Usage record (per-request ledger: tokens/cost + outcome/timing/routing) ───
 
-/// One completed gateway request's token + cost footprint.
+/// One finished gateway request (success, zero-token, or terminal failure).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRecordRow {
     pub id: String,
@@ -164,6 +164,51 @@ pub struct UsageRecordRow {
     pub cache_write_tokens: u32,
     pub cost_usd: f64,
     pub stream: bool,
+    /// Outcome: `ok` | `error` | `cancelled` | `partial`.
+    #[serde(default = "default_usage_status")]
+    pub status: String,
+    pub error_class: Option<String>,
+    pub http_status: Option<u16>,
+    pub finish_reason: Option<String>,
+    pub duration_ms: Option<u64>,
+    /// Time-to-first-byte (ms). Null when no first byte was observed.
+    pub ttfb_ms: Option<u64>,
+    pub route_strategy: Option<String>,
+    #[serde(default)]
+    pub attempt_no: u32,
+    #[serde(default = "default_attempt_count")]
+    pub attempt_count: u32,
+    pub session_id: Option<String>,
+    pub affinity_hit: Option<bool>,
+    pub pool_id: Option<String>,
+    pub selected_reason: Option<String>,
+}
+
+fn default_usage_status() -> String {
+    "ok".into()
+}
+
+fn default_attempt_count() -> u32 {
+    1
+}
+
+/// One upstream try within a gateway request (retry / fallback chain).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageAttemptRow {
+    pub id: String,
+    pub request_id: String,
+    pub attempt_no: u32,
+    pub provider_id: Option<String>,
+    pub provider_kind: Option<String>,
+    pub model_id: Option<String>,
+    pub status: String,
+    pub error_class: Option<String>,
+    pub http_status: Option<u16>,
+    pub duration_ms: Option<u64>,
+    pub ttfb_ms: Option<u64>,
+    /// `initial` | `retry` | etc.
+    pub reason: Option<String>,
+    pub ts: String,
 }
 
 // ── App event ─────────────────────────────────────────────────────────────────

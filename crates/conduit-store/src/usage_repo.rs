@@ -6,7 +6,10 @@ use chrono::Utc;
 use sqlx::{Row, SqlitePool};
 use tracing::instrument;
 
-use crate::{schema::UsageRecordRow, StoreError};
+use crate::{
+    schema::{UsageAttemptRow, UsageRecordRow},
+    StoreError,
+};
 
 pub struct UsageRepo<'a> {
     pool: &'a SqlitePool,
@@ -65,7 +68,7 @@ impl<'a> UsageRepo<'a> {
         Self { pool }
     }
 
-    /// Insert one request consumption row.
+    /// Insert one request ledger row (success, zero-token, or terminal failure).
     #[instrument(skip(self, row))]
     pub async fn insert(&self, row: &UsageRecordRow) -> Result<(), StoreError> {
         sqlx::query(
@@ -74,8 +77,15 @@ impl<'a> UsageRepo<'a> {
                    provider_id, provider_kind, model_id,
                    prompt_tokens, completion_tokens, total_tokens,
                    reasoning_tokens, cache_read_tokens, cache_write_tokens,
-                   cost_usd, stream
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                   cost_usd, stream,
+                   status, error_class, http_status, finish_reason,
+                   duration_ms, ttfb_ms, route_strategy,
+                   attempt_no, attempt_count, session_id, affinity_hit,
+                   pool_id, selected_reason
+               ) VALUES (
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+               )"#,
         )
         .bind(&row.id)
         .bind(&row.ts)
@@ -93,10 +103,71 @@ impl<'a> UsageRepo<'a> {
         .bind(row.cache_write_tokens)
         .bind(row.cost_usd)
         .bind(row.stream as i32)
+        .bind(&row.status)
+        .bind(&row.error_class)
+        .bind(row.http_status.map(|s| s as i64))
+        .bind(&row.finish_reason)
+        .bind(row.duration_ms.map(|d| d as i64))
+        .bind(row.ttfb_ms.map(|d| d as i64))
+        .bind(&row.route_strategy)
+        .bind(row.attempt_no as i64)
+        .bind(row.attempt_count as i64)
+        .bind(&row.session_id)
+        .bind(row.affinity_hit.map(|b| b as i32))
+        .bind(&row.pool_id)
+        .bind(&row.selected_reason)
         .execute(self.pool)
         .await
         .map_err(|e| StoreError::Sqlx(e.to_string()))?;
         Ok(())
+    }
+
+    /// Insert one per-try attempt row.
+    #[instrument(skip(self, row))]
+    pub async fn insert_attempt(&self, row: &UsageAttemptRow) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"INSERT INTO usage_attempts (
+                   id, request_id, attempt_no, provider_id, provider_kind, model_id,
+                   status, error_class, http_status, duration_ms, ttfb_ms, reason, ts
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&row.id)
+        .bind(&row.request_id)
+        .bind(row.attempt_no as i64)
+        .bind(&row.provider_id)
+        .bind(&row.provider_kind)
+        .bind(&row.model_id)
+        .bind(&row.status)
+        .bind(&row.error_class)
+        .bind(row.http_status.map(|s| s as i64))
+        .bind(row.duration_ms.map(|d| d as i64))
+        .bind(row.ttfb_ms.map(|d| d as i64))
+        .bind(&row.reason)
+        .bind(&row.ts)
+        .execute(self.pool)
+        .await
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        Ok(())
+    }
+
+    /// List attempt rows for a request (ordered by attempt_no).
+    #[instrument(skip(self))]
+    pub async fn list_attempts(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<UsageAttemptRow>, StoreError> {
+        let rows = sqlx::query(
+            r#"SELECT id, request_id, attempt_no, provider_id, provider_kind, model_id,
+                      status, error_class, http_status, duration_ms, ttfb_ms, reason, ts
+               FROM usage_attempts
+               WHERE request_id = ?
+               ORDER BY attempt_no ASC"#,
+        )
+        .bind(request_id)
+        .fetch_all(self.pool)
+        .await
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        Ok(rows.into_iter().map(map_attempt_row).collect())
     }
 
     /// Recent usage rows (default: newest first). Thin wrapper around [`list_page`].
@@ -179,7 +250,11 @@ impl<'a> UsageRepo<'a> {
                    provider_id, provider_kind, model_id,
                    prompt_tokens, completion_tokens, total_tokens,
                    reasoning_tokens, cache_read_tokens, cache_write_tokens,
-                   cost_usd, stream
+                   cost_usd, stream,
+                   status, error_class, http_status, finish_reason,
+                   duration_ms, ttfb_ms, route_strategy,
+                   attempt_no, attempt_count, session_id, affinity_hit,
+                   pool_id, selected_reason
             FROM usage_records
             WHERE (?1 IS NULL OR downstream_key_id = ?1)
               AND (?2 IS NULL OR ts LIKE ?2)
@@ -450,6 +525,142 @@ impl<'a> UsageRepo<'a> {
             })
             .collect())
     }
+
+    /// Period-level outcome / latency aggregates (success rate + avg TTFB).
+    #[instrument(skip(self))]
+    pub async fn summary_outcome(
+        &self,
+        period: &str,
+        key_id: Option<&str>,
+    ) -> Result<UsageOutcomeSummary, StoreError> {
+        let pattern = format!("{period}%");
+        let row = match key_id {
+            Some(kid) => {
+                sqlx::query(
+                    r#"SELECT
+                           COUNT(*) AS request_count,
+                           COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
+                               AS success_count,
+                           AVG(ttfb_ms) AS avg_ttfb_ms,
+                           AVG(duration_ms) AS avg_duration_ms
+                       FROM usage_records
+                       WHERE ts LIKE ? AND downstream_key_id = ?"#,
+                )
+                .bind(&pattern)
+                .bind(kid)
+                .fetch_one(self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    r#"SELECT
+                           COUNT(*) AS request_count,
+                           COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
+                               AS success_count,
+                           AVG(ttfb_ms) AS avg_ttfb_ms,
+                           AVG(duration_ms) AS avg_duration_ms
+                       FROM usage_records
+                       WHERE ts LIKE ?"#,
+                )
+                .bind(&pattern)
+                .fetch_one(self.pool)
+                .await
+            }
+        }
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+
+        let request_count = row.get::<i64, _>("request_count").max(0) as u64;
+        let success_count = row.get::<i64, _>("success_count").max(0) as u64;
+        let success_rate = if request_count == 0 {
+            0.0
+        } else {
+            success_count as f64 / request_count as f64
+        };
+        Ok(UsageOutcomeSummary {
+            request_count,
+            success_count,
+            success_rate,
+            avg_ttfb_ms: row.get::<Option<f64>, _>("avg_ttfb_ms"),
+            avg_duration_ms: row.get::<Option<f64>, _>("avg_duration_ms"),
+        })
+    }
+
+    /// Provider health rollup for a calendar period.
+    #[instrument(skip(self))]
+    pub async fn summary_by_provider(
+        &self,
+        period: &str,
+        key_id: Option<&str>,
+    ) -> Result<Vec<UsageProviderRow>, StoreError> {
+        let pattern = format!("{period}%");
+        let rows = match key_id {
+            Some(kid) => {
+                sqlx::query(
+                    r#"SELECT
+                       COALESCE(NULLIF(provider_id, ''), '(unknown)') AS provider_id,
+                       provider_kind,
+                       COUNT(*) AS request_count,
+                       COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
+                           AS success_count,
+                       AVG(ttfb_ms) AS avg_ttfb_ms,
+                       AVG(duration_ms) AS avg_duration_ms,
+                       COALESCE(SUM(cost_usd), 0) AS total_usd
+                   FROM usage_records
+                   WHERE ts LIKE ? AND downstream_key_id = ?
+                   GROUP BY COALESCE(NULLIF(provider_id, ''), '(unknown)'), provider_kind
+                   ORDER BY request_count DESC"#,
+                )
+                .bind(&pattern)
+                .bind(kid)
+                .fetch_all(self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    r#"SELECT
+                       COALESCE(NULLIF(provider_id, ''), '(unknown)') AS provider_id,
+                       provider_kind,
+                       COUNT(*) AS request_count,
+                       COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
+                           AS success_count,
+                       AVG(ttfb_ms) AS avg_ttfb_ms,
+                       AVG(duration_ms) AS avg_duration_ms,
+                       COALESCE(SUM(cost_usd), 0) AS total_usd
+                   FROM usage_records
+                   WHERE ts LIKE ?
+                   GROUP BY COALESCE(NULLIF(provider_id, ''), '(unknown)'), provider_kind
+                   ORDER BY request_count DESC"#,
+                )
+                .bind(&pattern)
+                .fetch_all(self.pool)
+                .await
+            }
+        }
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let request_count = r.get::<i64, _>("request_count") as u64;
+                let success_count = r.get::<i64, _>("success_count") as u64;
+                let success_rate = if request_count == 0 {
+                    0.0
+                } else {
+                    success_count as f64 / request_count as f64
+                };
+                UsageProviderRow {
+                    provider_id: r.get("provider_id"),
+                    provider_kind: r.get("provider_kind"),
+                    request_count,
+                    success_count,
+                    success_rate,
+                    avg_ttfb_ms: r.get::<Option<f64>, _>("avg_ttfb_ms"),
+                    avg_duration_ms: r.get::<Option<f64>, _>("avg_duration_ms"),
+                    total_usd: r.get("total_usd"),
+                }
+            })
+            .collect())
+    }
 }
 
 /// Period rollup used by console summary.
@@ -505,6 +716,29 @@ pub struct UsageDayModelRow {
     pub total_tokens: u64,
 }
 
+/// Period outcome aggregates for success rate / latency cards.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageOutcomeSummary {
+    pub request_count: u64,
+    pub success_count: u64,
+    pub success_rate: f64,
+    pub avg_ttfb_ms: Option<f64>,
+    pub avg_duration_ms: Option<f64>,
+}
+
+/// Provider health rollup within a period.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageProviderRow {
+    pub provider_id: String,
+    pub provider_kind: Option<String>,
+    pub request_count: u64,
+    pub success_count: u64,
+    pub success_rate: f64,
+    pub avg_ttfb_ms: Option<f64>,
+    pub avg_duration_ms: Option<f64>,
+    pub total_usd: f64,
+}
+
 fn map_row(r: sqlx::sqlite::SqliteRow) -> UsageRecordRow {
     UsageRecordRow {
         id: r.get("id"),
@@ -523,10 +757,61 @@ fn map_row(r: sqlx::sqlite::SqliteRow) -> UsageRecordRow {
         cache_write_tokens: r.get::<i64, _>("cache_write_tokens") as u32,
         cost_usd: r.get("cost_usd"),
         stream: r.get::<i32, _>("stream") != 0,
+        status: r
+            .try_get::<String, _>("status")
+            .unwrap_or_else(|_| "ok".into()),
+        error_class: r.try_get("error_class").ok().flatten(),
+        http_status: r
+            .try_get::<Option<i64>, _>("http_status")
+            .ok()
+            .flatten()
+            .map(|s| s as u16),
+        finish_reason: r.try_get("finish_reason").ok().flatten(),
+        duration_ms: r
+            .try_get::<Option<i64>, _>("duration_ms")
+            .ok()
+            .flatten()
+            .map(|d| d as u64),
+        ttfb_ms: r
+            .try_get::<Option<i64>, _>("ttfb_ms")
+            .ok()
+            .flatten()
+            .map(|d| d as u64),
+        route_strategy: r.try_get("route_strategy").ok().flatten(),
+        attempt_no: r.try_get::<i64, _>("attempt_no").unwrap_or(0) as u32,
+        attempt_count: r.try_get::<i64, _>("attempt_count").unwrap_or(1) as u32,
+        session_id: r.try_get("session_id").ok().flatten(),
+        affinity_hit: r
+            .try_get::<Option<i32>, _>("affinity_hit")
+            .ok()
+            .flatten()
+            .map(|b| b != 0),
+        pool_id: r.try_get("pool_id").ok().flatten(),
+        selected_reason: r.try_get("selected_reason").ok().flatten(),
     }
 }
 
-/// Build a row for a completed request. Generates `id` and `ts`.
+fn map_attempt_row(r: sqlx::sqlite::SqliteRow) -> UsageAttemptRow {
+    UsageAttemptRow {
+        id: r.get("id"),
+        request_id: r.get("request_id"),
+        attempt_no: r.get::<i64, _>("attempt_no") as u32,
+        provider_id: r.get("provider_id"),
+        provider_kind: r.get("provider_kind"),
+        model_id: r.get("model_id"),
+        status: r.get("status"),
+        error_class: r.get("error_class"),
+        http_status: r
+            .get::<Option<i64>, _>("http_status")
+            .map(|s| s as u16),
+        duration_ms: r.get::<Option<i64>, _>("duration_ms").map(|d| d as u64),
+        ttfb_ms: r.get::<Option<i64>, _>("ttfb_ms").map(|d| d as u64),
+        reason: r.get("reason"),
+        ts: r.get("ts"),
+    }
+}
+
+/// Build a main ledger row. Generates `id` and `ts`.
 #[allow(clippy::too_many_arguments)]
 pub fn new_usage_record(
     request_id: impl Into<String>,
@@ -561,6 +846,51 @@ pub fn new_usage_record(
         cache_write_tokens,
         cost_usd,
         stream,
+        status: "ok".into(),
+        error_class: None,
+        http_status: None,
+        finish_reason: None,
+        duration_ms: None,
+        ttfb_ms: None,
+        route_strategy: None,
+        attempt_no: 0,
+        attempt_count: 1,
+        session_id: None,
+        affinity_hit: None,
+        pool_id: None,
+        selected_reason: None,
+    }
+}
+
+/// Build an attempt row. Generates `id` and `ts`.
+#[allow(clippy::too_many_arguments)]
+pub fn new_usage_attempt(
+    request_id: impl Into<String>,
+    attempt_no: u32,
+    provider_id: Option<String>,
+    provider_kind: Option<String>,
+    model_id: Option<String>,
+    status: impl Into<String>,
+    error_class: Option<String>,
+    http_status: Option<u16>,
+    duration_ms: Option<u64>,
+    ttfb_ms: Option<u64>,
+    reason: Option<String>,
+) -> UsageAttemptRow {
+    UsageAttemptRow {
+        id: ulid::Ulid::new().to_string(),
+        request_id: request_id.into(),
+        attempt_no,
+        provider_id,
+        provider_kind,
+        model_id,
+        status: status.into(),
+        error_class,
+        http_status,
+        duration_ms,
+        ttfb_ms,
+        reason,
+        ts: Utc::now().to_rfc3339(),
     }
 }
 
@@ -858,5 +1188,200 @@ mod tests {
         let unknown = by_model.iter().find(|m| m.label == "(unknown)").unwrap();
         assert_eq!(unknown.request_count, 3);
         assert!((unknown.total_usd - 4.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn zero_consumption_success_still_inserts() {
+        let pool = open_db("sqlite::memory:").await.unwrap();
+        let repo = UsageRepo::new(&pool);
+        let mut row = new_usage_record(
+            "req-zero",
+            Some("dk1".into()),
+            Some("gpt".into()),
+            Some("p1".into()),
+            Some("openai".into()),
+            Some("gpt-4o".into()),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            false,
+        );
+        row.status = "ok".into();
+        row.duration_ms = Some(12);
+        repo.insert(&row).await.unwrap();
+        let listed = repo.list(10, None, None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "ok");
+        assert_eq!(listed[0].duration_ms, Some(12));
+        assert_eq!(listed[0].total_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_error_and_attempts_insert() {
+        let pool = open_db("sqlite::memory:").await.unwrap();
+        let repo = UsageRepo::new(&pool);
+
+        let mut main = new_usage_record(
+            "req-err",
+            Some("dk1".into()),
+            Some("gpt".into()),
+            Some("p2".into()),
+            Some("openai".into()),
+            Some("gpt-4o".into()),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            false,
+        );
+        main.status = "error".into();
+        main.error_class = Some("rate_limited".into());
+        main.http_status = Some(429);
+        main.duration_ms = Some(80);
+        main.attempt_no = 1;
+        main.attempt_count = 2;
+        main.route_strategy = Some("fallback".into());
+        main.ts = "2026-07-15T10:00:00Z".into();
+        repo.insert(&main).await.unwrap();
+
+        let a0 = new_usage_attempt(
+            "req-err",
+            0,
+            Some("p1".into()),
+            Some("openai".into()),
+            Some("gpt-4o".into()),
+            "error",
+            Some("rate_limited".into()),
+            Some(429),
+            Some(30),
+            None,
+            Some("initial".into()),
+        );
+        let a1 = new_usage_attempt(
+            "req-err",
+            1,
+            Some("p2".into()),
+            Some("openai".into()),
+            Some("gpt-4o".into()),
+            "error",
+            Some("rate_limited".into()),
+            Some(429),
+            Some(50),
+            None,
+            Some("retry".into()),
+        );
+        repo.insert_attempt(&a0).await.unwrap();
+        repo.insert_attempt(&a1).await.unwrap();
+
+        let attempts = repo.list_attempts("req-err").await.unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].provider_id.as_deref(), Some("p1"));
+        assert_eq!(attempts[1].provider_id.as_deref(), Some("p2"));
+        assert_eq!(attempts[0].status, "error");
+
+        let outcome = repo.summary_outcome("2026-07", None).await.unwrap();
+        assert_eq!(outcome.request_count, 1);
+        assert_eq!(outcome.success_count, 0);
+        assert!((outcome.success_rate - 0.0).abs() < 1e-12);
+
+        let by_p = repo.summary_by_provider("2026-07", None).await.unwrap();
+        assert_eq!(by_p.len(), 1);
+        assert_eq!(by_p[0].provider_id, "p2");
+        assert!((by_p[0].success_rate - 0.0).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn summary_outcome_and_by_provider_success_rate() {
+        let pool = open_db("sqlite::memory:").await.unwrap();
+        let repo = UsageRepo::new(&pool);
+
+        let mut ok = new_usage_record(
+            "r-ok",
+            Some("k1".into()),
+            None,
+            Some("prov-a".into()),
+            Some("openai".into()),
+            Some("m".into()),
+            1,
+            1,
+            2,
+            0,
+            0,
+            0,
+            0.1,
+            true,
+        );
+        ok.ts = "2026-07-10T00:00:00Z".into();
+        ok.status = "ok".into();
+        ok.ttfb_ms = Some(40);
+        ok.duration_ms = Some(100);
+        repo.insert(&ok).await.unwrap();
+
+        let mut err = new_usage_record(
+            "r-err",
+            Some("k1".into()),
+            None,
+            Some("prov-a".into()),
+            Some("openai".into()),
+            Some("m".into()),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            false,
+        );
+        err.ts = "2026-07-11T00:00:00Z".into();
+        err.status = "error".into();
+        err.error_class = Some("upstream_5xx".into());
+        err.duration_ms = Some(20);
+        repo.insert(&err).await.unwrap();
+
+        let mut ok_b = new_usage_record(
+            "r-ok-b",
+            Some("k1".into()),
+            None,
+            Some("prov-b".into()),
+            Some("anthropic".into()),
+            Some("m2".into()),
+            2,
+            2,
+            4,
+            0,
+            0,
+            0,
+            0.2,
+            false,
+        );
+        ok_b.ts = "2026-07-12T00:00:00Z".into();
+        ok_b.status = "ok".into();
+        ok_b.ttfb_ms = Some(80);
+        ok_b.duration_ms = Some(200);
+        repo.insert(&ok_b).await.unwrap();
+
+        let outcome = repo.summary_outcome("2026-07", None).await.unwrap();
+        assert_eq!(outcome.request_count, 3);
+        assert_eq!(outcome.success_count, 2);
+        assert!((outcome.success_rate - 2.0 / 3.0).abs() < 1e-9);
+        let avg_ttfb = outcome.avg_ttfb_ms.unwrap();
+        assert!((avg_ttfb - 60.0).abs() < 1e-6); // (40+80)/2
+
+        let by_p = repo.summary_by_provider("2026-07", None).await.unwrap();
+        let a = by_p.iter().find(|p| p.provider_id == "prov-a").unwrap();
+        assert_eq!(a.request_count, 2);
+        assert!((a.success_rate - 0.5).abs() < 1e-9);
+        assert!((a.avg_ttfb_ms.unwrap() - 40.0).abs() < 1e-6);
+        let b = by_p.iter().find(|p| p.provider_id == "prov-b").unwrap();
+        assert_eq!(b.request_count, 1);
+        assert!((b.success_rate - 1.0).abs() < 1e-9);
     }
 }

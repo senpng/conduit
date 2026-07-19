@@ -27,7 +27,9 @@ pub mod engine;
 
 // Flatten the most-used types into the crate root.
 pub use bucket::SlidingWindowCounter;
-pub use check::{BoxFuture, QuotaCheckRequest, QuotaRecordRequest, RecordFn};
+pub use check::{
+    BoxFuture, QuotaAttemptRecord, QuotaCheckRequest, QuotaRecordRequest, RecordFn,
+};
 // Re-export the canonical QuotaError from conduit-ir.
 pub use conduit_ir::error::QuotaError;
 pub use engine::{InMemoryQuotaEngine, NoopQuotaEngine, QuotaEngine};

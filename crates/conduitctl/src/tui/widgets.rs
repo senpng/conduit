@@ -206,6 +206,13 @@ pub fn format_tokens(n: u64) -> String {
 }
 
 pub fn format_usd(v: f64) -> String {
+    // Collapse signed zero / float dust so we never render "$-0.0000".
+    // (`format!("{:.4}", -0.0)` keeps the sign bit even though -0.0 == 0.0.)
+    let v = if !v.is_finite() || v.abs() < 1e-9 {
+        0.0
+    } else {
+        v
+    };
     if v >= 100.0 {
         format!("${v:.2}")
     } else if v >= 1.0 {
@@ -284,6 +291,31 @@ fn parse_to_local(s: &str) -> Option<DateTime<Local>> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod format_usd_tests {
+    use super::*;
+
+    #[test]
+    fn zero_and_signed_zero_are_plain() {
+        assert_eq!(format_usd(0.0), "$0.0000");
+        assert_eq!(format_usd(-0.0), "$0.0000");
+        assert_eq!(format_usd(-1e-15), "$0.0000");
+    }
+
+    #[test]
+    fn small_positive_keeps_four_decimals() {
+        assert_eq!(format_usd(0.0123), "$0.0123");
+    }
+
+    #[test]
+    fn negative_spend_still_shows_sign() {
+        // Thresholds use `v >= 1.0`, so true negatives always take the
+        // four-decimal branch — only dust/signed-zero is collapsed.
+        assert_eq!(format_usd(-0.42), "$-0.4200");
+        assert!(format_usd(-12.5).starts_with("$-"), "{}", format_usd(-12.5));
+    }
 }
 
 #[cfg(test)]

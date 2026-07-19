@@ -28,9 +28,27 @@ pub struct QuotaCheckRequest {
     pub model_alias: String,
 }
 
-/// Input for [`QuotaEngine::record`] — one completed request's consumption.
+/// One upstream try within a gateway request (retry / fallback).
+#[derive(Debug, Clone)]
+pub struct QuotaAttemptRecord {
+    pub attempt_no: u32,
+    pub provider_id: Option<String>,
+    pub provider_kind: Option<String>,
+    pub model_id: Option<String>,
+    /// `ok` | `error` | `partial` | …
+    pub status: String,
+    pub error_class: Option<String>,
+    pub http_status: Option<u16>,
+    pub duration_ms: Option<u64>,
+    pub ttfb_ms: Option<u64>,
+    /// `initial` | `retry` | …
+    pub reason: Option<String>,
+}
+
+/// Input for [`QuotaEngine::record`] — one finished request's ledger entry.
 ///
-/// Written to the durable usage ledger by the daemon.
+/// Written to the durable usage ledger by the daemon. Always persisted for
+/// observability (including zero-token success and terminal failures).
 #[derive(Debug, Clone)]
 pub struct QuotaRecordRequest {
     /// Stable request id (pipeline request correlation id).
@@ -51,10 +69,30 @@ pub struct QuotaRecordRequest {
     /// Cost of the completed request in USD.
     pub cost_usd: f64,
     pub stream: bool,
+    /// Outcome: `ok` | `error` | `cancelled` | `partial`.
+    pub status: String,
+    pub error_class: Option<String>,
+    pub http_status: Option<u16>,
+    pub finish_reason: Option<String>,
+    pub duration_ms: Option<u64>,
+    /// Time-to-first-byte in ms; null when no first byte was observed.
+    pub ttfb_ms: Option<u64>,
+    pub route_strategy: Option<String>,
+    pub attempt_no: u32,
+    pub attempt_count: u32,
+    pub session_id: Option<String>,
+    pub affinity_hit: Option<bool>,
+    pub pool_id: Option<String>,
+    pub selected_reason: Option<String>,
+    /// Per-try history (may be empty for single-shot success).
+    pub attempts: Vec<QuotaAttemptRecord>,
 }
 
 impl QuotaRecordRequest {
-    /// True when the request has any token or cost signal worth recording.
+    /// True when the request has any token or cost signal.
+    ///
+    /// Note: the engine **no longer skips** zero-consumption rows — the ledger
+    /// records outcomes for success-rate / latency observability.
     pub fn has_consumption(&self) -> bool {
         self.prompt_tokens > 0
             || self.completion_tokens > 0

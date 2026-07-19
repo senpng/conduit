@@ -978,9 +978,10 @@ mod tests {
             kind: "claude-oauth".into(),
         };
         w.targets[0].model_id.value = "claude-sonnet-4".into();
-        w.strategy_idx = 2; // weighted
+        // Pool targets use round_robin / fill_first (strategy_idx 0 / 1), not weighted.
+        w.strategy_idx = 0;
         let body = w.to_body().unwrap();
-        assert_eq!(body.strategy, "weighted");
+        assert_eq!(body.strategy, "round_robin");
         let t = &body.targets.as_array().unwrap()[0];
         assert_eq!(t["pool_kind"], "claude-oauth");
         assert_eq!(t["provider_kind"], "claude-oauth");
@@ -1061,7 +1062,8 @@ mod tests {
         let route = RouteView {
             id: "r1".into(),
             match_alias: "sonnet".into(),
-            strategy: "weighted".into(),
+            // Pool routes store pool schedule (round_robin / fill_first), not weighted.
+            strategy: "round_robin".into(),
             targets_json:
                 r#"[{"pool_kind":"claude-oauth","model_id":"claude-sonnet-4","provider_kind":"claude-oauth"}]"#
                     .into(),
@@ -1074,7 +1076,7 @@ mod tests {
             &route,
             vec![pv("c1", "a", "claude-oauth"), pv("c2", "b", "claude-oauth")],
         );
-        assert_eq!(w.strategy(), "weighted");
+        assert_eq!(w.strategy(), "round_robin");
         assert_eq!(
             w.targets[0].binding,
             TargetBinding::PoolKind {

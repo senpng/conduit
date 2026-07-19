@@ -232,6 +232,30 @@ pub struct UsageRecordView {
     pub cost_usd: f64,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default = "default_ok_status")]
+    pub status: String,
+    pub error_class: Option<String>,
+    pub http_status: Option<u16>,
+    pub finish_reason: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub ttfb_ms: Option<u64>,
+    pub route_strategy: Option<String>,
+    #[serde(default)]
+    pub attempt_no: u32,
+    #[serde(default = "default_attempt_count_one")]
+    pub attempt_count: u32,
+    pub session_id: Option<String>,
+    pub affinity_hit: Option<bool>,
+    pub pool_id: Option<String>,
+    pub selected_reason: Option<String>,
+}
+
+fn default_ok_status() -> String {
+    "ok".into()
+}
+
+fn default_attempt_count_one() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -326,6 +350,25 @@ pub struct UsageDayModelEntry {
     pub total_tokens: u64,
 }
 
+/// Provider health rollup (success rate + TTFB) from `by_provider`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct UsageProviderEntry {
+    #[serde(default)]
+    pub provider_id: String,
+    #[serde(default)]
+    pub provider_kind: String,
+    #[serde(default)]
+    pub request_count: u64,
+    #[serde(default)]
+    pub success_count: u64,
+    #[serde(default)]
+    pub success_rate: f64,
+    pub avg_ttfb_ms: Option<f64>,
+    pub avg_duration_ms: Option<f64>,
+    #[serde(default)]
+    pub total_usd: f64,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct UsageSummaryView {
     #[serde(default)]
@@ -334,6 +377,11 @@ pub struct UsageSummaryView {
     pub total_usd: f64,
     #[serde(default)]
     pub request_count: u64,
+    /// Fraction of requests with `status = ok` in the period.
+    #[serde(default)]
+    pub success_rate: f64,
+    pub avg_ttfb_ms: Option<f64>,
+    pub avg_duration_ms: Option<f64>,
     pub key_id: Option<String>,
     #[serde(default)]
     pub entries: Vec<UsageSummaryEntry>,
@@ -347,6 +395,9 @@ pub struct UsageSummaryView {
     /// Per-day model rollups for Usage → by day detail.
     #[serde(default)]
     pub by_day_model: Vec<UsageDayModelEntry>,
+    /// Provider health for Usage → by provider detail.
+    #[serde(default)]
+    pub by_provider: Vec<UsageProviderEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -624,6 +675,59 @@ mod tests {
         assert_eq!(u.cache_write_tokens, 40);
         assert_eq!(u.reasoning_tokens, 5);
         assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.status, "ok");
+        assert_eq!(u.attempt_count, 1);
+    }
+
+    #[test]
+    fn usage_summary_deserializes_success_rate_and_by_provider() {
+        let raw = r#"{
+            "period":"2026-07",
+            "total_usd":1.5,
+            "request_count":10,
+            "success_rate":0.8,
+            "avg_ttfb_ms":42.5,
+            "avg_duration_ms":100.0,
+            "entries":[],
+            "by_day":[],
+            "by_model":[],
+            "by_key_model":[],
+            "by_day_model":[],
+            "by_provider":[{
+                "provider_id":"p1",
+                "provider_kind":"openai",
+                "request_count":10,
+                "success_count":8,
+                "success_rate":0.8,
+                "avg_ttfb_ms":42.5,
+                "avg_duration_ms":100.0,
+                "total_usd":1.5
+            }]
+        }"#;
+        let s: UsageSummaryView = serde_json::from_str(raw).unwrap();
+        assert!((s.success_rate - 0.8).abs() < 1e-9);
+        assert!((s.avg_ttfb_ms.unwrap() - 42.5).abs() < 1e-9);
+        assert_eq!(s.by_provider.len(), 1);
+        assert_eq!(s.by_provider[0].provider_id, "p1");
+        assert!((s.by_provider[0].success_rate - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn usage_record_deserializes_outcome_and_timing() {
+        let raw = r#"{
+            "id":"1","ts":"t","request_id":"r",
+            "status":"error","error_class":"timeout","http_status":null,
+            "duration_ms":90,"ttfb_ms":null,
+            "route_strategy":"fallback","attempt_no":1,"attempt_count":2,
+            "selected_reason":"retry",
+            "cost_usd":0.0,"stream":false
+        }"#;
+        let u: UsageRecordView = serde_json::from_str(raw).unwrap();
+        assert_eq!(u.status, "error");
+        assert_eq!(u.error_class.as_deref(), Some("timeout"));
+        assert_eq!(u.duration_ms, Some(90));
+        assert_eq!(u.attempt_count, 2);
+        assert_eq!(u.selected_reason.as_deref(), Some("retry"));
     }
 
     #[test]

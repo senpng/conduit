@@ -959,6 +959,14 @@ pub async fn usage_summary(
         Ok(m) => m,
         Err(e) => return internal(e).into_response(),
     };
+    let outcome = match repo.summary_outcome(&period, key_id).await {
+        Ok(o) => o,
+        Err(e) => return internal(e).into_response(),
+    };
+    let by_provider = match repo.summary_by_provider(&period, key_id).await {
+        Ok(p) => p,
+        Err(e) => return internal(e).into_response(),
+    };
 
     // Top-level totals: when a key filter is set, sum only that key's entry so
     // cards match the scoped day/model charts.
@@ -970,7 +978,12 @@ pub async fn usage_summary(
         None => entries.iter().collect(),
     };
     let total_usd: f64 = scoped_entries.iter().map(|e| e.total_usd).sum();
-    let request_count: u64 = scoped_entries.iter().map(|e| e.request_count).sum();
+    // Prefer outcome request_count (includes zero-token / error rows) when present.
+    let request_count: u64 = if outcome.request_count > 0 {
+        outcome.request_count
+    } else {
+        scoped_entries.iter().map(|e| e.request_count).sum()
+    };
 
     (
         StatusCode::OK,
@@ -978,6 +991,9 @@ pub async fn usage_summary(
             "period": period,
             "total_usd": total_usd,
             "request_count": request_count,
+            "success_rate": outcome.success_rate,
+            "avg_ttfb_ms": outcome.avg_ttfb_ms,
+            "avg_duration_ms": outcome.avg_duration_ms,
             "key_id": key_id,
             "entries": entries.iter().map(|e| json!({
                 "downstream_key_id": e.downstream_key_id,
@@ -1015,6 +1031,16 @@ pub async fn usage_summary(
                 "request_count": m.request_count,
                 "total_usd": m.total_usd,
                 "total_tokens": m.total_tokens,
+            })).collect::<Vec<_>>(),
+            "by_provider": by_provider.iter().map(|p| json!({
+                "provider_id": p.provider_id,
+                "provider_kind": p.provider_kind,
+                "request_count": p.request_count,
+                "success_count": p.success_count,
+                "success_rate": p.success_rate,
+                "avg_ttfb_ms": p.avg_ttfb_ms,
+                "avg_duration_ms": p.avg_duration_ms,
+                "total_usd": p.total_usd,
             })).collect::<Vec<_>>(),
         })),
     )
