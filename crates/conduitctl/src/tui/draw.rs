@@ -931,7 +931,9 @@ fn draw_master_detail_keys(frame: &mut Frame, area: Rect, app: &App) {
         [
             Constraint::Length(2),
             Constraint::Percentage(45),
-            Constraint::Length(8),
+            // RPM holds a short number (or "—") + the "RPM" header — 6 is plenty;
+            // the freed width goes to the flexible ID column.
+            Constraint::Length(6),
             Constraint::Min(10),
         ],
     )
