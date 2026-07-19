@@ -6,6 +6,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 
 use super::theme::Theme;
 
@@ -181,17 +182,54 @@ pub fn keybind_line(theme: &Theme, pairs: &[(&str, &str)]) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Display columns a string occupies in a terminal cell grid (CJK/emoji = 2,
+/// control chars = 0). Use this instead of `chars().count()` whenever the
+/// result is compared against a column budget.
+pub fn display_width(s: &str) -> usize {
+    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+/// Truncate `s` to at most `max` **display columns**, appending `…` when cut.
+/// Wide characters (CJK, emoji) count as 2 columns, so the result never
+/// overflows the budget even by a single cell.
 pub fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    if s.chars().count() <= max {
-        s.to_string()
-    } else if max == 1 {
-        "…".into()
+    if display_width(s) <= max {
+        return s.to_string();
+    }
+    if max == 1 {
+        return "…".into();
+    }
+    // Reserve one column for the ellipsis; stop before a wide char would spill.
+    let budget = max - 1;
+    let mut used = 0;
+    let mut out = String::new();
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// Truncate to `width` display columns, then pad with spaces to exactly fill
+/// `width` columns. Column-accurate replacement for `format!("{:<width$}", …)`,
+/// which mis-measures CJK/emoji because it pads by `char` count.
+pub fn pad_display(s: &str, width: usize) -> String {
+    let t = truncate(s, width);
+    let pad = width.saturating_sub(display_width(&t));
+    if pad == 0 {
+        t
     } else {
-        let t: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{t}…")
+        let mut out = t;
+        out.extend(std::iter::repeat(' ').take(pad));
+        out
     }
 }
 
@@ -291,6 +329,46 @@ fn parse_to_local(s: &str) -> Option<DateTime<Local>> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::*;
+
+    #[test]
+    fn display_width_counts_cjk_as_two() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("中文"), 4); // two full-width cells each
+        assert_eq!(display_width("a中b"), 4);
+    }
+
+    #[test]
+    fn truncate_respects_display_columns() {
+        // "中文字" is 6 columns; budget 5 keeps "中" (2) + "…" (1) = 3 cols,
+        // never spilling a wide char past the limit.
+        let t = truncate("中文字", 5);
+        assert!(display_width(&t) <= 5, "width {} of {t:?}", display_width(&t));
+        assert!(t.ends_with('…'));
+        // Fits exactly → unchanged.
+        assert_eq!(truncate("中文", 4), "中文");
+        assert_eq!(truncate("abcdef", 4), "abc…");
+    }
+
+    #[test]
+    fn pad_display_fills_by_columns_not_chars() {
+        // A char-count pad would make this 14 wide (12 chars); column pad must
+        // account for the two full-width cells and land at exactly 14 columns.
+        let p = pad_display("中文name", 14);
+        assert_eq!(display_width(&p), 14);
+        // ASCII path still behaves like a plain left-pad.
+        assert_eq!(pad_display("ab", 5), "ab   ");
+    }
+
+    #[test]
+    fn zero_width_is_empty() {
+        assert_eq!(truncate("anything", 0), "");
+        assert_eq!(pad_display("x", 0), "");
+    }
 }
 
 #[cfg(test)]

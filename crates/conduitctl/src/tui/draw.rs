@@ -13,7 +13,8 @@ use super::forms::{ConfirmAction, ProviderFormKind};
 use super::theme::Theme;
 use super::widgets::{
     detail_kv, empty_state, fill_bg, format_local_time, format_local_time_short, format_tokens,
-    format_usd, health_badge, keybind_line, modal, panel_block, ratio_bar, spinner, truncate,
+    format_usd, health_badge, keybind_line, modal, pad_display, panel_block, ratio_bar, spinner,
+    truncate,
 };
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -341,7 +342,7 @@ fn draw_overview_top_models(frame: &mut Frame, area: Rect, app: &App) {
         .map(|(i, m)| {
             Line::from(vec![
                 Span::styled(
-                    format!("{:<14}", truncate(&m.label, 14)),
+                    pad_display(&m.label, 14),
                     Style::default().fg(theme.chart_color(i)),
                 ),
                 Span::styled(
@@ -1260,7 +1261,7 @@ fn draw_usage_by_model(
             let mark = if i == sel { "▶ " } else { "  " };
             Line::from(vec![
                 Span::styled(
-                    format!("{mark}{:<w$}", truncate(label, label_w), w = label_w),
+                    format!("{mark}{}", pad_display(label, label_w)),
                     if i == sel {
                         theme.accent_bold()
                     } else {
@@ -1387,7 +1388,7 @@ fn draw_usage_by_key(frame: &mut Frame, area: Rect, app: &App, sel: usize, perio
             let mark = if i == sel { "▶ " } else { "  " };
             Line::from(vec![
                 Span::styled(
-                    format!("{mark}{:<w$}", truncate(name, label_w), w = label_w),
+                    format!("{mark}{}", pad_display(name, label_w)),
                     if i == sel {
                         theme.accent_bold()
                     } else {
