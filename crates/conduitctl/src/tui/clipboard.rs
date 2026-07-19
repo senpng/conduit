@@ -53,16 +53,29 @@ fn pipe_to(cmd: &str, args: &[&str], text: &str) -> Result<(), String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("{cmd}: {e}"))?;
-    {
+
+    // Feed stdin in a nested scope so the pipe closes before we wait. If taking
+    // stdin or writing fails after the child already spawned, we must still reap
+    // it — otherwise the process leaks as a zombie. Capture the write result and
+    // reap unconditionally below.
+    let write_result = (|| -> Result<(), String> {
         let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| format!("{cmd}: no stdin"))?;
         stdin
             .write_all(text.as_bytes())
-            .map_err(|e| format!("{cmd} write: {e}"))?;
+            .map_err(|e| format!("{cmd} write: {e}"))
         // Drop stdin to close pipe so the tool exits.
+    })();
+
+    if let Err(e) = write_result {
+        // Don't leave the spawned child behind on a write failure.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
     }
+
     let status = child
         .wait()
         .map_err(|e| format!("{cmd} wait: {e}"))?;

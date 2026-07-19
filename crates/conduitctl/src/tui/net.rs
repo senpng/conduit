@@ -11,12 +11,12 @@ use crate::dto::{
 use super::app::USAGE_PAGE_SIZE;
 use super::msg::{Msg, RefreshKind};
 
-pub fn spawn_load_tab(client: ConsoleClient, tab_idx: usize, tx: UnboundedSender<Msg>) {
+pub fn spawn_load_tab(client: ConsoleClient, tab_idx: usize, gen: u64, tx: UnboundedSender<Msg>) {
     match tab_idx {
-        0 => spawn_overview(client, tx),
-        1 => spawn_providers(client, tx),
-        2 => spawn_routes(client, tx),
-        3 => spawn_keys(client, tx),
+        0 => spawn_overview(client, gen, tx),
+        1 => spawn_providers(client, gen, tx),
+        2 => spawn_routes(client, gen, tx),
+        3 => spawn_keys(client, gen, tx),
         4 => spawn_usage(
             client,
             None,
@@ -24,9 +24,10 @@ pub fn spawn_load_tab(client: ConsoleClient, tab_idx: usize, tx: UnboundedSender
             USAGE_PAGE_SIZE,
             None,
             Some("date".into()),
+            gen,
             tx,
         ),
-        5 => spawn_pricing(client, tx),
+        5 => spawn_pricing(client, gen, tx),
         _ => {}
     }
 }
@@ -41,35 +42,41 @@ fn empty_usage_page() -> UsageListResponse {
     }
 }
 
-pub fn spawn_overview(client: ConsoleClient, tx: UnboundedSender<Msg>) {
+pub fn spawn_overview(client: ConsoleClient, gen: u64, tx: UnboundedSender<Msg>) {
     tokio::spawn(async move {
         let health = client.health().await.map_err(|e| e.to_string());
         let _ = tx.send(Msg::Health(health));
         // Counts for metric strip
         let providers = client.list_providers_typed().await.map_err(|e| e.to_string());
-        let _ = tx.send(Msg::Providers(providers));
+        let _ = tx.send(Msg::Providers { gen, result: providers });
         let routes = client.list_routes_typed().await.map_err(|e| e.to_string());
-        let _ = tx.send(Msg::Routes(routes));
+        let _ = tx.send(Msg::Routes { gen, result: routes });
         let keys = client.list_keys_typed().await.map_err(|e| e.to_string());
-        let _ = tx.send(Msg::Keys(keys));
+        let _ = tx.send(Msg::Keys { gen, result: keys });
         // Current-month spend / sparkline / top models (defaults to UTC month on server).
         let summary = client
             .usage_summary_typed(None)
             .await
             .map_err(|e| e.to_string());
         let _ = tx.send(Msg::Usage {
+            gen,
             summary: Some(summary),
             recent: Some(Ok(empty_usage_page())),
         });
     });
 }
 
-pub fn spawn_providers(client: ConsoleClient, tx: UnboundedSender<Msg>) {
+pub fn spawn_providers(client: ConsoleClient, gen: u64, tx: UnboundedSender<Msg>) {
     tokio::spawn(async move {
         let r = client.list_providers_typed().await.map_err(|e| e.to_string());
-        let _ = tx.send(Msg::Providers(r));
+        let _ = tx.send(Msg::Providers { gen, result: r });
         // Probe OAuth remaining (Claude/Codex usage + Grok billing), then load snapshots + cooldowns.
-        let _ = client.refresh_all_quotas().await;
+        if let Err(e) = client.refresh_all_quotas().await {
+            let _ = tx.send(Msg::Quota {
+                snapshots: Err(format!("refresh quotas: {e}")),
+                cooldowns: Err(String::new()),
+            });
+        }
         spawn_quota_state(client, tx).await;
     });
 }
@@ -96,10 +103,16 @@ pub fn spawn_quota_refresh(
     tx: UnboundedSender<Msg>,
 ) {
     tokio::spawn(async move {
-        if let Some(id) = provider_id {
-            let _ = client.refresh_quota(&id).await;
+        let probe = if let Some(id) = provider_id {
+            client.refresh_quota(&id).await
         } else {
-            let _ = client.refresh_all_quotas().await;
+            client.refresh_all_quotas().await
+        };
+        if let Err(e) = probe {
+            let _ = tx.send(Msg::Quota {
+                snapshots: Err(format!("probe remaining: {e}")),
+                cooldowns: Err(String::new()),
+            });
         }
         spawn_quota_state(client, tx).await;
     });
@@ -122,17 +135,17 @@ async fn spawn_quota_state(client: ConsoleClient, tx: UnboundedSender<Msg>) {
     });
 }
 
-pub fn spawn_routes(client: ConsoleClient, tx: UnboundedSender<Msg>) {
+pub fn spawn_routes(client: ConsoleClient, gen: u64, tx: UnboundedSender<Msg>) {
     tokio::spawn(async move {
         let r = client.list_routes_typed().await.map_err(|e| e.to_string());
-        let _ = tx.send(Msg::Routes(r));
+        let _ = tx.send(Msg::Routes { gen, result: r });
     });
 }
 
-pub fn spawn_keys(client: ConsoleClient, tx: UnboundedSender<Msg>) {
+pub fn spawn_keys(client: ConsoleClient, gen: u64, tx: UnboundedSender<Msg>) {
     tokio::spawn(async move {
         let r = client.list_keys_typed().await.map_err(|e| e.to_string());
-        let _ = tx.send(Msg::Keys(r));
+        let _ = tx.send(Msg::Keys { gen, result: r });
     });
 }
 
@@ -144,6 +157,7 @@ pub fn spawn_usage(
     limit: usize,
     q: Option<String>,
     sort: Option<String>,
+    gen: u64,
     tx: UnboundedSender<Msg>,
 ) {
     tokio::spawn(async move {
@@ -162,15 +176,16 @@ pub fn spawn_usage(
             .await
             .map_err(|e| e.to_string());
         let _ = tx.send(Msg::Usage {
+            gen,
             summary: Some(summary),
             recent: Some(recent),
         });
         // Pricing rates used by usage detail pane (cache read/write unit prices).
         let pricing = client.list_pricing_typed().await.map_err(|e| e.to_string());
-        let _ = tx.send(Msg::Pricing(pricing));
+        let _ = tx.send(Msg::Pricing { gen, result: pricing });
         // Key names for Usage → by key rollup labels.
         let keys = client.list_keys_typed().await.map_err(|e| e.to_string());
-        let _ = tx.send(Msg::Keys(keys));
+        let _ = tx.send(Msg::Keys { gen, result: keys });
     });
 }
 
@@ -182,6 +197,7 @@ pub fn spawn_usage_page(
     limit: usize,
     q: Option<String>,
     sort: Option<String>,
+    gen: u64,
     tx: UnboundedSender<Msg>,
 ) {
     tokio::spawn(async move {
@@ -196,13 +212,14 @@ pub fn spawn_usage_page(
             .await
             .map_err(|e| e.to_string());
         let _ = tx.send(Msg::Usage {
+            gen,
             summary: None,
             recent: Some(recent),
         });
     });
 }
 
-pub fn spawn_pricing(client: ConsoleClient, tx: UnboundedSender<Msg>) {
+pub fn spawn_pricing(client: ConsoleClient, gen: u64, tx: UnboundedSender<Msg>) {
     tokio::spawn(async move {
         // Fetch in parallel so Overrides + Usage show together on first paint
         // (sequential order left usage empty until the very end).
@@ -216,35 +233,37 @@ pub fn spawn_pricing(client: ConsoleClient, tx: UnboundedSender<Msg>) {
         );
         // Usage first so detail panes have spend as soon as the list appears.
         let _ = tx.send(Msg::Usage {
+            gen,
             summary: Some(summary),
             recent: Some(Ok(empty_usage_page())),
         });
-        let _ = tx.send(Msg::PricingOverrides(overrides));
-        let _ = tx.send(Msg::Pricing(pricing));
+        let _ = tx.send(Msg::PricingOverrides { gen, result: overrides });
+        let _ = tx.send(Msg::Pricing { gen, result: pricing });
     });
 }
 
 /// Lightweight: only period usage summary (for Pricing detail without full reload).
-pub fn spawn_usage_summary_only(client: ConsoleClient, tx: UnboundedSender<Msg>) {
+pub fn spawn_usage_summary_only(client: ConsoleClient, gen: u64, tx: UnboundedSender<Msg>) {
     tokio::spawn(async move {
         let summary = client
             .usage_summary_typed(None)
             .await
             .map_err(|e| e.to_string());
         let _ = tx.send(Msg::Usage {
+            gen,
             summary: Some(summary),
             recent: None,
         });
     });
 }
 
-pub fn spawn_pricing_overrides(client: ConsoleClient, tx: UnboundedSender<Msg>) {
+pub fn spawn_pricing_overrides(client: ConsoleClient, gen: u64, tx: UnboundedSender<Msg>) {
     tokio::spawn(async move {
         let o = client
             .list_pricing_overrides()
             .await
             .map_err(|e| e.to_string());
-        let _ = tx.send(Msg::PricingOverrides(o));
+        let _ = tx.send(Msg::PricingOverrides { gen, result: o });
     });
 }
 
@@ -265,7 +284,7 @@ pub fn spawn_upsert_pricing_override(
             Ok(v) => {
                 // Immediate list update (don't wait for full refresh).
                 if let Some(rows) = overrides_from_mutation_body(&v) {
-                    let _ = tx.send(Msg::PricingOverrides(Ok(rows)));
+                    let _ = tx.send(Msg::PricingOverrides { gen: 0, result: Ok(rows) });
                 }
                 let _ = tx.send(Msg::Mutated {
                     ok: true,
@@ -299,7 +318,7 @@ pub fn spawn_delete_pricing_override(
         {
             Ok(v) => {
                 if let Some(rows) = overrides_from_mutation_body(&v) {
-                    let _ = tx.send(Msg::PricingOverrides(Ok(rows)));
+                    let _ = tx.send(Msg::PricingOverrides { gen: 0, result: Ok(rows) });
                 }
                 let _ = tx.send(Msg::Mutated {
                     ok: true,

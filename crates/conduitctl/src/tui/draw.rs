@@ -1042,11 +1042,9 @@ fn draw_usage_barchart(frame: &mut Frame, area: Rect, app: &App) {
     let labels: Vec<String> = slice
         .iter()
         .map(|d| {
-            if d.day.len() >= 10 {
-                d.day[8..10].to_string() // day-of-month
-            } else {
-                d.day.clone()
-            }
+            // day-of-month from `YYYY-MM-DD`; use char-safe slicing so a
+            // malformed multi-byte `day` can never panic the render thread.
+            d.day.get(8..10).map(str::to_string).unwrap_or_else(|| d.day.clone())
         })
         .collect();
     let data: Vec<(&str, u64)> = labels

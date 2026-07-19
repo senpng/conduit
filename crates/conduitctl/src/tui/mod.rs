@@ -16,11 +16,12 @@ use std::io::{self, stdout};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use crossterm::event::{Event, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;

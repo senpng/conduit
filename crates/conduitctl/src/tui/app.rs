@@ -203,6 +203,13 @@ pub struct App {
     /// Selection index into the **filtered** view for each tab.
     pub selected: [usize; 6],
 
+    /// Monotonic load generation. Bumped whenever a load that *replaces* list
+    /// data is issued (tab flip, refresh, page/sort/filter change). Data
+    /// responses carry the generation they were spawned under; `apply_msg`
+    /// drops any tagged response older than this so a slow in-flight request
+    /// can't clobber fresher data. Mutations send `gen == 0` to stay exempt.
+    data_gen: u64,
+
     tx: UnboundedSender<Msg>,
 }
 
@@ -239,6 +246,7 @@ impl App {
             usage_sort: UsageSort::default(),
             usage_detail: UsageDetail::default(),
             selected: [0; 6],
+            data_gen: 0,
             tx,
         }
     }
@@ -246,16 +254,27 @@ impl App {
     pub fn request_refresh(&mut self) {
         self.loading = true;
         self.error = None;
+        let gen = self.next_gen();
         match self.tab {
             Tab::Usage => {
                 self.spawn_usage_load(true);
             }
             Tab::Pricing => {
                 // Always reload pricing + period usage together.
-                net::spawn_pricing(self.client.clone(), self.tx.clone());
+                net::spawn_pricing(self.client.clone(), gen, self.tx.clone());
             }
-            other => net::spawn_load_tab(self.client.clone(), other.index(), self.tx.clone()),
+            other => net::spawn_load_tab(self.client.clone(), other.index(), gen, self.tx.clone()),
         }
+    }
+
+    /// Bump and return the load generation for a data-replacing request.
+    /// Skips 0, which is the exempt sentinel used by mutation-path responses.
+    fn next_gen(&mut self) -> u64 {
+        self.data_gen = self.data_gen.wrapping_add(1);
+        if self.data_gen == 0 {
+            self.data_gen = 1;
+        }
+        self.data_gen
     }
 
     pub fn handle_action(&mut self, action: Action) {
@@ -509,12 +528,14 @@ impl App {
                     // Ensure usage summary is present for the right-hand 用量 pane.
                     // Full pricing list may already be loaded — only pull missing pieces.
                     if self.usage_summary.is_none() {
-                        net::spawn_usage_summary_only(self.client.clone(), self.tx.clone());
+                        let gen = self.next_gen();
+                        net::spawn_usage_summary_only(self.client.clone(), gen, self.tx.clone());
                     }
                     if self.pricing_pane == PricingPane::Overrides
                         && self.pricing_overrides.is_empty()
                     {
-                        net::spawn_pricing_overrides(self.client.clone(), self.tx.clone());
+                        let gen = self.next_gen();
+                        net::spawn_pricing_overrides(self.client.clone(), gen, self.tx.clone());
                     }
                 }
             }
@@ -553,6 +574,7 @@ impl App {
         self.loading = true;
         self.error = None;
         self.usage_applied_filter = self.filter.clone();
+        let gen = self.next_gen();
         let q = if self.filter.is_empty() {
             None
         } else {
@@ -566,6 +588,7 @@ impl App {
                 USAGE_PAGE_SIZE,
                 q,
                 Some(self.usage_sort.label().to_string()),
+                gen,
                 self.tx.clone(),
             );
         } else {
@@ -576,6 +599,7 @@ impl App {
                 USAGE_PAGE_SIZE,
                 q,
                 Some(self.usage_sort.label().to_string()),
+                gen,
                 self.tx.clone(),
             );
         }
@@ -948,7 +972,8 @@ impl App {
             }
             Tab::Routes => {
                 // Always refresh providers so the wizard has a current list.
-                net::spawn_providers(self.client.clone(), self.tx.clone());
+                let gen = self.next_gen();
+                net::spawn_providers(self.client.clone(), gen, self.tx.clone());
                 self.mode = Mode::RouteWizard(RouteWizard::create(self.providers.clone()));
             }
             Tab::Keys => {
@@ -1050,10 +1075,11 @@ impl App {
                 }
             }
             Tab::Routes => {
-                if let Some(r) = self.routes.get(idx) {
-                    net::spawn_providers(self.client.clone(), self.tx.clone());
+                if let Some(r) = self.routes.get(idx).cloned() {
+                    let gen = self.next_gen();
+                    net::spawn_providers(self.client.clone(), gen, self.tx.clone());
                     self.mode =
-                        Mode::RouteWizard(RouteWizard::edit(r, self.providers.clone()));
+                        Mode::RouteWizard(RouteWizard::edit(&r, self.providers.clone()));
                 }
             }
             Tab::Keys => {
@@ -1583,9 +1609,11 @@ impl App {
         if let Mode::OauthFlow(f) = &mut self.mode {
             if f.pending_session_id.is_some() {
                 f.poll_ticks = f.poll_ticks.wrapping_add(1);
-                // ~2s at 200ms tick → every 10 ticks
-                if f.poll_ticks % 10 == 0 {
+                // ~2s at 200ms tick → every 10 ticks. Skip if a poll is still
+                // in flight so a slow one can't let requests pile up.
+                if f.poll_ticks % 10 == 0 && !f.poll_inflight {
                     if let Some(sid) = f.pending_session_id.clone() {
+                        f.poll_inflight = true;
                         net::spawn_oauth_poll(self.client.clone(), sid, self.tx.clone());
                     }
                 }
@@ -1593,61 +1621,92 @@ impl App {
         }
     }
 
+    /// True when a data response tagged `gen` is stale and must be dropped.
+    /// `gen == 0` is the mutation-path sentinel and is never considered stale.
+    fn is_stale(&self, gen: u64) -> bool {
+        gen != 0 && gen < self.data_gen
+    }
+
     pub fn apply_msg(&mut self, msg: Msg) {
-        self.loading = false;
         match msg {
-            Msg::Health(r) => match r {
-                Ok(h) => {
-                    self.health = Some(h);
-                    self.error = None;
-                }
-                Err(e) => {
-                    self.error = Some(e);
-                    self.health = None;
-                }
-            },
-            Msg::Providers(r) => match r {
-                Ok(v) => {
-                    self.providers = v;
-                    // Drop decrypted secrets for providers that no longer exist.
-                    self.provider_secrets
-                        .retain(|id, _| self.providers.iter().any(|p| p.id == *id));
-                    self.clamp_sel(Tab::Providers);
-                    if let Mode::RouteWizard(w) = &mut self.mode {
-                        w.set_providers(self.providers.clone());
+            Msg::Health(r) => {
+                self.loading = false;
+                match r {
+                    Ok(h) => {
+                        self.health = Some(h);
+                        self.error = None;
+                    }
+                    Err(e) => {
+                        self.error = Some(e);
+                        self.health = None;
                     }
                 }
-                Err(e) => self.error = Some(e),
-            },
-            Msg::Routes(r) => match r {
-                Ok(v) => {
-                    self.routes = v;
-                    self.clamp_sel(Tab::Routes);
+            }
+            Msg::Providers { gen, result } => {
+                if self.is_stale(gen) {
+                    return;
                 }
-                Err(e) => self.error = Some(e),
-            },
-            Msg::Keys(r) => match r {
-                Ok(v) => {
-                    self.keys = v;
-                    self.clamp_sel(Tab::Keys);
+                self.loading = false;
+                match result {
+                    Ok(v) => {
+                        self.providers = v;
+                        // Drop decrypted secrets for providers that no longer exist.
+                        self.provider_secrets
+                            .retain(|id, _| self.providers.iter().any(|p| p.id == *id));
+                        self.clamp_sel(Tab::Providers);
+                        if let Mode::RouteWizard(w) = &mut self.mode {
+                            w.set_providers(self.providers.clone());
+                        }
+                    }
+                    Err(e) => self.error = Some(e),
                 }
-                Err(e) => self.error = Some(e),
-            },
+            }
+            Msg::Routes { gen, result } => {
+                if self.is_stale(gen) {
+                    return;
+                }
+                self.loading = false;
+                match result {
+                    Ok(v) => {
+                        self.routes = v;
+                        self.clamp_sel(Tab::Routes);
+                    }
+                    Err(e) => self.error = Some(e),
+                }
+            }
+            Msg::Keys { gen, result } => {
+                if self.is_stale(gen) {
+                    return;
+                }
+                self.loading = false;
+                match result {
+                    Ok(v) => {
+                        self.keys = v;
+                        self.clamp_sel(Tab::Keys);
+                    }
+                    Err(e) => self.error = Some(e),
+                }
+            }
             Msg::Quota {
                 snapshots,
                 cooldowns,
             } => {
+                self.loading = false;
                 match snapshots {
                     Ok(v) => self.quota_snapshots = v,
-                    Err(e) => {
+                    // Empty error string is a "don't touch" placeholder from the
+                    // quota-probe failure path — surface only real messages.
+                    Err(e) if !e.is_empty() => {
                         self.status = format!("quota snapshots: {e}");
                     }
+                    Err(_) => {}
                 }
                 match cooldowns {
                     Ok(v) => self.cooldowns = v,
-                    Err(e) => {
+                    Err(e) if !e.is_empty() => {
                         self.status = format!("cooldowns: {e}");
                     }
+                    Err(_) => {}
                 }
                 if self.tab == Tab::Providers {
                     let n = self.quota_snapshots.len();
@@ -1659,34 +1718,41 @@ impl App {
                     };
                 }
             }
-            Msg::ProviderSecret(r) => match r {
-                Ok(view) => {
-                    let title = format!(
-                        "Secret · {} ({})",
-                        if view.provider_name.is_empty() {
-                            view.provider_id.as_str()
-                        } else {
-                            view.provider_name.as_str()
-                        },
-                        view.secret_kind
-                    );
-                    let body = format_provider_secret_modal(&view);
-                    let id = view.provider_id.clone();
-                    self.provider_secrets.insert(id, view);
-                    self.mode = Mode::SecretReveal {
-                        title,
-                        secret: body,
-                    };
-                    self.status =
-                        "Secret decrypted — shown in detail & modal (v to hide; others keep)"
-                            .into();
+            Msg::ProviderSecret(r) => {
+                self.loading = false;
+                match r {
+                    Ok(view) => {
+                        let title = format!(
+                            "Secret · {} ({})",
+                            if view.provider_name.is_empty() {
+                                view.provider_id.as_str()
+                            } else {
+                                view.provider_name.as_str()
+                            },
+                            view.secret_kind
+                        );
+                        let body = format_provider_secret_modal(&view);
+                        let id = view.provider_id.clone();
+                        self.provider_secrets.insert(id, view);
+                        self.mode = Mode::SecretReveal {
+                            title,
+                            secret: body,
+                        };
+                        self.status =
+                            "Secret decrypted — shown in detail & modal (v to hide; others keep)"
+                                .into();
+                    }
+                    Err(e) => {
+                        self.error = Some(e);
+                        self.status = "Failed to decrypt secret".into();
+                    }
                 }
-                Err(e) => {
-                    self.error = Some(e);
-                    self.status = "Failed to decrypt secret".into();
+            }
+            Msg::Usage { gen, summary, recent } => {
+                if self.is_stale(gen) {
+                    return;
                 }
-            },
-            Msg::Usage { summary, recent } => {
+                self.loading = false;
                 if let Some(summary) = summary {
                     match summary {
                         Ok(s) => self.usage_summary = Some(s),
@@ -1726,15 +1792,26 @@ impl App {
                     }
                 }
             }
-            Msg::Pricing(r) => match r {
-                Ok(v) => {
-                    self.pricing = v;
-                    self.clamp_sel(Tab::Pricing);
+            Msg::Pricing { gen, result } => {
+                if self.is_stale(gen) {
+                    return;
                 }
-                Err(e) => self.error = Some(e),
-            },
-            Msg::PricingOverrides(r) => match r {
-                Ok(v) => {
+                self.loading = false;
+                match result {
+                    Ok(v) => {
+                        self.pricing = v;
+                        self.clamp_sel(Tab::Pricing);
+                    }
+                    Err(e) => self.error = Some(e),
+                }
+            }
+            Msg::PricingOverrides { gen, result } => {
+                if self.is_stale(gen) {
+                    return;
+                }
+                self.loading = false;
+                match result {
+                    Ok(v) => {
                     // If we just saved a specific row, keep selection on it.
                     let prefer = self
                         .pricing_overrides
@@ -1765,26 +1842,28 @@ impl App {
                         self.error = None;
                     }
                 }
-                Err(e) => {
-                    // Older daemons / missing route: keep any rows we already
-                    // have (e.g. from upsert response) and only warn.
-                    if e.contains("404") {
-                        if self.pricing_overrides.is_empty() {
-                            self.status =
+                    Err(e) => {
+                        // Older daemons / missing route: keep any rows we already
+                        // have (e.g. from upsert response) and only warn.
+                        if e.contains("404") {
+                            if self.pricing_overrides.is_empty() {
+                                self.status =
                                 "overrides API unavailable (restart conduitd?) — showing merged only"
                                     .into();
+                            }
+                        } else {
+                            self.error = Some(e);
                         }
-                    } else {
-                        self.error = Some(e);
                     }
                 }
-            },
+            }
             Msg::Mutated {
                 ok,
                 message,
                 refresh,
                 secret,
             } => {
+                self.loading = false;
                 if ok {
                     self.status = message;
                     self.error = None;
@@ -1800,7 +1879,9 @@ impl App {
                     self.status = "Error".into();
                 }
             }
-            Msg::KeyCreated(r) => match r {
+            Msg::KeyCreated(r) => {
+                self.loading = false;
+                match r {
                 Ok(k) => {
                     self.status = format!("Key {} created", k.id);
                     self.apply_refresh(RefreshKind::Keys);
@@ -1809,12 +1890,15 @@ impl App {
                         secret: k.key,
                     };
                 }
-                Err(e) => {
-                    self.error = Some(e);
+                    Err(e) => {
+                        self.error = Some(e);
+                    }
                 }
-            },
-            Msg::OauthStarted(r) => match r {
-                Ok(s) => {
+            }
+            Msg::OauthStarted(r) => {
+                self.loading = false;
+                match r {
+                    Ok(s) => {
                     if let Mode::OauthFlow(f) = &mut self.mode {
                         f.pending_session_id = Some(s.session_id.clone());
                         f.session_status = Some(s.status.clone());
@@ -1835,52 +1919,62 @@ impl App {
                     }
                     self.status = "OAuth pending — complete in browser".into();
                 }
-                Err(e) => {
-                    if let Mode::OauthFlow(f) = &mut self.mode {
-                        f.error = Some(e.clone());
+                    Err(e) => {
+                        if let Mode::OauthFlow(f) = &mut self.mode {
+                            f.error = Some(e.clone());
+                        }
+                        self.error = Some(e);
                     }
-                    self.error = Some(e);
                 }
-            },
-            Msg::OauthPolled(r) => match r {
-                Ok(s) => {
-                    if let Mode::OauthFlow(f) = &mut self.mode {
-                        f.session_status = Some(s.status.clone());
-                        f.auth_url = s.auth_url.or(f.auth_url.clone());
-                        f.user_code = s.user_code.or(f.user_code.clone());
-                        f.verification_uri = s.verification_uri.or(f.verification_uri.clone());
-                        f.error = s.error.clone();
-                        let st = s.status.to_lowercase();
-                        if st == "completed" {
-                            f.pending_session_id = None;
-                            f.result_message = Some(format!(
-                                "Completed. provider_id={:?} email={:?}",
-                                s.provider_id, s.email
-                            ));
-                            self.status = "OAuth completed — provider list refreshed".into();
-                            self.tab = Tab::Providers;
-                            self.apply_refresh(RefreshKind::Providers);
-                        } else if st == "error" || st == "cancelled" {
-                            f.pending_session_id = None;
-                            f.result_message =
-                                Some(s.error.unwrap_or_else(|| st.clone()));
-                            self.status = format!("OAuth {st}");
+            }
+            Msg::OauthPolled(r) => {
+                self.loading = false;
+                if let Mode::OauthFlow(f) = &mut self.mode {
+                    f.poll_inflight = false;
+                }
+                match r {
+                    Ok(s) => {
+                        if let Mode::OauthFlow(f) = &mut self.mode {
+                            f.session_status = Some(s.status.clone());
+                            f.auth_url = s.auth_url.or(f.auth_url.clone());
+                            f.user_code = s.user_code.or(f.user_code.clone());
+                            f.verification_uri = s.verification_uri.or(f.verification_uri.clone());
+                            f.error = s.error.clone();
+                            let st = s.status.to_lowercase();
+                            if st == "completed" {
+                                f.pending_session_id = None;
+                                f.result_message = Some(format!(
+                                    "Completed. provider_id={:?} email={:?}",
+                                    s.provider_id, s.email
+                                ));
+                                self.status = "OAuth completed — provider list refreshed".into();
+                                self.tab = Tab::Providers;
+                                self.apply_refresh(RefreshKind::Providers);
+                            } else if st == "error" || st == "cancelled" {
+                                f.pending_session_id = None;
+                                f.result_message =
+                                    Some(s.error.unwrap_or_else(|| st.clone()));
+                                self.status = format!("OAuth {st}");
+                            }
                         }
                     }
+                    Err(e) => self.error = Some(e),
                 }
-                Err(e) => self.error = Some(e),
-            },
-            Msg::OauthCancelled(r) => match r {
-                Ok(()) => {
-                    if let Mode::OauthFlow(f) = &mut self.mode {
-                        f.pending_session_id = None;
-                        f.session_status = Some("cancelled".into());
-                        f.result_message = Some("Cancelled".into());
+            }
+            Msg::OauthCancelled(r) => {
+                self.loading = false;
+                match r {
+                    Ok(()) => {
+                        if let Mode::OauthFlow(f) = &mut self.mode {
+                            f.pending_session_id = None;
+                            f.session_status = Some("cancelled".into());
+                            f.result_message = Some("Cancelled".into());
+                        }
+                        self.status = "OAuth cancelled".into();
                     }
-                    self.status = "OAuth cancelled".into();
+                    Err(e) => self.error = Some(e),
                 }
-                Err(e) => self.error = Some(e),
-            },
+            }
         }
     }
 
@@ -1902,27 +1996,28 @@ impl App {
     }
 
     fn apply_refresh(&mut self, kind: RefreshKind) {
+        let gen = self.next_gen();
         match kind {
             RefreshKind::None => {}
-            RefreshKind::Overview => net::spawn_overview(self.client.clone(), self.tx.clone()),
+            RefreshKind::Overview => net::spawn_overview(self.client.clone(), gen, self.tx.clone()),
             RefreshKind::Providers => {
-                net::spawn_providers(self.client.clone(), self.tx.clone());
+                net::spawn_providers(self.client.clone(), gen, self.tx.clone());
             }
-            RefreshKind::Routes => net::spawn_routes(self.client.clone(), self.tx.clone()),
-            RefreshKind::Keys => net::spawn_keys(self.client.clone(), self.tx.clone()),
+            RefreshKind::Routes => net::spawn_routes(self.client.clone(), gen, self.tx.clone()),
+            RefreshKind::Keys => net::spawn_keys(self.client.clone(), gen, self.tx.clone()),
             RefreshKind::Usage => {
                 self.spawn_usage_load(true);
             }
-            RefreshKind::Pricing => net::spawn_pricing(self.client.clone(), self.tx.clone()),
+            RefreshKind::Pricing => net::spawn_pricing(self.client.clone(), gen, self.tx.clone()),
             RefreshKind::PricingOverrides => {
-                net::spawn_pricing_overrides(self.client.clone(), self.tx.clone());
+                net::spawn_pricing_overrides(self.client.clone(), gen, self.tx.clone());
             }
             RefreshKind::Oauth => {
                 // OAuth is not a tab; refresh provider list after login.
-                net::spawn_providers(self.client.clone(), self.tx.clone());
+                net::spawn_providers(self.client.clone(), gen, self.tx.clone());
             }
             RefreshKind::All => {
-                net::spawn_overview(self.client.clone(), self.tx.clone());
+                net::spawn_overview(self.client.clone(), gen, self.tx.clone());
             }
         }
     }

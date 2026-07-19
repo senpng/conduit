@@ -9,16 +9,36 @@ use crate::dto::{
 #[derive(Debug)]
 pub enum Msg {
     Health(Result<HealthResponse, String>),
-    Providers(Result<Vec<ProviderView>, String>),
-    Routes(Result<Vec<RouteView>, String>),
-    Keys(Result<Vec<KeyView>, String>),
+    /// `gen` is the request generation captured when the load was spawned; the
+    /// UI drops any data response whose `gen` is older than the latest issued
+    /// load, so a slow in-flight request can't clobber fresher data (tab flip,
+    /// page flip, filter change all bump the generation).
+    Providers {
+        gen: u64,
+        result: Result<Vec<ProviderView>, String>,
+    },
+    Routes {
+        gen: u64,
+        result: Result<Vec<RouteView>, String>,
+    },
+    Keys {
+        gen: u64,
+        result: Result<Vec<KeyView>, String>,
+    },
     /// `summary` / `recent` are independently optional so page flips can skip the rollup.
     Usage {
+        gen: u64,
         summary: Option<Result<UsageSummaryView, String>>,
         recent: Option<Result<UsageListResponse, String>>,
     },
-    Pricing(Result<Vec<PricingView>, String>),
-    PricingOverrides(Result<Vec<PricingView>, String>),
+    Pricing {
+        gen: u64,
+        result: Result<Vec<PricingView>, String>,
+    },
+    PricingOverrides {
+        gen: u64,
+        result: Result<Vec<PricingView>, String>,
+    },
     /// Upstream quota snapshots + cooldowns (OAuth remaining).
     Quota {
         snapshots: Result<Vec<QuotaSnapshotView>, String>,

@@ -701,6 +701,9 @@ pub struct OauthFlow {
     pub result_message: Option<String>,
     pub error: Option<String>,
     pub poll_ticks: u32,
+    /// True while a status poll is in flight, so `on_tick` doesn't stack a new
+    /// poll on top of a slow/hung one (which would let dozens accumulate).
+    pub poll_inflight: bool,
 }
 
 impl OauthFlow {
@@ -718,6 +721,7 @@ impl OauthFlow {
             result_message: None,
             error: None,
             poll_ticks: 0,
+            poll_inflight: false,
         }
     }
 
