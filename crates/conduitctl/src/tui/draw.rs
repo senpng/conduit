@@ -2563,21 +2563,38 @@ fn form_modal(
     let mut lines = vec![Line::from("")];
     for (i, label) in labels.iter().enumerate() {
         let focused = i == focus;
-        let val = fields.get(i).map(|x| x.display()).unwrap_or_default();
         let marker = if focused { "▸" } else { " " };
-        let style = if focused {
+        // Focused label: accent so which field is active is obvious.
+        let label_style = if focused {
             theme.accent_bold()
         } else {
-            Style::default().fg(theme.fg)
+            theme.muted()
         };
         lines.push(Line::from(Span::styled(
             format!(" {marker} {label}"),
-            theme.muted(),
+            label_style,
         )));
-        lines.push(Line::from(Span::styled(
-            format!("   {val}{}", if focused { "▌" } else { "" }),
-            style,
-        )));
+
+        // Value line: caret at InputField.cursor (not always at end).
+        let base = if focused {
+            Style::default()
+                .fg(theme.fg)
+                .bg(theme.selection_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg).bg(theme.surface)
+        };
+        let caret =
+            super::input::InputField::caret_style(theme.accent, theme.background);
+        let mut value_spans = vec![Span::styled("   ", base)];
+        if let Some(field) = fields.get(i) {
+            value_spans.extend(field.line_spans(base, caret, focused).spans);
+        }
+        // Soft pad after the value so the selection bar is easy to spot.
+        if focused {
+            value_spans.push(Span::styled("  ", base));
+        }
+        lines.push(Line::from(value_spans));
         lines.push(Line::from(""));
     }
     if let Some(err) = error {
@@ -2698,10 +2715,16 @@ fn draw_route_wizard(frame: &mut Frame, theme: &Theme, w: &super::forms::RouteWi
 
     match w.step {
         0 => {
-            lines.push(Line::from(Span::styled(
-                format!("  ▸ match_alias: {}▌", w.match_alias.display()),
-                theme.accent_bold(),
-            )));
+            let base = Style::default()
+                .fg(theme.fg)
+                .bg(theme.selection_bg)
+                .add_modifier(Modifier::BOLD);
+            let caret =
+                super::input::InputField::caret_style(theme.accent, theme.background);
+            let mut alias_spans = vec![Span::styled("  ▸ match_alias: ", theme.accent_bold())];
+            alias_spans.extend(w.match_alias.line_spans(base, caret, true).spans);
+            alias_spans.push(Span::styled("  ", base));
+            lines.push(Line::from(alias_spans));
             lines.push(Line::from(Span::styled(
                 format!(
                     "    strategy: {}  — {}  (Ctrl-y / Ctrl-k cycle)",
@@ -2727,20 +2750,68 @@ fn draw_route_wizard(frame: &mut Frame, theme: &Theme, w: &super::forms::RouteWi
             lines.push(Line::from(""));
             for (i, t) in w.targets.iter().enumerate() {
                 let label = w.binding_label(&t.binding);
-                let mark = if i == w.target_focus { "▸" } else { " " };
+                let selected = i == w.target_focus;
+                let mark = if selected { "▸" } else { " " };
                 let pool_mark = if t.binding.is_pool() { "◇" } else { "·" };
+                let row_style = if selected {
+                    theme.accent_bold()
+                } else {
+                    Style::default().fg(theme.fg)
+                };
                 lines.push(Line::from(Span::styled(
-                    format!(
-                        " {mark} [{i}] {pool_mark} {label}\n     model={}  overrides={}",
-                        t.model_id.display(),
-                        truncate(&t.overrides.display(), 40)
-                    ),
-                    if i == w.target_focus {
-                        theme.accent_bold()
-                    } else {
-                        Style::default().fg(theme.fg)
-                    },
+                    format!(" {mark} [{i}] {pool_mark} {label}"),
+                    row_style,
                 )));
+
+                // Active target: show real caret on the field being edited.
+                if selected {
+                    let base = Style::default()
+                        .fg(theme.fg)
+                        .bg(theme.selection_bg)
+                        .add_modifier(Modifier::BOLD);
+                    let caret =
+                        super::input::InputField::caret_style(theme.accent, theme.background);
+                    let edit_model = w.field_in_target == 0;
+                    let mut model_spans = vec![Span::styled(
+                        "     model=",
+                        if edit_model {
+                            theme.accent_bold()
+                        } else {
+                            theme.muted()
+                        },
+                    )];
+                    model_spans.extend(
+                        t.model_id
+                            .line_spans(base, caret, edit_model)
+                            .spans,
+                    );
+                    lines.push(Line::from(model_spans));
+
+                    let mut ov_spans = vec![Span::styled(
+                        "     overrides=",
+                        if !edit_model {
+                            theme.accent_bold()
+                        } else {
+                            theme.muted()
+                        },
+                    )];
+                    // Show caret on full overrides field (not truncated) so position is real.
+                    ov_spans.extend(
+                        t.overrides
+                            .line_spans(base, caret, !edit_model)
+                            .spans,
+                    );
+                    lines.push(Line::from(ov_spans));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "     model={}  overrides={}",
+                            t.model_id.display(),
+                            truncate(&t.overrides.display(), 40)
+                        ),
+                        Style::default().fg(theme.fg),
+                    )));
+                }
             }
             lines.push(Line::from(Span::styled(
                 format!(
@@ -2824,21 +2895,33 @@ fn draw_oauth_flow(frame: &mut Frame, theme: &Theme, f: &super::forms::OauthFlow
                 theme.muted(),
             )));
         }
-        let name_focus = f.focus == 1 || (!reauth && f.focus != 2);
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  {} name     {}{}",
-                if f.focus == 1 { "▸" } else { " " },
-                f.name.display(),
-                if f.focus == 1 { "▌" } else { "" }
+        let name_focused = f.focus == 1;
+        let marker = if name_focused { "▸" } else { " " };
+        let base = if name_focused {
+            Style::default()
+                .fg(theme.fg)
+                .bg(theme.selection_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg)
+        };
+        let caret =
+            super::input::InputField::caret_style(theme.accent, theme.background);
+        let mut name_spans = vec![
+            Span::styled(
+                format!("  {marker} name     "),
+                if name_focused {
+                    theme.accent_bold()
+                } else {
+                    theme.muted()
+                },
             ),
-            if f.focus == 1 {
-                theme.accent_bold()
-            } else {
-                Style::default().fg(theme.fg)
-            },
-        )));
-        let _ = name_focus;
+        ];
+        name_spans.extend(f.name.line_spans(base, caret, name_focused).spans);
+        if name_focused {
+            name_spans.push(Span::styled("  ", base));
+        }
+        lines.push(Line::from(name_spans));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  Enter start login · Esc cancel  (returns to Providers)",

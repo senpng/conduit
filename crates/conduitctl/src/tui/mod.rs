@@ -50,12 +50,15 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     let mut out = stdout();
     execute!(out, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(out);
-    let terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::new(backend)?;
+    // Forms draw their own caret; the hardware cursor just floats and confuses.
+    terminal.hide_cursor()?;
     // Best-effort restore on panic
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), crossterm::cursor::Show);
         original_hook(info);
     }));
     Ok(terminal)
