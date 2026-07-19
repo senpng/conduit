@@ -916,7 +916,7 @@ fn draw_master_detail_keys(frame: &mut Frame, area: Rect, app: &App) {
                 en.into(),
                 truncate(&k.name, 24),
                 rpm,
-                truncate(&k.id, 12),
+                truncate(&k.id, 26),
             ]);
             if view_i == sel {
                 row.style(theme.selection())
@@ -930,11 +930,13 @@ fn draw_master_detail_keys(frame: &mut Frame, area: Rect, app: &App) {
         rows,
         [
             Constraint::Length(2),
-            Constraint::Percentage(45),
-            // RPM holds a short number (or "—") + the "RPM" header — 6 is plenty;
-            // the freed width goes to the flexible ID column.
+            // A fixed 45% NAME left a big gap before RPM for short names and
+            // truncated the ID. Make both flexible; ID gets the larger share so
+            // the 26-char ULID shows in full when there's room.
+            Constraint::Fill(1), // NAME
+            // RPM holds a short number (or "—") + the "RPM" header — 6 is plenty.
             Constraint::Length(6),
-            Constraint::Min(10),
+            Constraint::Fill(2), // ID
         ],
     )
     .header(Row::new(vec!["", "NAME", "RPM", "ID"]).style(theme.header_cell()))
