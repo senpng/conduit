@@ -1,22 +1,11 @@
 import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
-import tailwindcss from "@tailwindcss/vite";
-import path from "node:path";
 
 const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig({
-  plugins: [tailwindcss(), svelte()],
+  plugins: [svelte()],
   clearScreen: false,
-  resolve: {
-    alias: {
-      $lib: path.resolve(__dirname, "src/lib"),
-      $components: path.resolve(__dirname, "src/components"),
-    },
-    // Client-only app (no SSR): makes vitest resolve Svelte's browser build
-    // so component `mount()` works in jsdom smoke tests.
-    conditions: ["browser"],
-  },
   server: {
     port: 1420,
     strictPort: true,
@@ -32,9 +21,5 @@ export default defineConfig({
     target: ["es2021", "chrome100", "safari13"],
     minify: !process.env.TAURI_DEBUG ? "esbuild" : false,
     sourcemap: !!process.env.TAURI_DEBUG,
-  },
-  test: {
-    environment: "node",
-    include: ["src/**/*.test.ts"],
   },
 });
