@@ -40,7 +40,7 @@ pub enum Action {
     OauthCancel,
     /// OAuth: refresh selected provider tokens
     OauthRefresh,
-    /// Providers: probe OAuth subscription remaining (5h / 7d)
+    /// Providers: probe OAuth subscription remaining (Claude 5h/7d, Codex 7d, Grok mo)
     RefreshQuota,
     /// Providers: decrypt & show upstream secret in detail
     ViewSecret,

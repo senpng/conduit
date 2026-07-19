@@ -34,12 +34,13 @@ pub struct QuotaSnapshot {
     pub resets_in_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resets_at: Option<String>,
-    /// Session (≈5h) remaining percent 0–100 from OAuth usage API.
+    /// Session (≈5h, Claude) remaining percent 0–100 from OAuth usage API.
+    /// Codex no longer exposes a session window (weekly only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_remaining_pct: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_resets_at: Option<String>,
-    /// Weekly (≈7d) remaining percent 0–100 from OAuth usage API.
+    /// Weekly (≈7d) remaining percent 0–100 from OAuth usage API (Claude + Codex).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weekly_remaining_pct: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -239,7 +240,7 @@ impl UpstreamQuotaStore {
         });
     }
 
-    /// Compact remaining label for list UIs: `5h 95% · 7d 66%`, Grok `mo 72%`, or header fallbacks.
+    /// Compact remaining label for list UIs: Claude `5h·7d`, Codex `7d`, Grok `mo`, or header fallbacks.
     pub fn remaining_label(snap: &QuotaSnapshot) -> Option<String> {
         let billing = snap.source.to_ascii_lowercase().contains("billing")
             || snap.source.to_ascii_lowercase().contains("grok");

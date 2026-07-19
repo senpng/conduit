@@ -461,10 +461,10 @@ pub struct QuotaSnapshotView {
     pub tokens_limit: Option<u64>,
     pub resets_in_seconds: Option<u64>,
     pub resets_at: Option<String>,
-    /// Session (≈5h) remaining percent 0–100.
+    /// Session (≈5h, Claude) remaining percent 0–100; Codex no longer uses this.
     pub session_remaining_pct: Option<f64>,
     pub session_resets_at: Option<String>,
-    /// Weekly (≈7d) remaining percent 0–100.
+    /// Weekly (≈7d) remaining percent 0–100 (Claude + Codex).
     pub weekly_remaining_pct: Option<f64>,
     pub weekly_resets_at: Option<String>,
     #[serde(default)]
@@ -472,7 +472,7 @@ pub struct QuotaSnapshotView {
 }
 
 impl QuotaSnapshotView {
-    /// Compact remaining label: `5h 95% · 7d 66%`, Grok `mo 72%`, or header fallbacks.
+    /// Compact remaining label: Claude `5h 95% · 7d 66%`, Codex `7d 60%`, Grok `mo 72%`, or header fallbacks.
     pub fn remaining_label(&self) -> Option<String> {
         let billing = self.source.to_ascii_lowercase().contains("billing")
             || self.source.to_ascii_lowercase().contains("grok");

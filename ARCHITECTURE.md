@@ -104,7 +104,7 @@ Credentials (access + refresh + expiry + account metadata) are stored as JSON in
 | Kind | Probe | Remaining fields |
 |------|-------|------------------|
 | `claude-oauth` | `GET /api/oauth/usage` | session 5h + weekly 7d % |
-| `codex-oauth` | `GET …/wham/usage` | session 5h + weekly 7d % |
+| `codex-oauth` | `GET …/wham/usage` | weekly 7d % only (5h session removed) |
 | `grok-oauth` | `POST grok.com …/GetGrokCreditsConfig` (gRPC-web) | monthly credits % (`mo`) |
 
 Successful and error upstream responses also record `anthropic-ratelimit-*` / `x-ratelimit-*` / `retry-after`. TUI Providers tab shows a **REMAINING** column and detail meters (`u` re-probes).

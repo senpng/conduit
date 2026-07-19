@@ -3,7 +3,7 @@
 //! | Provider | Endpoint | Windows |
 //! |----------|----------|---------|
 //! | Claude   | `GET https://api.anthropic.com/api/oauth/usage` | 5h session + 7d weekly |
-//! | Codex    | `GET https://chatgpt.com/backend-api/wham/usage` | 5h primary + 7d secondary |
+//! | Codex    | `GET https://chatgpt.com/backend-api/wham/usage` | weekly 7d only (5h session removed) |
 //! | Grok     | `POST https://grok.com/.../GetGrokCreditsConfig` (gRPC-web) | monthly credits |
 //!
 //! Mirrors CodexBar's OAuth remaining strategy: reuse the stored OAuth access
@@ -42,7 +42,7 @@ pub struct UsageWindow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OauthUsage {
     pub provider_kind: OAuthProviderKind,
-    /// Session / short window (≈5h for Claude/Codex).
+    /// Session / short window (≈5h for Claude; Codex no longer exposes this).
     pub session: Option<UsageWindow>,
     /// Longer window: weekly for Claude/Codex, **monthly credits** for Grok.
     pub weekly: Option<UsageWindow>,
@@ -362,6 +362,10 @@ fn window_from_utilization(node: Option<&Value>) -> Option<UsageWindow> {
 }
 
 /// Parse Codex `wham/usage` JSON into session/weekly windows.
+///
+/// Product change: Codex dropped the ≈5h session cap; only the weekly (≈7d)
+/// limit remains. We still classify a short `limit_window_seconds` as session
+/// if upstream ever returns one (legacy dual-window payloads).
 pub fn parse_codex_usage(body: &str) -> Result<OauthUsage, OAuthError> {
     let v: Value = serde_json::from_str(body)
         .map_err(|e| OAuthError::Provider(format!("codex usage json: {e}")))?;
@@ -384,22 +388,46 @@ pub fn parse_codex_usage(body: &str) -> Result<OauthUsage, OAuthError> {
         .or_else(|| rl.get("secondary"))
         .or_else(|| v.get("secondary_window"));
 
-    let mut session = window_from_codex_node(primary);
-    let mut weekly = window_from_codex_node(secondary);
+    let nodes: Vec<&Value> = [primary, secondary].into_iter().flatten().collect();
+    let any_duration = nodes.iter().any(|n| codex_window_secs(n).is_some());
 
-    // Prefer duration-based classification when limit_window_seconds present.
-    for node in [primary, secondary].into_iter().flatten() {
-        let secs = node
-            .get("limit_window_seconds")
-            .or_else(|| node.get("limit_window_secs"))
-            .and_then(|x| x.as_u64().or_else(|| x.as_i64().map(|i| i.max(0) as u64)));
-        let Some(secs) = secs else { continue };
-        let win = window_from_codex_node(Some(node));
-        // ~5h = 18000, ~7d = 604800 — allow slack.
-        if (3_600..43_200).contains(&secs) {
-            session = win;
-        } else if secs >= 86_400 {
-            weekly = win;
+    let mut session = None;
+    let mut weekly = None;
+
+    if any_duration {
+        // Prefer duration-based classification.
+        // ~5h = 18000 (legacy), ~7d = 604800 — allow slack.
+        for node in &nodes {
+            let win = window_from_codex_node(Some(node));
+            match codex_window_secs(node) {
+                Some(secs) if (3_600..43_200).contains(&secs) => session = win,
+                Some(secs) if secs >= 86_400 => weekly = win,
+                // Unknown band or missing on this node: default to weekly.
+                _ => {
+                    if weekly.is_none() {
+                        weekly = win;
+                    } else if session.is_none() {
+                        session = win;
+                    }
+                }
+            }
+        }
+    } else {
+        // No durations at all.
+        match (
+            window_from_codex_node(primary),
+            window_from_codex_node(secondary),
+        ) {
+            // Legacy dual-window shape without durations: primary≈session, secondary≈weekly.
+            (Some(p), Some(s)) => {
+                session = Some(p);
+                weekly = Some(s);
+            }
+            // Single window → weekly only (current Codex product).
+            (Some(only), None) | (None, Some(only)) => {
+                weekly = Some(only);
+            }
+            (None, None) => {}
         }
     }
 
@@ -415,6 +443,12 @@ pub fn parse_codex_usage(body: &str) -> Result<OauthUsage, OAuthError> {
         source: "oauth_usage_api",
         raw_excerpt: body.chars().take(256).collect(),
     })
+}
+
+fn codex_window_secs(node: &Value) -> Option<u64> {
+    node.get("limit_window_seconds")
+        .or_else(|| node.get("limit_window_secs"))
+        .and_then(|x| x.as_u64().or_else(|| x.as_i64().map(|i| i.max(0) as u64)))
 }
 
 fn window_from_codex_node(node: Option<&Value>) -> Option<UsageWindow> {
@@ -778,7 +812,8 @@ pub fn used_to_remaining(used: f64) -> f64 {
 
 /// Compact one-line summary for list columns.
 ///
-/// Claude/Codex: `5h 95% · 7d 66%`
+/// Claude: `5h 95% · 7d 66%`
+/// Codex: `7d 60%` (weekly only; session only if legacy short window present)
 /// Grok: `mo 72%` (monthly credits remaining)
 pub fn format_remaining_short(usage: &OauthUsage) -> String {
     match usage.provider_kind {
@@ -853,7 +888,8 @@ mod tests {
     }
 
     #[test]
-    fn codex_primary_secondary() {
+    fn codex_legacy_primary_secondary() {
+        // Legacy dual-window payload (pre-removal of 5h session).
         let body = r#"{
           "rate_limit": {
             "primary_window": {
@@ -872,6 +908,40 @@ mod tests {
         assert!((u.session.as_ref().unwrap().remaining_pct - 87.5).abs() < 0.01);
         assert!((u.weekly.as_ref().unwrap().remaining_pct - 60.0).abs() < 0.01);
         assert_eq!(format_remaining_short(&u), "5h 88% · 7d 60%");
+    }
+
+    #[test]
+    fn codex_weekly_only_primary() {
+        // Current product: 5h session removed; primary is the weekly window.
+        let body = r#"{
+          "rate_limit": {
+            "primary_window": {
+              "used_percent": 40.0,
+              "limit_window_seconds": 604800,
+              "reset_at": "2026-07-26T00:00:00Z"
+            }
+          }
+        }"#;
+        let u = parse_codex_usage(body).unwrap();
+        assert!(u.session.is_none(), "weekly primary must not be labeled 5h");
+        assert!((u.weekly.as_ref().unwrap().remaining_pct - 60.0).abs() < 0.01);
+        assert_eq!(format_remaining_short(&u), "7d 60%");
+    }
+
+    #[test]
+    fn codex_single_window_no_duration_is_weekly() {
+        let body = r#"{
+          "rate_limit": {
+            "primary_window": {
+              "used_percent": 25.0,
+              "reset_at": "2026-07-26T00:00:00Z"
+            }
+          }
+        }"#;
+        let u = parse_codex_usage(body).unwrap();
+        assert!(u.session.is_none());
+        assert!((u.weekly.as_ref().unwrap().remaining_pct - 75.0).abs() < 0.01);
+        assert_eq!(format_remaining_short(&u), "7d 75%");
     }
 
     #[test]

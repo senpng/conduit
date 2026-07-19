@@ -636,7 +636,7 @@ fn provider_quota_detail_lines(
         }
     } else if super::forms::ProviderForm::is_oauth_kind_label(&p.kind) {
         out.push(Line::from(Span::styled(
-            "  press u to probe OAuth remaining (Claude/Codex 5h·7d, Grok mo)",
+            "  press u to probe OAuth remaining (Claude 5h·7d, Codex 7d, Grok mo)",
             theme.subtle(),
         )));
     } else {
@@ -2195,7 +2195,7 @@ Providers  (OAuth is an add method here)
   Y             Copy primary only (api_key / access_token)
   o             Re-auth OAuth provider
   x             Force-refresh OAuth tokens
-  u             Probe OAuth remaining (Claude 5h/7d · Codex 5h/7d)
+  u             Probe OAuth remaining (Claude 5h/7d · Codex 7d · Grok mo)
   d             Delete
 
 Secret reveal modal
