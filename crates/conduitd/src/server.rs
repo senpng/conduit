@@ -59,7 +59,7 @@ pub async fn run(
     let secret_backend = backend_result.backend;
 
     // ── Pricing repo (hot-reloadable from pricing.json) ───────────────────────
-    let pricing_repo = Arc::new(PricingRepo::new(pool.clone(), &data_dir).await?);
+    let pricing_repo = Arc::new(PricingRepo::new(&data_dir).await?);
 
     // ── Model limits (context window) — separate from pricing ────────────────
     let limits_repo = Arc::new(conduit_store::LimitsRepo::new(&data_dir).await?);

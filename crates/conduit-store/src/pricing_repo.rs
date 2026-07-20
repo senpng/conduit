@@ -3,7 +3,6 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 // Shared source of truth for pricing kind fallbacks (see `conduit_ir::pricing`).
 use conduit_ir::pricing::pricing_kind_aliases as kind_aliases;
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
@@ -103,8 +102,11 @@ impl PricingSnapshot {
 
 // ── PricingRepo ───────────────────────────────────────────────────────────────
 
+/// File-backed pricing (no SQLite table — same pattern as model limits).
+///
+/// Authority: embedded defaults + `{app_dir}/pricing.litellm.json` +
+/// `{app_dir}/pricing.json`, merged into an in-memory snapshot.
 pub struct PricingRepo {
-    pool: SqlitePool,
     snapshot: PricingSnapshot,
 }
 
@@ -115,23 +117,16 @@ impl PricingRepo {
     /// 1. Embedded `DEFAULT_PRICING_JSON`
     /// 2. `{app_dir}/pricing.litellm.json` (last LiteLLM sync cache)
     /// 3. `{app_dir}/pricing.json` (operator overrides)
-    ///
-    /// Whatever is loaded is also written back to the DB so other processes
-    /// see it.
-    pub async fn new(pool: SqlitePool, app_dir: &Path) -> Result<Self, StoreError> {
+    pub async fn new(app_dir: &Path) -> Result<Self, StoreError> {
         let rows = Self::load_from_file_or_default(app_dir).await;
-        let snapshot = PricingSnapshot::from_rows(rows.clone());
-        let repo = Self { pool, snapshot };
-        repo.upsert_all(&rows).await?;
-        Ok(repo)
+        Ok(Self {
+            snapshot: PricingSnapshot::from_rows(rows),
+        })
     }
 
     /// Reload pricing from data-dir files (hot reload).
-    ///
-    /// On success the in-memory snapshot and the DB are both updated.
     pub async fn reload(&self, app_dir: &Path) -> Result<(), StoreError> {
         let rows = Self::load_from_file_or_default(app_dir).await;
-        self.upsert_all(&rows).await?;
         self.snapshot.replace(rows).await;
         info!("pricing hot-reloaded");
         Ok(())
@@ -177,7 +172,7 @@ impl PricingRepo {
         Ok((total, stats.source_models, stats.skipped))
     }
 
-    /// In-memory lookup — does not hit the DB.
+    /// In-memory lookup.
     pub async fn get_price(&self, provider_kind: &str, model_id: &str) -> Option<PricingRow> {
         self.snapshot.get(provider_kind, model_id).await
     }
@@ -338,36 +333,6 @@ impl PricingRepo {
             Err(e) => warn!("failed to read {label} ({}): {e}", path.display()),
         }
     }
-
-    async fn upsert_all(&self, rows: &[PricingRow]) -> Result<(), StoreError> {
-        for row in rows {
-            sqlx::query(
-                r#"INSERT INTO pricing
-                   (provider_kind, model_id, input_per_mtok, output_per_mtok,
-                    cache_read_per_mtok, cache_write_per_mtok, reasoning_per_mtok, effective_from)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(provider_kind, model_id) DO UPDATE SET
-                       input_per_mtok        = excluded.input_per_mtok,
-                       output_per_mtok       = excluded.output_per_mtok,
-                       cache_read_per_mtok   = excluded.cache_read_per_mtok,
-                       cache_write_per_mtok  = excluded.cache_write_per_mtok,
-                       reasoning_per_mtok    = excluded.reasoning_per_mtok,
-                       effective_from        = excluded.effective_from"#,
-            )
-            .bind(&row.provider_kind)
-            .bind(&row.model_id)
-            .bind(row.input_per_mtok)
-            .bind(row.output_per_mtok)
-            .bind(row.cache_read_per_mtok)
-            .bind(row.cache_write_per_mtok)
-            .bind(row.reasoning_per_mtok)
-            .bind(&row.effective_from)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
-        }
-        Ok(())
-    }
 }
 
 // ── Serde helper for pricing.json ─────────────────────────────────────────────
@@ -407,13 +372,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::open_db;
 
     #[tokio::test]
     async fn default_pricing_loads() {
-        let pool = open_db("sqlite::memory:").await.unwrap();
         let dir = tempdir().unwrap();
-        let repo = PricingRepo::new(pool, dir.path()).await.unwrap();
+        let repo = PricingRepo::new(dir.path()).await.unwrap();
 
         let row = repo.get_price("openai", "gpt-4o").await.unwrap();
         assert_eq!(row.input_per_mtok, 2.50);
@@ -422,9 +385,8 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_and_delete_override_roundtrip() {
-        let pool = open_db("sqlite::memory:").await.unwrap();
         let dir = tempdir().unwrap();
-        let repo = PricingRepo::new(pool, dir.path()).await.unwrap();
+        let repo = PricingRepo::new(dir.path()).await.unwrap();
 
         let row = PricingRow {
             provider_kind: "openai".into(),
@@ -453,7 +415,6 @@ mod tests {
 
     #[tokio::test]
     async fn custom_pricing_file_overrides_default() {
-        let pool = open_db("sqlite::memory:").await.unwrap();
         let dir = tempdir().unwrap();
 
         let custom = serde_json::json!([{
@@ -473,7 +434,7 @@ mod tests {
         .await
         .unwrap();
 
-        let repo = PricingRepo::new(pool, dir.path()).await.unwrap();
+        let repo = PricingRepo::new(dir.path()).await.unwrap();
         let row = repo.get_price("openai", "gpt-4o").await.unwrap();
         assert_eq!(row.input_per_mtok, 1.00);
         // Partial file must not wipe other defaults (merge, not replace).
@@ -483,9 +444,8 @@ mod tests {
 
     #[tokio::test]
     async fn hot_reload_updates_snapshot() {
-        let pool = open_db("sqlite::memory:").await.unwrap();
         let dir = tempdir().unwrap();
-        let repo = PricingRepo::new(pool, dir.path()).await.unwrap();
+        let repo = PricingRepo::new(dir.path()).await.unwrap();
 
         // Write a new pricing.json.
         let updated = serde_json::json!([{
@@ -512,7 +472,6 @@ mod tests {
 
     #[tokio::test]
     async fn litellm_cache_then_user_override() {
-        let pool = open_db("sqlite::memory:").await.unwrap();
         let dir = tempdir().unwrap();
 
         let litellm_rows = serde_json::json!([{
@@ -549,16 +508,15 @@ mod tests {
         .await
         .unwrap();
 
-        let repo = PricingRepo::new(pool, dir.path()).await.unwrap();
+        let repo = PricingRepo::new(dir.path()).await.unwrap();
         let row = repo.get_price("openai", "gpt-4o").await.unwrap();
         assert_eq!(row.input_per_mtok, 1.00); // user wins
     }
 
     #[tokio::test]
     async fn apply_litellm_json_writes_cache_and_reloads() {
-        let pool = open_db("sqlite::memory:").await.unwrap();
         let dir = tempdir().unwrap();
-        let repo = PricingRepo::new(pool, dir.path()).await.unwrap();
+        let repo = PricingRepo::new(dir.path()).await.unwrap();
 
         let litellm = r#"{
           "new-model-xyz": {
@@ -583,5 +541,13 @@ mod tests {
             .get_price("codex-oauth", "new-model-xyz")
             .await
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn pricing_repo_does_not_require_sqlite() {
+        // File + memory only — constructing with just a data dir succeeds.
+        let dir = tempdir().unwrap();
+        let repo = PricingRepo::new(dir.path()).await.unwrap();
+        assert!(!repo.all().await.is_empty());
     }
 }

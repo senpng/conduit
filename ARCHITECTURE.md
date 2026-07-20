@@ -162,7 +162,8 @@ Hard monthly budget *caps* are not enforced; RPM rate limits remain.
 
 ## Pricing data sources
 
-Cost estimation uses a layered pricing table (USD per million tokens):
+Cost estimation uses a layered pricing table (USD per million tokens),
+**file + memory only** (no SQLite `pricing` table):
 
 | Layer | Source | Priority |
 |-------|--------|----------|

@@ -128,9 +128,10 @@ pub struct DownstreamKeyRow {
 
 // ── Pricing ───────────────────────────────────────────────────────────────────
 
-/// A single pricing row read from DB or pricing.json.
+/// A single pricing row from embedded defaults / pricing JSON files.
 ///
 /// Price-only: context / max-output limits live in [`ModelLimitsRow`], not here.
+/// Not stored in SQLite — file + in-memory snapshot only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PricingRow {
     pub provider_kind: String,

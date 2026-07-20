@@ -124,17 +124,8 @@ CREATE TABLE IF NOT EXISTS usage_attempts (
 CREATE INDEX IF NOT EXISTS idx_usage_attempts_request
     ON usage_attempts(request_id, attempt_no);
 
-CREATE TABLE IF NOT EXISTS pricing (
-    provider_kind           TEXT NOT NULL,
-    model_id                TEXT NOT NULL,
-    input_per_mtok          REAL NOT NULL,
-    output_per_mtok         REAL NOT NULL,
-    cache_read_per_mtok     REAL,
-    cache_write_per_mtok    REAL,
-    reasoning_per_mtok      REAL,
-    effective_from          TEXT NOT NULL,
-    PRIMARY KEY (provider_kind, model_id)
-);
+-- Pricing lives in JSON files + memory (pricing.litellm.json / pricing.json),
+-- not SQLite. Legacy `pricing` table is dropped on migrate if present.
 
 CREATE TABLE IF NOT EXISTS app_events (
     id             TEXT PRIMARY KEY,
@@ -193,7 +184,17 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), StoreError> {
     add_soft_delete_columns(pool).await?;
     migrate_routes_soft_delete_unique(pool).await?;
     migrate_usage_request_ledger(pool).await?;
+    drop_legacy_pricing_table(pool).await?;
     info!("conduit-store schema up to date");
+    Ok(())
+}
+
+/// Pricing is file-backed; remove the unused SQLite mirror on existing installs.
+async fn drop_legacy_pricing_table(pool: &SqlitePool) -> Result<(), StoreError> {
+    sqlx::query("DROP TABLE IF EXISTS pricing")
+        .execute(pool)
+        .await
+        .map_err(|e| StoreError::Migration(e.to_string()))?;
     Ok(())
 }
 
