@@ -541,7 +541,14 @@ impl<'a> UsageRepo<'a> {
                        provider_kind,
                        COUNT(*) AS request_count,
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                       SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                                THEN completion_tokens ELSE 0 END) * 1000.0
+                           / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                               -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
+                               -- returns NULL if any argument is NULL, unlike agg MAX().
+                               THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
+                               ELSE NULL END), 0) AS tokens_per_sec
                    FROM usage_records
                    WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ? AND downstream_key_id = ?
                    GROUP BY COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
@@ -561,7 +568,14 @@ impl<'a> UsageRepo<'a> {
                        provider_kind,
                        COUNT(*) AS request_count,
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                       SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                                THEN completion_tokens ELSE 0 END) * 1000.0
+                           / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                               -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
+                               -- returns NULL if any argument is NULL, unlike agg MAX().
+                               THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
+                               ELSE NULL END), 0) AS tokens_per_sec
                    FROM usage_records
                    WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?
                    GROUP BY COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
@@ -580,7 +594,14 @@ impl<'a> UsageRepo<'a> {
                        provider_kind,
                        COUNT(*) AS request_count,
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                       SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                                THEN completion_tokens ELSE 0 END) * 1000.0
+                           / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                               -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
+                               -- returns NULL if any argument is NULL, unlike agg MAX().
+                               THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
+                               ELSE NULL END), 0) AS tokens_per_sec
                    FROM usage_records
                    WHERE downstream_key_id = ?
                    GROUP BY COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
@@ -598,7 +619,14 @@ impl<'a> UsageRepo<'a> {
                        provider_kind,
                        COUNT(*) AS request_count,
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                       SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                                THEN completion_tokens ELSE 0 END) * 1000.0
+                           / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                               -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
+                               -- returns NULL if any argument is NULL, unlike agg MAX().
+                               THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
+                               ELSE NULL END), 0) AS tokens_per_sec
                    FROM usage_records
                    GROUP BY COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
                             provider_kind
@@ -618,6 +646,7 @@ impl<'a> UsageRepo<'a> {
                 request_count: r.get::<i64, _>("request_count") as u64,
                 total_usd: r.get("total_usd"),
                 total_tokens: r.get::<i64, _>("total_tokens") as u64,
+                tokens_per_sec: r.get::<Option<f64>, _>("tokens_per_sec"),
             })
             .collect())
     }
@@ -772,7 +801,14 @@ impl<'a> UsageRepo<'a> {
                            COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
                                AS success_count,
                            AVG(ttfb_ms) AS avg_ttfb_ms,
-                           AVG(duration_ms) AS avg_duration_ms
+                           AVG(duration_ms) AS avg_duration_ms,
+                           SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                                    THEN completion_tokens ELSE 0 END) * 1000.0
+                               / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                                   -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
+                                   -- returns NULL if any argument is NULL, unlike agg MAX().
+                                   THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
+                                   ELSE NULL END), 0) AS tokens_per_sec
                        FROM usage_records
                        WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ? AND downstream_key_id = ?"#,
                 )
@@ -789,7 +825,14 @@ impl<'a> UsageRepo<'a> {
                            COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
                                AS success_count,
                            AVG(ttfb_ms) AS avg_ttfb_ms,
-                           AVG(duration_ms) AS avg_duration_ms
+                           AVG(duration_ms) AS avg_duration_ms,
+                           SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                                    THEN completion_tokens ELSE 0 END) * 1000.0
+                               / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                                   -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
+                                   -- returns NULL if any argument is NULL, unlike agg MAX().
+                                   THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
+                                   ELSE NULL END), 0) AS tokens_per_sec
                        FROM usage_records
                        WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?"#,
                 )
@@ -805,7 +848,14 @@ impl<'a> UsageRepo<'a> {
                            COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
                                AS success_count,
                            AVG(ttfb_ms) AS avg_ttfb_ms,
-                           AVG(duration_ms) AS avg_duration_ms
+                           AVG(duration_ms) AS avg_duration_ms,
+                           SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                                    THEN completion_tokens ELSE 0 END) * 1000.0
+                               / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                                   -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
+                                   -- returns NULL if any argument is NULL, unlike agg MAX().
+                                   THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
+                                   ELSE NULL END), 0) AS tokens_per_sec
                        FROM usage_records
                        WHERE downstream_key_id = ?"#,
                 )
@@ -820,7 +870,14 @@ impl<'a> UsageRepo<'a> {
                            COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
                                AS success_count,
                            AVG(ttfb_ms) AS avg_ttfb_ms,
-                           AVG(duration_ms) AS avg_duration_ms
+                           AVG(duration_ms) AS avg_duration_ms,
+                           SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                                    THEN completion_tokens ELSE 0 END) * 1000.0
+                               / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                                   -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
+                                   -- returns NULL if any argument is NULL, unlike agg MAX().
+                                   THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
+                                   ELSE NULL END), 0) AS tokens_per_sec
                        FROM usage_records"#,
                 )
                 .fetch_one(self.pool)
@@ -842,6 +899,7 @@ impl<'a> UsageRepo<'a> {
             success_rate,
             avg_ttfb_ms: row.get::<Option<f64>, _>("avg_ttfb_ms"),
             avg_duration_ms: row.get::<Option<f64>, _>("avg_duration_ms"),
+            tokens_per_sec: row.get::<Option<f64>, _>("tokens_per_sec"),
         })
     }
 
@@ -866,6 +924,13 @@ impl<'a> UsageRepo<'a> {
                            AS success_count,
                        AVG(ttfb_ms) AS avg_ttfb_ms,
                        AVG(duration_ms) AS avg_duration_ms,
+                       SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                                THEN completion_tokens ELSE 0 END) * 1000.0
+                           / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                               -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
+                               -- returns NULL if any argument is NULL, unlike agg MAX().
+                               THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
+                               ELSE NULL END), 0) AS tokens_per_sec,
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
                        COALESCE(SUM(total_tokens), 0) AS total_tokens
                    FROM usage_records
@@ -889,6 +954,13 @@ impl<'a> UsageRepo<'a> {
                            AS success_count,
                        AVG(ttfb_ms) AS avg_ttfb_ms,
                        AVG(duration_ms) AS avg_duration_ms,
+                       SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                                THEN completion_tokens ELSE 0 END) * 1000.0
+                           / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                               -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
+                               -- returns NULL if any argument is NULL, unlike agg MAX().
+                               THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
+                               ELSE NULL END), 0) AS tokens_per_sec,
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
                        COALESCE(SUM(total_tokens), 0) AS total_tokens
                    FROM usage_records
@@ -911,6 +983,13 @@ impl<'a> UsageRepo<'a> {
                            AS success_count,
                        AVG(ttfb_ms) AS avg_ttfb_ms,
                        AVG(duration_ms) AS avg_duration_ms,
+                       SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                                THEN completion_tokens ELSE 0 END) * 1000.0
+                           / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                               -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
+                               -- returns NULL if any argument is NULL, unlike agg MAX().
+                               THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
+                               ELSE NULL END), 0) AS tokens_per_sec,
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
                        COALESCE(SUM(total_tokens), 0) AS total_tokens
                    FROM usage_records
@@ -932,6 +1011,13 @@ impl<'a> UsageRepo<'a> {
                            AS success_count,
                        AVG(ttfb_ms) AS avg_ttfb_ms,
                        AVG(duration_ms) AS avg_duration_ms,
+                       SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                                THEN completion_tokens ELSE 0 END) * 1000.0
+                           / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+                               -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
+                               -- returns NULL if any argument is NULL, unlike agg MAX().
+                               THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
+                               ELSE NULL END), 0) AS tokens_per_sec,
                        COALESCE(SUM(cost_usd), 0) AS total_usd,
                        COALESCE(SUM(total_tokens), 0) AS total_tokens
                    FROM usage_records
@@ -962,6 +1048,7 @@ impl<'a> UsageRepo<'a> {
                     success_rate,
                     avg_ttfb_ms: r.get::<Option<f64>, _>("avg_ttfb_ms"),
                     avg_duration_ms: r.get::<Option<f64>, _>("avg_duration_ms"),
+                    tokens_per_sec: r.get::<Option<f64>, _>("tokens_per_sec"),
                     total_usd: r.get("total_usd"),
                     total_tokens: r.get::<i64, _>("total_tokens") as u64,
                 }
@@ -1009,6 +1096,9 @@ pub struct UsageModelRow {
     pub request_count: u64,
     pub total_usd: f64,
     pub total_tokens: u64,
+    /// Throughput = Σcompletion_tokens / Σgeneration_ms, size-weighted — NOT a
+    /// row-wise mean. `None` when no eligible row exists.
+    pub tokens_per_sec: Option<f64>,
 }
 
 /// Model rollup for one downstream key within a period.
@@ -1041,6 +1131,9 @@ pub struct UsageOutcomeSummary {
     pub success_rate: f64,
     pub avg_ttfb_ms: Option<f64>,
     pub avg_duration_ms: Option<f64>,
+    /// Throughput = Σcompletion_tokens / Σgeneration_ms, size-weighted — NOT a
+    /// row-wise mean like `avg_ttfb_ms`. `None` when no eligible row exists.
+    pub tokens_per_sec: Option<f64>,
 }
 
 /// Provider health rollup within a period.
@@ -1053,6 +1146,9 @@ pub struct UsageProviderRow {
     pub success_rate: f64,
     pub avg_ttfb_ms: Option<f64>,
     pub avg_duration_ms: Option<f64>,
+    /// Throughput = Σcompletion_tokens / Σgeneration_ms, size-weighted — NOT a
+    /// row-wise mean like `avg_ttfb_ms`. `None` when no eligible row exists.
+    pub tokens_per_sec: Option<f64>,
     pub total_usd: f64,
     pub total_tokens: u64,
 }
@@ -1824,14 +1920,201 @@ mod tests {
         assert!((outcome.success_rate - 2.0 / 3.0).abs() < 1e-9);
         let avg_ttfb = outcome.avg_ttfb_ms.unwrap();
         assert!((avg_ttfb - 60.0).abs() < 1e-6); // (40+80)/2
+        // ok: 1 tok / (100-40)ms; ok_b: 2 tok / (200-80)ms; err has 0 tokens, excluded.
+        // sum/sum = 3 tok / 180ms * 1000 = 16.666.. tok/s
+        let tps = outcome.tokens_per_sec.unwrap();
+        assert!((tps - 16.666_666_666_666_668).abs() < 1e-6);
 
         let by_p = repo.summary_by_provider("2026-07", None, 0).await.unwrap();
         let a = by_p.iter().find(|p| p.provider_id == "prov-a").unwrap();
         assert_eq!(a.request_count, 2);
         assert!((a.success_rate - 0.5).abs() < 1e-9);
         assert!((a.avg_ttfb_ms.unwrap() - 40.0).abs() < 1e-6);
+        // Only the ok row is eligible (err has 0 completion_tokens): 1 tok / 60ms * 1000.
+        assert!((a.tokens_per_sec.unwrap() - 16.666_666_666_666_668).abs() < 1e-6);
         let b = by_p.iter().find(|p| p.provider_id == "prov-b").unwrap();
         assert_eq!(b.request_count, 1);
         assert!((b.success_rate - 1.0).abs() < 1e-9);
+        // 2 tok / (200-80)ms * 1000.
+        assert!((b.tokens_per_sec.unwrap() - 16.666_666_666_666_668).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn tokens_per_sec_edge_cases() {
+        let pool = open_db("sqlite::memory:").await.unwrap();
+        let repo = UsageRepo::new(&pool);
+
+        // Row with no duration_ms at all must not leak its completion_tokens
+        // into the numerator (numerator/denominator filters must match).
+        let mut no_duration = new_usage_record(
+            "r-no-duration",
+            Some("k1".into()),
+            None,
+            Some("prov-a".into()),
+            Some("openai".into()),
+            Some("m".into()),
+            5,
+            10,
+            15,
+            0,
+            0,
+            0,
+            0.05,
+            true,
+        );
+        no_duration.ts = "2026-07-01T00:00:00Z".into();
+        no_duration.status = "ok".into();
+        no_duration.duration_ms = None;
+        no_duration.ttfb_ms = None;
+        repo.insert(&no_duration).await.unwrap();
+
+        // Dirty data: ttfb_ms > duration_ms must clamp generation time to 0,
+        // contributing 0 to the denominator (not negative).
+        let mut dirty = new_usage_record(
+            "r-dirty",
+            Some("k1".into()),
+            None,
+            Some("prov-a".into()),
+            Some("openai".into()),
+            Some("m".into()),
+            1,
+            20,
+            21,
+            0,
+            0,
+            0,
+            0.01,
+            true,
+        );
+        dirty.ts = "2026-07-02T00:00:00Z".into();
+        dirty.status = "ok".into();
+        dirty.duration_ms = Some(100);
+        dirty.ttfb_ms = Some(150);
+        repo.insert(&dirty).await.unwrap();
+
+        // A normal eligible row so the denominator isn't 0 overall -- this
+        // makes the no_duration-leak scenario distinguishable: if its 10
+        // tokens wrongly leaked into the numerator, the rate would be
+        // (10+20+6)*1000/100 = 360 instead of the correct (20+6)*1000/100 = 260.
+        let mut valid = new_usage_record(
+            "r-valid",
+            Some("k1".into()),
+            None,
+            Some("prov-a".into()),
+            Some("openai".into()),
+            Some("m".into()),
+            3,
+            6,
+            9,
+            0,
+            0,
+            0,
+            0.02,
+            true,
+        );
+        valid.ts = "2026-07-03T00:00:00Z".into();
+        valid.status = "ok".into();
+        valid.duration_ms = Some(100);
+        valid.ttfb_ms = Some(0);
+        repo.insert(&valid).await.unwrap();
+
+        let outcome = repo.summary_outcome("2026-07", None, 0).await.unwrap();
+        // no_duration is excluded entirely (duration_ms IS NULL); dirty
+        // contributes 20 tokens / 0ms (clamped); valid contributes 6 tokens /
+        // 100ms. sum/sum = (20+6)*1000/(0+100) = 260 tok/s.
+        let tps = outcome.tokens_per_sec.unwrap();
+        assert!((tps - 260.0).abs() < 1e-6);
+
+        let by_p = repo.summary_by_provider("2026-07", None, 0).await.unwrap();
+        let a = by_p.iter().find(|p| p.provider_id == "prov-a").unwrap();
+        assert!((a.tokens_per_sec.unwrap() - 260.0).abs() < 1e-6);
+
+        // A group where every row has completion_tokens == 0 must yield None,
+        // not 0.0 or a panic from division by zero.
+        let pool2 = open_db("sqlite::memory:").await.unwrap();
+        let repo2 = UsageRepo::new(&pool2);
+        let mut all_error = new_usage_record(
+            "r-all-error",
+            Some("k1".into()),
+            None,
+            Some("prov-z".into()),
+            Some("openai".into()),
+            Some("m".into()),
+            5,
+            0,
+            5,
+            0,
+            0,
+            0,
+            0.0,
+            false,
+        );
+        all_error.ts = "2026-07-03T00:00:00Z".into();
+        all_error.status = "error".into();
+        all_error.duration_ms = Some(10);
+        repo2.insert(&all_error).await.unwrap();
+
+        let outcome2 = repo2.summary_outcome("2026-07", None, 0).await.unwrap();
+        assert!(outcome2.tokens_per_sec.is_none());
+
+        let by_p2 = repo2.summary_by_provider("2026-07", None, 0).await.unwrap();
+        assert_eq!(by_p2.len(), 1);
+        assert!(by_p2[0].tokens_per_sec.is_none());
+    }
+
+    #[tokio::test]
+    async fn summary_by_model_tokens_per_sec() {
+        let pool = open_db("sqlite::memory:").await.unwrap();
+        let repo = UsageRepo::new(&pool);
+
+        let mut fast = new_usage_record(
+            "r-fast",
+            Some("k1".into()),
+            Some("gpt-fast".into()),
+            Some("prov-a".into()),
+            Some("openai".into()),
+            Some("gpt-fast".into()),
+            1,
+            100,
+            101,
+            0,
+            0,
+            0,
+            0.1,
+            true,
+        );
+        fast.ts = "2026-07-10T00:00:00Z".into();
+        fast.status = "ok".into();
+        fast.ttfb_ms = Some(0);
+        fast.duration_ms = Some(500); // 100 tok / 500ms * 1000 = 200 tok/s
+        repo.insert(&fast).await.unwrap();
+
+        let mut slow = new_usage_record(
+            "r-slow",
+            Some("k1".into()),
+            Some("gpt-slow".into()),
+            Some("prov-a".into()),
+            Some("openai".into()),
+            Some("gpt-slow".into()),
+            1,
+            50,
+            51,
+            0,
+            0,
+            0,
+            0.1,
+            true,
+        );
+        slow.ts = "2026-07-10T00:00:00Z".into();
+        slow.status = "ok".into();
+        slow.ttfb_ms = Some(0);
+        slow.duration_ms = Some(1000); // 50 tok / 1000ms * 1000 = 50 tok/s
+        repo.insert(&slow).await.unwrap();
+
+        let by_model = repo.summary_by_model("2026-07", None, 0).await.unwrap();
+        let fast_row = by_model.iter().find(|m| m.label == "gpt-fast").unwrap();
+        assert!((fast_row.tokens_per_sec.unwrap() - 200.0).abs() < 1e-6);
+        let slow_row = by_model.iter().find(|m| m.label == "gpt-slow").unwrap();
+        assert!((slow_row.tokens_per_sec.unwrap() - 50.0).abs() < 1e-6);
     }
 }

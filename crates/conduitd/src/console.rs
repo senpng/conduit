@@ -1111,6 +1111,7 @@ pub async fn usage_summary(
             "success_rate": outcome.success_rate,
             "avg_ttfb_ms": outcome.avg_ttfb_ms,
             "avg_duration_ms": outcome.avg_duration_ms,
+            "tokens_per_sec": outcome.tokens_per_sec,
             "key_id": key_id,
             "entries": entries.iter().map(|e| json!({
                 "downstream_key_id": e.downstream_key_id,
@@ -1138,6 +1139,7 @@ pub async fn usage_summary(
                 "request_count": m.request_count,
                 "total_usd": m.total_usd,
                 "total_tokens": m.total_tokens,
+                "tokens_per_sec": m.tokens_per_sec,
             })).collect::<Vec<_>>(),
             "by_key_model": by_key_model.iter().map(|m| json!({
                 "downstream_key_id": m.downstream_key_id,
@@ -1163,6 +1165,7 @@ pub async fn usage_summary(
                 "success_rate": p.success_rate,
                 "avg_ttfb_ms": p.avg_ttfb_ms,
                 "avg_duration_ms": p.avg_duration_ms,
+                "tokens_per_sec": p.tokens_per_sec,
                 "total_usd": p.total_usd,
                 "total_tokens": p.total_tokens,
             })).collect::<Vec<_>>(),

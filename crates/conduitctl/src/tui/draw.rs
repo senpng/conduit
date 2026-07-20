@@ -341,7 +341,7 @@ fn draw_overview_metrics(frame: &mut Frame, area: Rect, app: &App) {
         .as_ref()
         .map(|h| h.status.clone())
         .unwrap_or_else(|| "down".into());
-    let (cost, tokens, period_label, success, ttfb, latency, tok_style, spend_style, ok_style) =
+    let (cost, tokens, period_label, success, ttfb, latency, speed, tok_style, spend_style, ok_style) =
         match app.overview_summary.as_ref() {
             Some(s) => {
                 let success = format!("{:.0}%", s.success_rate * 100.0);
@@ -359,6 +359,7 @@ fn draw_overview_metrics(frame: &mut Frame, area: Rect, app: &App) {
                         }
                     })
                     .unwrap_or_else(|| "—".into());
+                let speed = super::widgets::format_tok_per_sec(s.tokens_per_sec);
                 let ok_style = if s.success_rate >= 0.99 {
                     theme.success()
                 } else if s.success_rate >= 0.95 {
@@ -378,6 +379,7 @@ fn draw_overview_metrics(frame: &mut Frame, area: Rect, app: &App) {
                     success,
                     ttfb,
                     latency,
+                    speed,
                     theme.warning(),
                     theme.success(),
                     ok_style,
@@ -387,6 +389,7 @@ fn draw_overview_metrics(frame: &mut Frame, area: Rect, app: &App) {
                 "…".into(),
                 "…".into(),
                 "all-time".into(),
+                "…".into(),
                 "…".into(),
                 "…".into(),
                 "…".into(),
@@ -420,6 +423,7 @@ fn draw_overview_metrics(frame: &mut Frame, area: Rect, app: &App) {
             ("SUCCESS", success, ok_style),
             ("TTFB", ttfb, Style::default().fg(theme.chart[4])),
             ("LAT", latency, Style::default().fg(theme.chart[2])),
+            ("SPEED", speed, Style::default().fg(theme.chart[0])),
         ],
     );
 }
@@ -1257,9 +1261,10 @@ fn draw_overview_provider_health(frame: &mut Frame, area: Rect, app: &App) {
     let pct_w = 5usize; // "100%"
     let ttfb_w = 7usize; // "1200ms" / "5.5s  "
     let tok_w = 8usize; // "12.34M "
-    // 1 leading + 5 inter-column spaces
-    let gaps = 6usize;
-    let fixed = kind_w + pct_w + ttfb_w + tok_w + gaps;
+    let tps_w = 7usize; // "12.34M " tok/s (compact, no unit suffix)
+    // 1 leading + 6 inter-column spaces
+    let gaps = 7usize;
+    let fixed = kind_w + pct_w + ttfb_w + tok_w + tps_w + gaps;
     let flex = width.saturating_sub(fixed).max(16);
     // Give name room for "codex (user@email.com)"; leftover grows the success bar.
     // Never force a min bar wider than remaining flex (avoids overflow on narrow panes).
@@ -1287,6 +1292,8 @@ fn draw_overview_provider_health(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(pad_display("ttfb", ttfb_w), theme.muted()),
             Span::raw(" "),
             Span::styled(pad_display("tokens", tok_w), theme.muted()),
+            Span::raw(" "),
+            Span::styled(pad_display("tok/s", tps_w), theme.muted()),
         ]));
     }
 
@@ -1316,6 +1323,11 @@ fn draw_overview_provider_health(frame: &mut Frame, area: Rect, app: &App) {
             })
             .unwrap_or_else(|| "—".into());
         let tok = format_tokens(p.total_tokens);
+        let tps = match p.tokens_per_sec {
+            None => "—".into(),
+            Some(v) if v >= 1000.0 => format_tokens(v.round() as u64),
+            Some(v) => format!("{v:.1}"),
+        };
         let bar = ratio_bar(rate, bar_w);
         let pct = format!("{:>3.0}%", rate * 100.0);
 
@@ -1337,6 +1349,11 @@ fn draw_overview_provider_health(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(
                 pad_display(&truncate(&tok, tok_w), tok_w),
                 theme.warning(),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                pad_display(&truncate(&tps, tps_w), tps_w),
+                Style::default().fg(theme.chart[0]),
             ),
         ]));
     }
@@ -2410,7 +2427,7 @@ fn draw_usage_by_model(
 ) {
     let theme = &app.theme;
     let filtered = app.filtered_indices();
-    let mut items: Vec<(usize, String, String, f64, u64, u64)> = app
+    let mut items: Vec<(usize, String, String, f64, u64, u64, Option<f64>)> = app
         .usage_summary
         .as_ref()
         .map(|s| {
@@ -2425,6 +2442,7 @@ fn draw_usage_by_model(
                             m.total_usd,
                             m.total_tokens,
                             m.request_count,
+                            m.tokens_per_sec,
                         )
                     })
                 })
@@ -2470,7 +2488,7 @@ fn draw_usage_by_model(
     let lines: Vec<Line> = items[start..end]
         .iter()
         .enumerate()
-        .map(|(off, (_, label, _, cost, tok, req))| {
+        .map(|(off, (_, label, _, cost, tok, req, _tps))| {
             let i = start + off;
             let mark = if i == sel { "▶ " } else { "  " };
             let ratio = if bar_by_cost {
@@ -2506,12 +2524,13 @@ fn draw_usage_by_model(
     frame.render_widget(Paragraph::new(lines), inner);
 
     if show_detail {
-        let (label, provider, cost, tok, req) = (
+        let (label, provider, cost, tok, req, tps) = (
             &items[sel].1,
             &items[sel].2,
             items[sel].3,
             items[sel].4,
             items[sel].5,
+            items[sel].6,
         );
         let cost_share = (cost / period_total) * 100.0;
         let tok_share = tok as f64 / period_tokens as f64 * 100.0;
@@ -2533,6 +2552,7 @@ fn draw_usage_by_model(
                 ),
                 ("tokens", format_tokens(tok)),
                 ("tok share", format!("{tok_share:.1}% of period")),
+                ("tok/s", super::widgets::format_tok_per_sec(tps)),
                 ("requests", req.to_string()),
                 ("cost", format_usd(cost)),
                 ("$ share", format!("{cost_share:.1}% of period")),
@@ -2795,8 +2815,8 @@ fn draw_usage_by_provider(
 ) {
     let theme = &app.theme;
     let filtered = app.filtered_indices();
-    // (name, id, kind, reqs, success_rate, ttfb, cost, tokens)
-    let mut rows_data: Vec<(String, String, String, u64, f64, Option<f64>, f64, u64)> = app
+    // (name, id, kind, reqs, success_rate, ttfb, cost, tokens, tokens_per_sec)
+    let mut rows_data: Vec<(String, String, String, u64, f64, Option<f64>, f64, u64, Option<f64>)> = app
         .usage_summary
         .as_ref()
         .map(|s| {
@@ -2813,6 +2833,7 @@ fn draw_usage_by_provider(
                             p.avg_ttfb_ms,
                             p.total_usd,
                             p.total_tokens,
+                            p.tokens_per_sec,
                         )
                     })
                 })
@@ -2852,18 +2873,23 @@ fn draw_usage_by_provider(
     let sel = sel.min(rows_data.len().saturating_sub(1));
     let (list_area, detail_area, show_detail) = usage_master_detail(area);
 
-    // name · kind · tokens · reqs · success · ttfb
+    // name · kind · tokens · reqs · success · ttfb · tok/s
     let name_w = (list_area.width as usize)
-        .saturating_sub(12 + 8 + 6 + 8 + 8 + 6)
+        .saturating_sub(12 + 8 + 6 + 8 + 8 + 8 + 7)
         .clamp(10, 28);
 
     let rows: Vec<Row> = rows_data
         .iter()
         .enumerate()
-        .map(|(i, (name, _id, kind, req, rate, ttfb, _cost, tok))| {
+        .map(|(i, (name, _id, kind, req, rate, ttfb, _cost, tok, tps))| {
             let ttfb_s = ttfb
                 .map(|ms| format!("{ms:.0}ms"))
                 .unwrap_or_else(|| "—".into());
+            let tps_s = match tps {
+                None => "—".into(),
+                Some(v) if *v >= 1000.0 => format_tokens(v.round() as u64),
+                Some(v) => format!("{v:.1}"),
+            };
             let row = Row::new(vec![
                 Cell::from(truncate(name, name_w)),
                 Cell::from(truncate(kind, 12)),
@@ -2871,6 +2897,7 @@ fn draw_usage_by_provider(
                 Cell::from(req.to_string()),
                 Cell::from(format!("{:.0}%", rate * 100.0)),
                 Cell::from(ttfb_s),
+                Cell::from(tps_s),
             ]);
             if i == sel {
                 row.style(theme.selection())
@@ -2888,11 +2915,14 @@ fn draw_usage_by_provider(
             Constraint::Length(6),
             Constraint::Length(8),
             Constraint::Length(8),
+            Constraint::Length(8),
         ],
     )
     .header(
-        Row::new(vec!["name", "kind", "tokens", "reqs", "success", "ttfb"])
-            .style(theme.header_cell()),
+        Row::new(vec![
+            "name", "kind", "tokens", "reqs", "success", "ttfb", "tok/s",
+        ])
+        .style(theme.header_cell()),
     )
     .block(panel_block(
         theme,
@@ -2906,7 +2936,7 @@ fn draw_usage_by_provider(
     render_scrollable_table(frame, table, list_area, sel);
 
     if show_detail {
-        if let Some((name, id, kind, req, rate, ttfb, cost, tok)) = rows_data.get(sel) {
+        if let Some((name, id, kind, req, rate, ttfb, cost, tok, tps)) = rows_data.get(sel) {
             let ttfb_s = ttfb
                 .map(|ms| format!("{ms:.0}ms"))
                 .unwrap_or_else(|| "—".into());
@@ -2927,6 +2957,7 @@ fn draw_usage_by_provider(
                     ("requests", req.to_string()),
                     ("success", format!("{:.1}%", rate * 100.0)),
                     ("avg ttfb", ttfb_s),
+                    ("tok/s", super::widgets::format_tok_per_sec(*tps)),
                     ("cost", format_usd(*cost)),
                 ],
                 *tok as f64 / max_tok,
@@ -3193,7 +3224,7 @@ fn draw_usage_rollup_detail(
 
 /// Sort by-model rollup rows: (idx, label, provider, cost, tokens, reqs).
 fn sort_usage_items(
-    items: &mut [(usize, String, String, f64, u64, u64)],
+    items: &mut [(usize, String, String, f64, u64, u64, Option<f64>)],
     sort: super::app::UsageSort,
 ) {
     use super::app::UsageSort;
@@ -3248,6 +3279,15 @@ fn draw_usage_record_detail(
     ));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("  Request", theme.title())));
+    // Exact (not sum/sum-estimated) throughput for this one request: the
+    // generation window is duration_ms minus ttfb_ms (0 if ttfb is unknown).
+    let tps = match u.duration_ms {
+        Some(dur) if u.completion_tokens > 0 => {
+            let gen_ms = dur.saturating_sub(u.ttfb_ms.unwrap_or(0));
+            (gen_ms > 0).then(|| u.completion_tokens as f64 * 1000.0 / gen_ms as f64)
+        }
+        _ => None,
+    };
     lines.extend(detail_kv(
         theme,
         &[
@@ -3268,6 +3308,7 @@ fn draw_usage_record_detail(
                     .map(|ms| format!("{ms}ms"))
                     .unwrap_or_else(|| "—".into()),
             ),
+            ("tok/s", super::widgets::format_tok_per_sec(tps)),
             ("cost", format_usd(u.cost_usd)),
             ("stream", if u.stream { "yes" } else { "no" }.into()),
             (

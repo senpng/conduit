@@ -506,6 +506,16 @@ pub fn format_tokens(n: u64) -> String {
     }
 }
 
+/// Format a throughput value (`UsageOutcomeSummary::tokens_per_sec` /
+/// `UsageProviderRow::tokens_per_sec`) as e.g. `"42.3 tok/s"` or `"1.2k tok/s"`.
+pub fn format_tok_per_sec(v: Option<f64>) -> String {
+    match v {
+        None => "—".into(),
+        Some(v) if v >= 1000.0 => format!("{} tok/s", format_tokens(v.round() as u64)),
+        Some(v) => format!("{v:.1} tok/s"),
+    }
+}
+
 pub fn format_usd(v: f64) -> String {
     // Collapse signed zero / float dust so we never render "$-0.0000".
     // (`format!("{:.4}", -0.0)` keeps the sign bit even though -0.0 == 0.0.)

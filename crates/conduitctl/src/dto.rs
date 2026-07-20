@@ -325,6 +325,9 @@ pub struct UsageModelEntry {
     pub total_usd: f64,
     #[serde(default)]
     pub total_tokens: u64,
+    /// Throughput = Σcompletion_tokens / Σgeneration_ms, size-weighted — NOT a
+    /// row-wise mean. `None` when no eligible row exists.
+    pub tokens_per_sec: Option<f64>,
 }
 
 /// Model breakdown for one downstream key (from `by_key_model`).
@@ -376,6 +379,9 @@ pub struct UsageProviderEntry {
     pub success_rate: f64,
     pub avg_ttfb_ms: Option<f64>,
     pub avg_duration_ms: Option<f64>,
+    /// Throughput = Σcompletion_tokens / Σgeneration_ms, size-weighted — NOT a
+    /// row-wise mean like `avg_ttfb_ms`. `None` when no eligible row exists.
+    pub tokens_per_sec: Option<f64>,
     #[serde(default)]
     pub total_usd: f64,
     #[serde(default)]
@@ -397,6 +403,9 @@ pub struct UsageSummaryView {
     pub success_rate: f64,
     pub avg_ttfb_ms: Option<f64>,
     pub avg_duration_ms: Option<f64>,
+    /// Throughput = Σcompletion_tokens / Σgeneration_ms, size-weighted — NOT a
+    /// row-wise mean like `avg_ttfb_ms`. `None` when no eligible row exists.
+    pub tokens_per_sec: Option<f64>,
     pub key_id: Option<String>,
     #[serde(default)]
     pub entries: Vec<UsageSummaryEntry>,
@@ -706,6 +715,7 @@ mod tests {
             "success_rate":0.8,
             "avg_ttfb_ms":42.5,
             "avg_duration_ms":100.0,
+            "tokens_per_sec":61.5,
             "entries":[],
             "by_day":[],
             "by_model":[],
@@ -719,15 +729,18 @@ mod tests {
                 "success_rate":0.8,
                 "avg_ttfb_ms":42.5,
                 "avg_duration_ms":100.0,
+                "tokens_per_sec":61.5,
                 "total_usd":1.5
             }]
         }"#;
         let s: UsageSummaryView = serde_json::from_str(raw).unwrap();
         assert!((s.success_rate - 0.8).abs() < 1e-9);
         assert!((s.avg_ttfb_ms.unwrap() - 42.5).abs() < 1e-9);
+        assert!((s.tokens_per_sec.unwrap() - 61.5).abs() < 1e-9);
         assert_eq!(s.by_provider.len(), 1);
         assert_eq!(s.by_provider[0].provider_id, "p1");
         assert!((s.by_provider[0].success_rate - 0.8).abs() < 1e-9);
+        assert!((s.by_provider[0].tokens_per_sec.unwrap() - 61.5).abs() < 1e-9);
     }
 
     #[test]
