@@ -1,11 +1,13 @@
 pub mod audit;
 pub mod backend;
+pub mod cache;
 pub mod master_password;
 
 use std::{path::Path, sync::Arc};
 
 pub use audit::{AuditAction, AuditEntry, SecretAuditLog};
 pub use backend::{SecretBackend, SecurityLevel};
+pub use cache::CachingSecretBackend;
 pub use conduit_ir::error::SecretError;
 pub use master_password::MasterPasswordBackend;
 use secrecy::{ExposeSecret, SecretString};
@@ -21,7 +23,8 @@ pub struct BackendResult {
 }
 
 /// Build the secret backend: AES-256-GCM files under `{app_dir}/secrets/`,
-/// keyed by Argon2id from the master password.
+/// keyed by Argon2id from the master password, wrapped with an in-process
+/// plaintext cache so hot-path `get` does not re-run Argon2 on every request.
 ///
 /// `master_password` is stored as a `SecretString` for the process lifetime.
 /// An empty / missing password is accepted so the daemon can start in local
@@ -31,7 +34,8 @@ pub fn build_backend(app_dir: &Path, master_password: Option<SecretString>) -> B
     let password = master_password.unwrap_or_else(|| SecretString::new(String::new()));
     let empty = password.expose_secret().is_empty();
 
-    let backend = Arc::new(MasterPasswordBackend::new(password, app_dir));
+    let durable = Arc::new(MasterPasswordBackend::new(password, app_dir));
+    let backend = CachingSecretBackend::wrap(durable);
 
     // Do not log here — callers (e.g. conduitd) own presentation so the
     // message is not duplicated across crate boundaries.
@@ -46,7 +50,9 @@ pub fn build_backend(app_dir: &Path, master_password: Option<SecretString>) -> B
             .to_string(),
         )
     } else {
-        tracing::info!("secret backend: master-password AES-256-GCM under secrets/");
+        tracing::info!(
+            "secret backend: master-password AES-256-GCM under secrets/ (in-memory get cache)"
+        );
         None
     };
 
