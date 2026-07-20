@@ -70,7 +70,7 @@ For crate boundaries, storage details, security trade-offs, and codec contracts,
 | OpenAI Responses | `POST /v1/responses` | Yes | First-class ingress; local `previous_response_id` continuation when `store` is enabled |
 | OpenAI Responses Compact | `POST /v1/responses/compact` | No (non-stream only) | Context compaction for Codex; preserves `compaction_trigger` and proxies to upstream `/responses/compact` |
 | Anthropic Messages | `POST /v1/messages` | Yes | Native Anthropic wire format |
-| OpenAI Models | `GET /v1/models` | N/A | Lists configured route aliases |
+| OpenAI Models | `GET /v1/models` | N/A | Lists route aliases; includes `context_window` / `context_length` when model limits are known |
 
 Clients can speak Chat Completions or Responses on the gateway; Conduit translates to the selected upstream protocol (including Responses-native providers such as Codex and Grok chat-proxy).
 

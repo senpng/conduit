@@ -494,29 +494,24 @@ pub(crate) fn status_for_gateway_error(err: &GatewayError) -> StatusCode {
 }
 
 /// GET /v1/models — OpenAI-compatible list from the live routing table.
+///
+/// When model limits are known for a route target, includes `context_window`
+/// and `context_length` (from LiteLLM `max_input_tokens`). Omits those fields
+/// when no limit is known — does not invent a default window.
 pub async fn list_models(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let table = state.routing_table.load();
-    let mut data = Vec::new();
-    for route in table.iter() {
-        let owned_by = route
-            .targets
-            .first()
-            .map(|t| t.provider_kind.as_str())
-            .unwrap_or("conduit");
-        data.push(json!({
-            "id": route.alias,
-            "object": "model",
-            "created": 0,
-            "owned_by": owned_by,
-        }));
-    }
-    // Stable order for clients that cache by index.
-    data.sort_by(|a, b| {
-        a.get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .cmp(b.get("id").and_then(|v| v.as_str()).unwrap_or(""))
+    let limits = state.limits_table.load();
+    let routes = table.iter().map(|route| {
+        let target = route.targets.first();
+        let owned_by = target
+            .map(|t| t.provider_kind.clone())
+            .unwrap_or_else(|| "conduit".into());
+        let model_id = target
+            .map(|t| t.model_id.clone())
+            .unwrap_or_else(|| route.alias.clone());
+        (route.alias.clone(), owned_by, model_id)
     });
+    let data = crate::state::build_models_list_data(routes, &limits);
     Json(json!({
         "object": "list",
         "data": data,

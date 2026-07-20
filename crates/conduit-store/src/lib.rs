@@ -1,4 +1,5 @@
 pub mod key_repo;
+pub mod limits_repo;
 pub mod litellm;
 pub mod migrations;
 pub mod pricing_repo;
@@ -14,8 +15,12 @@ use std::{
 };
 
 pub use key_repo::KeyRepo;
+pub use limits_repo::{
+    lookup_limits_rows, LimitsRepo, LimitsSnapshot, LIMITS_OVERRIDE_FILENAME,
+};
 pub use litellm::{
-    convert_litellm_json, LiteLlmConvertStats, DEFAULT_LITELLM_PRICING_URL, LITELLM_CACHE_FILENAME,
+    convert_litellm_json, convert_litellm_limits, LiteLlmConvertStats, LiteLlmLimitsConvertStats,
+    DEFAULT_LITELLM_PRICING_URL, LITELLM_CACHE_FILENAME, LITELLM_LIMITS_CACHE_FILENAME,
 };
 pub use migrations::run_migrations;
 pub use pricing_repo::{PricingRepo, PricingSnapshot, DEFAULT_PRICING_JSON};
@@ -23,8 +28,8 @@ pub use provider_repo::ProviderRepo;
 pub use response_continuation_repo::{ResponseContinuationRepo, RESPONSE_CONTINUATION_TTL};
 pub use route_repo::RouteRepo;
 pub use schema::{
-    secret_key_id_from_ref, AppEventRow, DownstreamKeyRow, PricingRow, ProviderRow, RouteRow,
-    UsageAttemptRow, UsageRecordRow,
+    secret_key_id_from_ref, AppEventRow, DownstreamKeyRow, ModelLimitsRow, PricingRow, ProviderRow,
+    RouteRow, UsageAttemptRow, UsageRecordRow,
 };
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},

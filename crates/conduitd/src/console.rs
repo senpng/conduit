@@ -1380,6 +1380,24 @@ pub async fn sync_pricing(
         Ok((total_rows, source_models, skipped)) => {
             let map = crate::state::pricing_map_from_repo(&state.pricing_repo).await;
             state.pricing_table.store(std::sync::Arc::new(map));
+
+            // Same LiteLLM blob also refreshes the separate model-limits table.
+            let (limits_rows, limits_source, limits_skipped) = match state
+                .limits_repo
+                .apply_litellm_json(&state.data_dir, &text)
+                .await
+            {
+                Ok(v) => {
+                    let lim_map = crate::state::limits_map_from_repo(&state.limits_repo).await;
+                    state.limits_table.store(std::sync::Arc::new(lim_map));
+                    v
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "LiteLLM limits sync failed (pricing ok)");
+                    (0, 0, 0)
+                }
+            };
+
             (
                 StatusCode::OK,
                 Json(json!({
@@ -1390,6 +1408,9 @@ pub async fn sync_pricing(
                     "source_models": source_models,
                     "skipped": skipped,
                     "total_rows": total_rows,
+                    "limits_source_models": limits_source,
+                    "limits_skipped": limits_skipped,
+                    "limits_total_rows": limits_rows,
                 })),
             )
                 .into_response()

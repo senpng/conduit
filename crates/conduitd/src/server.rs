@@ -61,6 +61,9 @@ pub async fn run(
     // ── Pricing repo (hot-reloadable from pricing.json) ───────────────────────
     let pricing_repo = Arc::new(PricingRepo::new(pool.clone(), &data_dir).await?);
 
+    // ── Model limits (context window) — separate from pricing ────────────────
+    let limits_repo = Arc::new(conduit_store::LimitsRepo::new(&data_dir).await?);
+
     // ── Load routing table from DB ─────────────────────────────────────────────
     let routing_table = {
         let route_repo = RouteRepo::new(&pool);
@@ -231,6 +234,9 @@ pub async fn run(
     let pricing_table = Arc::new(ArcSwap::from_pointee(
         pricing_map_from_repo(&pricing_repo).await,
     ));
+    let limits_table = Arc::new(ArcSwap::from_pointee(
+        crate::state::limits_map_from_repo(&limits_repo).await,
+    ));
     let pricing_table_for_fn = pricing_table.clone();
     let pricing_fn: PricingFn = Arc::new(move |kind: &str, model: &str| {
         let snap = pricing_table_for_fn.load();
@@ -260,6 +266,8 @@ pub async fn run(
         secret_backend,
         pricing_repo,
         pricing_table,
+        limits_repo,
+        limits_table,
         data_dir: data_dir.clone(),
         oauth: Arc::new(crate::oauth::OAuthRuntime::new()),
         proxy_url: cfg.proxy_url.clone(),

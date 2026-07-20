@@ -129,6 +129,8 @@ pub struct DownstreamKeyRow {
 // ── Pricing ───────────────────────────────────────────────────────────────────
 
 /// A single pricing row read from DB or pricing.json.
+///
+/// Price-only: context / max-output limits live in [`ModelLimitsRow`], not here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PricingRow {
     pub provider_kind: String,
@@ -140,6 +142,23 @@ pub struct PricingRow {
     pub reasoning_per_mtok: Option<f64>,
     /// ISO 8601 date from which this pricing is valid.
     pub effective_from: String,
+}
+
+// ── Model limits (context window / max output) ────────────────────────────────
+
+/// Per-model token limits, separate from pricing.
+///
+/// Populated from LiteLLM `max_input_tokens` / `max_output_tokens` (never from
+/// LiteLLM `max_tokens` as context — that field is often max output).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelLimitsRow {
+    pub provider_kind: String,
+    pub model_id: String,
+    /// Context window (max input tokens). Source: LiteLLM `max_input_tokens`.
+    pub max_input_tokens: u64,
+    /// Optional max completion / output tokens. Source: `max_output_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
 }
 
 // ── Usage record (per-request ledger: tokens/cost + outcome/timing/routing) ───

@@ -170,7 +170,8 @@ Cost estimation uses a layered pricing table (USD per million tokens):
 | LiteLLM cache | `{data_dir}/pricing.litellm.json` | middle |
 | Operator overrides | `{data_dir}/pricing.json` | highest |
 
-Later layers win on `(provider_kind, model_id)`.
+Later layers win on `(provider_kind, model_id)`. **Pricing rows are price-only**
+(no context-window fields).
 
 **Operator overrides** (tokscale-style custom pricing): exact `(provider_kind, model_id)`
 rows in `pricing.json`, USD **per million tokens**. Manage via:
@@ -189,6 +190,20 @@ no fetch on boot):
 - UI: Pricing → “Sync LiteLLM”
 
 Reload layers without network: `POST /console/pricing/reload` / `conduitctl pricing reload`.
+
+## Model limits (context window)
+
+Token limits are a **separate** store from pricing (same LiteLLM JSON, second pipeline):
+
+| Layer | Source | Priority |
+|-------|--------|----------|
+| LiteLLM limits cache | `{data_dir}/limits.litellm.json` | base |
+| Operator overrides | `{data_dir}/limits.json` | highest |
+
+Context window = LiteLLM **`max_input_tokens`** (not `max_tokens`, which is often
+max output). `GET /v1/models` includes `context_window` / `context_length` when a
+positive limit is known for the route target; otherwise those fields are omitted
+(no invented default). LiteLLM pricing sync also refreshes the limits cache.
 
 ## Codec Contract
 
