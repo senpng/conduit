@@ -4,7 +4,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap,
+    Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap,
 };
 use ratatui::Frame;
 
@@ -17,6 +17,29 @@ use super::widgets::{
     modal, month_day_spends, pad_display, panel_block, panel_block_borders, ratio_bar, spinner,
     truncate, ContributionCell, DaySpend,
 };
+
+/// Stateful table render so the selected row stays in the visible viewport.
+///
+/// Each frame starts with offset 0; ratatui's [`TableState`] scrolls just far
+/// enough for `selected` to appear (same behaviour as keeping a persistent
+/// offset, without needing App-level scroll state).
+fn render_scrollable_table(frame: &mut Frame, table: Table, area: Rect, selected: usize) {
+    let mut state = TableState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// First visible index so `selected` stays in a window of `visible` rows.
+/// Selection sits at the bottom of the window when past the first page
+/// (matches Table's ephemeral-offset behaviour).
+fn list_window_start(selected: usize, len: usize, visible: usize) -> usize {
+    if visible == 0 || len == 0 {
+        return 0;
+    }
+    let visible = visible.min(len);
+    let max_start = len.saturating_sub(visible);
+    let start = selected.saturating_sub(visible.saturating_sub(1));
+    start.min(max_start)
+}
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let theme = &app.theme;
@@ -1264,7 +1287,7 @@ fn draw_master_detail_providers(frame: &mut Frame, area: Rect, app: &App) {
         true,
     ))
     .column_spacing(1);
-    frame.render_widget(table, list_area);
+    render_scrollable_table(frame, table, list_area, sel);
 
     // Detail
     let p = &app.providers[filtered[sel]];
@@ -1639,7 +1662,7 @@ fn draw_master_detail_routes(frame: &mut Frame, area: Rect, app: &App) {
         format!("Routes  {}/{}", sel + 1, filtered.len()),
         true,
     ));
-    frame.render_widget(table, list_area);
+    render_scrollable_table(frame, table, list_area, sel);
 
     let r = &app.routes[filtered[sel]];
     let targets_pretty = serde_json::from_str::<serde_json::Value>(&r.targets_json)
@@ -1740,7 +1763,7 @@ fn draw_master_detail_keys(frame: &mut Frame, area: Rect, app: &App) {
         format!("Keys  {}/{}", sel + 1, filtered.len()),
         true,
     ));
-    frame.render_widget(table, list_area);
+    render_scrollable_table(frame, table, list_area, sel);
 
     let k = &app.keys[filtered[sel]];
     let mut lines = detail_kv(
@@ -2244,7 +2267,7 @@ fn draw_usage_recent(frame: &mut Frame, area: Rect, app: &App, sel: usize) {
         Row::new(vec!["TS", "MODEL", "TOK", "cR", "cW", "COST"]).style(theme.header_cell()),
     )
     .block(panel_block(theme, title, true));
-    frame.render_widget(table, list_area);
+    render_scrollable_table(frame, table, list_area, sel);
 
     if show_detail {
         if let Some(u) = app.usage_recent.get(sel) {
@@ -2311,10 +2334,20 @@ fn draw_usage_by_model(
         .clamp(6, 20);
 
     let bar_by_cost = matches!(app.usage_sort, super::app::UsageSort::Cost);
-    let lines: Vec<Line> = items
+    let block = panel_block(
+        theme,
+        format!("By model  ·  tokens  ·  sort={}", app.usage_sort.label()),
+        true,
+    );
+    let inner = block.inner(list_area);
+    let visible = inner.height as usize;
+    let start = list_window_start(sel, items.len(), visible);
+    let end = (start + visible).min(items.len());
+    let lines: Vec<Line> = items[start..end]
         .iter()
         .enumerate()
-        .map(|(i, (_, label, _, cost, tok, req))| {
+        .map(|(off, (_, label, _, cost, tok, req))| {
+            let i = start + off;
             let mark = if i == sel { "▶ " } else { "  " };
             let ratio = if bar_by_cost {
                 *cost / max_cost
@@ -2345,14 +2378,8 @@ fn draw_usage_by_model(
             ])
         })
         .collect();
-    frame.render_widget(
-        Paragraph::new(lines).block(panel_block(
-            theme,
-            format!("By model  ·  tokens  ·  sort={}", app.usage_sort.label()),
-            true,
-        )),
-        list_area,
-    );
+    frame.render_widget(block, list_area);
+    frame.render_widget(Paragraph::new(lines), inner);
 
     if show_detail {
         let (label, provider, cost, tok, req) = (
@@ -2462,10 +2489,20 @@ fn draw_usage_by_key(
         .clamp(6, 20);
 
     let bar_by_cost = matches!(app.usage_sort, super::app::UsageSort::Cost);
-    let lines: Vec<Line> = items
+    let block = panel_block(
+        theme,
+        format!("By key  ·  tokens  ·  sort={}", app.usage_sort.label()),
+        true,
+    );
+    let inner = block.inner(list_area);
+    let visible = inner.height as usize;
+    let start = list_window_start(sel, items.len(), visible);
+    let end = (start + visible).min(items.len());
+    let lines: Vec<Line> = items[start..end]
         .iter()
         .enumerate()
-        .map(|(i, (name, _id, cost, tok, req, _, _))| {
+        .map(|(off, (name, _id, cost, tok, req, _, _))| {
+            let i = start + off;
             let mark = if i == sel { "▶ " } else { "  " };
             let ratio = if bar_by_cost {
                 *cost / max_cost
@@ -2496,14 +2533,8 @@ fn draw_usage_by_key(
             ])
         })
         .collect();
-    frame.render_widget(
-        Paragraph::new(lines).block(panel_block(
-            theme,
-            format!("By key  ·  tokens  ·  sort={}", app.usage_sort.label()),
-            true,
-        )),
-        list_area,
-    );
+    frame.render_widget(block, list_area);
+    frame.render_widget(Paragraph::new(lines), inner);
 
     if show_detail {
         let (name, id, cost, tok, req, prompt, completion) = (
@@ -2748,7 +2779,7 @@ fn draw_usage_by_provider(
         true,
     ))
     .column_spacing(1);
-    frame.render_widget(table, list_area);
+    render_scrollable_table(frame, table, list_area, sel);
 
     if show_detail {
         if let Some((name, id, kind, req, rate, ttfb, cost, tok)) = rows_data.get(sel) {
@@ -2873,7 +2904,7 @@ fn draw_usage_by_day(frame: &mut Frame, area: Rect, app: &App, sel: usize, perio
         format!("By day  {}/{}", sel + 1, days.len()),
         true,
     ));
-    frame.render_widget(table, list_chunks[1]);
+    render_scrollable_table(frame, table, list_chunks[1], sel);
 
     if show_detail {
         let d = &days[sel];
@@ -3322,7 +3353,7 @@ fn draw_pricing(frame: &mut Frame, area: Rect, app: &App) {
         format!("{title}  ($/MTok · cR/cW = cache)"),
         true,
     ));
-    frame.render_widget(table, list_area);
+    render_scrollable_table(frame, table, list_area, sel);
 
     let p = &rows_src[filtered[sel]];
     draw_pricing_detail(frame, detail_area, theme, p, app);
@@ -4107,4 +4138,31 @@ fn draw_oauth_flow(frame: &mut Frame, theme: &Theme, f: &super::forms::OauthFlow
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         inner,
     );
+}
+
+#[cfg(test)]
+mod list_window_tests {
+    use super::list_window_start;
+
+    #[test]
+    fn empty_or_zero_visible() {
+        assert_eq!(list_window_start(0, 0, 10), 0);
+        assert_eq!(list_window_start(5, 20, 0), 0);
+    }
+
+    #[test]
+    fn short_list_fits_entirely() {
+        assert_eq!(list_window_start(0, 5, 10), 0);
+        assert_eq!(list_window_start(4, 5, 10), 0);
+    }
+
+    #[test]
+    fn selection_pins_to_bottom_of_window() {
+        // visible=5, selected=7 → window starts at 3 (indices 3..=7)
+        assert_eq!(list_window_start(7, 20, 5), 3);
+        // selected still on first page
+        assert_eq!(list_window_start(2, 20, 5), 0);
+        // last item
+        assert_eq!(list_window_start(19, 20, 5), 15);
+    }
 }
