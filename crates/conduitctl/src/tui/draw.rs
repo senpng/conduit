@@ -604,6 +604,8 @@ fn draw_month_token_chart(frame: &mut Frame, area: Rect, app: &App, period: &str
     let label_w = 2usize;
     let col_w = chart_w.saturating_sub(label_w + 1).max(1);
     let toks: Vec<f64> = days.iter().map(|d| d.total_tokens as f64).collect();
+    let model_mix = month_model_token_mix(app, period);
+    let stacks = month_day_model_stacks(app, period, &days, &model_mix, theme);
 
     draw_day_bar_panel(
         frame,
@@ -615,6 +617,7 @@ fn draw_month_token_chart(frame: &mut Frame, area: Rect, app: &App, period: &str
         theme.chart_color(1),
         theme,
         peak_idx,
+        &stacks,
     );
 
     if chunks[2].height > 0 {
@@ -750,7 +753,74 @@ fn month_model_token_mix(app: &App, period: &str) -> Vec<(String, u64)> {
     rows
 }
 
+/// Per-day model token stacks for the month chart (bottom → top).
+///
+/// Colors follow the same ranking as the right-hand Models panel
+/// (`theme.chart_color(i)` for the i-th month-ranked model). Empty segment
+/// lists mean “no day×model breakdown” and fall back to a solid bar color.
+fn month_day_model_stacks(
+    app: &App,
+    period: &str,
+    days: &[DaySpend],
+    model_mix: &[(String, u64)],
+    theme: &Theme,
+) -> Vec<Vec<(ratatui::style::Color, f64)>> {
+    if model_mix.is_empty() || days.is_empty() {
+        return days.iter().map(|_| Vec::new()).collect();
+    }
+    let Some(s) = app.overview_summary.as_ref() else {
+        return days.iter().map(|_| Vec::new()).collect();
+    };
+
+    // day → label → tokens (period only, positive tokens).
+    let mut by_day: std::collections::HashMap<String, std::collections::HashMap<String, u64>> =
+        std::collections::HashMap::new();
+    for m in &s.by_day_model {
+        if m.day.starts_with(period) && m.total_tokens > 0 {
+            *by_day
+                .entry(m.day.clone())
+                .or_default()
+                .entry(m.label.clone())
+                .or_default() += m.total_tokens;
+        }
+    }
+    if by_day.is_empty() {
+        // No per-day model rows — solid bars (mix may still come from by_model).
+        return days.iter().map(|_| Vec::new()).collect();
+    }
+
+    days.iter()
+        .map(|d| {
+            let Some(day_map) = by_day.get(&d.date) else {
+                return Vec::new();
+            };
+            let mut segs: Vec<(ratatui::style::Color, f64)> = Vec::new();
+            let mut used = 0u64;
+            for (i, (name, _)) in model_mix.iter().enumerate() {
+                let t = day_map.get(name).copied().unwrap_or(0);
+                if t > 0 {
+                    segs.push((theme.chart_color(i), t as f64));
+                    used += t;
+                }
+            }
+            // Models not in the month ranking (rare) + any ledger remainder.
+            let day_sum: u64 = day_map.values().sum();
+            let rest = d
+                .total_tokens
+                .max(day_sum)
+                .saturating_sub(used);
+            if rest > 0 {
+                segs.push((theme.muted, rest as f64));
+            }
+            segs
+        })
+        .collect()
+}
+
 /// Multi-row column bars for one series (`$` or tokens), day-aligned.
+///
+/// When `stacks[day]` is non-empty, each bar is colored by model share using
+/// the same palette order as the Models panel; otherwise the solid `fg` is used.
 fn draw_day_bar_panel(
     frame: &mut Frame,
     area: Rect,
@@ -761,12 +831,13 @@ fn draw_day_bar_panel(
     fg: ratatui::style::Color,
     theme: &Theme,
     peak_idx: Option<usize>,
+    stacks: &[Vec<(ratatui::style::Color, f64)>],
 ) {
     if area.height == 0 || area.width == 0 {
         return;
     }
     let bar_h = area.height as usize;
-    let lines = day_bar_lines(values, col_w, n_days, bar_h, fg, theme, peak_idx);
+    let lines = day_bar_lines(values, col_w, n_days, bar_h, fg, theme, peak_idx, stacks);
     let mut out: Vec<Line> = Vec::with_capacity(lines.len());
     for (i, mut spark) in lines.into_iter().enumerate() {
         let prefix = if i == 0 {
@@ -792,8 +863,38 @@ fn day_col_range(day_i: usize, n_days: usize, width: usize) -> (usize, usize) {
     (start, end)
 }
 
+/// Pick the model color at height `y` from the bottom of a stacked bar
+/// (`y` in `[0, lv]`, segments ordered bottom → top).
+fn stack_color_at(
+    y: f64,
+    lv: f64,
+    segments: &[(ratatui::style::Color, f64)],
+    fallback: ratatui::style::Color,
+) -> ratatui::style::Color {
+    if segments.is_empty() || lv <= 0.0 {
+        return fallback;
+    }
+    let total: f64 = segments.iter().map(|(_, w)| *w).sum();
+    if total <= 0.0 {
+        return fallback;
+    }
+    let y = y.clamp(0.0, lv);
+    let mut cum = 0.0;
+    for (color, w) in segments {
+        cum += (*w / total) * lv;
+        // Prefer lower segment on exact boundaries so thin slices stay visible.
+        if y <= cum + 1e-12 {
+            return *color;
+        }
+    }
+    segments.last().map(|(c, _)| *c).unwrap_or(fallback)
+}
+
 /// Multi-line column chart: each day is a vertical stack of `█`,
 /// **stretched across the full width** (variable bar width per day).
+///
+/// Optional per-day `stacks` paint model shares (bottom → top) with the Models
+/// panel palette. Peak day keeps model colors and only adds bold emphasis.
 fn day_bar_lines(
     values: &[f64],
     width: usize,
@@ -802,6 +903,7 @@ fn day_bar_lines(
     fg: ratatui::style::Color,
     theme: &Theme,
     peak_idx: Option<usize>,
+    stacks: &[Vec<(ratatui::style::Color, f64)>],
 ) -> Vec<Line<'static>> {
     if values.is_empty() || width == 0 || n_days == 0 || height == 0 {
         return vec![Line::from(Span::styled("—".to_string(), theme.subtle()))];
@@ -814,9 +916,7 @@ fn day_bar_lines(
     }
 
     let mut lines = Vec::with_capacity(height);
-    let peak_fg = theme.warning;
     let base_style = Style::default().fg(fg);
-    let peak_style = Style::default().fg(peak_fg).add_modifier(Modifier::BOLD);
     let quiet = Style::default().fg(theme.subtle);
 
     for row in 0..height {
@@ -834,7 +934,7 @@ fn day_bar_lines(
                 ((v / max) * height as f64).clamp(0.5, height as f64)
             };
             let is_peak = peak_idx == Some(day_i);
-            let style = if is_peak { peak_style } else { base_style };
+            let segs = stacks.get(day_i).map(|s| s.as_slice()).unwrap_or(&[]);
             // Baseline uses ASCII `-` (not box-drawing `┈`) so ambiguous-width
             // terminals never advance two cells and punch through the right border.
             let ch = if lv <= 0.0 {
@@ -852,7 +952,31 @@ fn day_bar_lines(
             };
             let st = if lv <= 0.0 && row + 1 == height {
                 quiet
+            } else if ch == ' ' {
+                base_style
             } else {
+                // Sample stack color at the vertical mid of this cell (from bottom).
+                let y_sample = if lv + 1e-9 >= threshold {
+                    (threshold - 0.5).clamp(0.0, lv)
+                } else {
+                    // Half-block: color of the upper edge of the filled portion.
+                    (lv - 0.25).clamp(0.0, lv)
+                };
+                let color = if segs.is_empty() {
+                    // No day×model data: solid bar; peak day uses warning (legacy).
+                    if is_peak {
+                        theme.warning
+                    } else {
+                        fg
+                    }
+                } else {
+                    // Keep model colors on peak day; bold marks the peak.
+                    stack_color_at(y_sample, lv, segs, fg)
+                };
+                let mut style = Style::default().fg(color);
+                if is_peak {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
                 style
             };
             // Fill the day's slot; leave a 1-col gutter between days when
@@ -4164,5 +4288,38 @@ mod list_window_tests {
         assert_eq!(list_window_start(2, 20, 5), 0);
         // last item
         assert_eq!(list_window_start(19, 20, 5), 15);
+    }
+}
+
+#[cfg(test)]
+mod stack_color_tests {
+    use super::stack_color_at;
+    use ratatui::style::Color;
+
+    #[test]
+    fn empty_segments_use_fallback() {
+        assert_eq!(
+            stack_color_at(1.0, 4.0, &[], Color::Red),
+            Color::Red
+        );
+    }
+
+    #[test]
+    fn bottom_segment_then_top() {
+        let segs = [(Color::Blue, 50.0), (Color::Green, 50.0)];
+        // lv=4 → blue occupies [0,2], green (2,4]
+        assert_eq!(stack_color_at(0.0, 4.0, &segs, Color::Red), Color::Blue);
+        assert_eq!(stack_color_at(1.5, 4.0, &segs, Color::Red), Color::Blue);
+        assert_eq!(stack_color_at(2.0, 4.0, &segs, Color::Red), Color::Blue);
+        assert_eq!(stack_color_at(2.5, 4.0, &segs, Color::Red), Color::Green);
+        assert_eq!(stack_color_at(4.0, 4.0, &segs, Color::Red), Color::Green);
+    }
+
+    #[test]
+    fn unequal_shares() {
+        // 75% blue bottom, 25% green top on height 4 → blue [0,3], green (3,4]
+        let segs = [(Color::Blue, 75.0), (Color::Green, 25.0)];
+        assert_eq!(stack_color_at(2.9, 4.0, &segs, Color::Red), Color::Blue);
+        assert_eq!(stack_color_at(3.5, 4.0, &segs, Color::Red), Color::Green);
     }
 }
