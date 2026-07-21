@@ -11,9 +11,10 @@ use tracing::info;
 #[derive(Debug, Parser)]
 #[command(name = "conduitd", about = "Conduit v2 LLM gateway daemon")]
 pub struct Args {
-    /// Path to conduit.toml config file
-    #[arg(long, env = "CONDUIT_CONFIG", default_value = "conduit.toml")]
-    pub config: std::path::PathBuf,
+    /// Path to conduit.toml config file. When unset, conduitd looks for
+    /// `conduit.toml` in the working directory, then `~/.conduit/conduit.toml`.
+    #[arg(long, env = "CONDUIT_CONFIG")]
+    pub config: Option<std::path::PathBuf>,
 
     /// Override gateway listen port
     #[arg(long, env = "CONDUIT_PORT")]
@@ -62,12 +63,15 @@ async fn main() -> Result<()> {
     // Load config before initializing tracing so that logging settings can
     // come from the config file. Defer any load message until the subscriber
     // is up, otherwise it would be lost.
-    let (cfg, load_note) = match config::Config::load(&args.config) {
-        Ok(cfg) => (cfg, None),
-        Err(_) => (
-            config::Config::default(),
-            Some("No config file found, using defaults"),
-        ),
+    //
+    // A present-but-invalid config is fatal: we exit rather than silently
+    // running with defaults, which would drop every configured setting.
+    let (cfg, load_note) = match resolve_config(args.config.as_deref()) {
+        Ok((cfg, note)) => (cfg, note),
+        Err(e) => {
+            eprintln!("conduitd: {e:#}");
+            std::process::exit(1);
+        }
     };
 
     // Resolve logging settings: CLI/env (Some) > config file (Some) > default.
@@ -154,6 +158,40 @@ fn init_tracing(
         _ => subscriber.init(),
     }
     None
+}
+
+/// Resolve the effective config, along with a note to log once tracing is up.
+///
+/// If `explicit` is set (via `--config` / `CONDUIT_CONFIG`), that path must
+/// load successfully — a missing or malformed file is an error. Otherwise
+/// conduitd searches `./conduit.toml` then `~/.conduit/conduit.toml`, using
+/// the first that exists; if none do, it falls back to built-in defaults.
+/// A malformed file that *is* found is always fatal.
+fn resolve_config(
+    explicit: Option<&std::path::Path>,
+) -> anyhow::Result<(config::Config, Option<&'static str>)> {
+    if let Some(path) = explicit {
+        return match config::Config::load(path)? {
+            Some(cfg) => Ok((cfg, None)),
+            None => Err(anyhow::anyhow!("config file {} not found", path.display())),
+        };
+    }
+
+    let mut candidates = vec![std::path::PathBuf::from("conduit.toml")];
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(std::path::Path::new(&home).join(".conduit/conduit.toml"));
+    }
+
+    for path in &candidates {
+        if let Some(cfg) = config::Config::load(path)? {
+            return Ok((cfg, None));
+        }
+    }
+
+    Ok((
+        config::Config::default(),
+        Some("No config file found, using defaults"),
+    ))
 }
 
 fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {

@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Gateway listen ports. The `[gateway]` section and its fields are all
+    /// optional; omitted fields fall back to the built-in defaults.
+    #[serde(default)]
     pub gateway: GatewayConfig,
     /// Upstream OAuth / token HTTP client proxy (HTTP or SOCKS URL).
     ///
@@ -50,17 +53,33 @@ pub struct LogConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
+    #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default = "default_console_port")]
     pub console_port: u16,
+}
+
+fn default_port() -> u16 {
+    4000
+}
+
+fn default_console_port() -> u16 {
+    4001
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            port: default_port(),
+            console_port: default_console_port(),
+        }
+    }
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            gateway: GatewayConfig {
-                port: 4000,
-                console_port: 4001,
-            },
+            gateway: GatewayConfig::default(),
             proxy_url: None,
             master_password: None,
             log: LogConfig::default(),
@@ -69,10 +88,24 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)?;
-        let cfg: Config = toml::from_str(&text)?;
-        Ok(cfg)
+    /// Load config from `path`.
+    ///
+    /// Returns `Ok(None)` when the file does not exist (callers should fall
+    /// back to defaults). Returns `Err` when the file exists but cannot be
+    /// read or parsed — this must surface to the user rather than being
+    /// silently replaced by defaults, otherwise a typo drops every setting.
+    pub fn load(path: &Path) -> anyhow::Result<Option<Self>> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("reading config file {}", path.display())))
+            }
+        };
+        let cfg: Config = toml::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("parsing config file {}: {e}", path.display()))?;
+        Ok(Some(cfg))
     }
 }
 
@@ -96,6 +129,50 @@ console_port = 4001
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.gateway.port, 4000);
+    }
+
+    #[test]
+    fn log_only_toml_loads_with_default_gateway() {
+        // A config with only a [log] section must parse — [gateway] and its
+        // fields are optional and fall back to defaults. This is the exact
+        // shape that previously failed to deserialize and silently dropped
+        // the log level.
+        let toml = r#"
+[log]
+level = "debug,sqlx::query=off"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.gateway.port, 4000);
+        assert_eq!(cfg.gateway.console_port, 4001);
+        assert_eq!(cfg.log.level.as_deref(), Some("debug,sqlx::query=off"));
+    }
+
+    #[test]
+    fn partial_gateway_fills_defaults() {
+        // Only one gateway field set; the other falls back to its default.
+        let toml = r#"
+[gateway]
+port = 8080
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.gateway.port, 8080);
+        assert_eq!(cfg.gateway.console_port, 4001);
+    }
+
+    #[test]
+    fn load_missing_file_returns_none() {
+        let got = Config::load(Path::new("/nonexistent/conduit.toml")).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn load_malformed_file_errors() {
+        // A present-but-invalid file must error, not silently fall back.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conduit.toml");
+        std::fs::write(&path, "port = = broken").unwrap();
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("parsing config file"));
     }
 
     #[test]

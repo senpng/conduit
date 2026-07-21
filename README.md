@@ -221,7 +221,7 @@ Run `cargo run -p conduitctl -- --help` or append `--help` to any subcommand for
 
 ## Configuration
 
-Conduit works without a configuration file. To override the defaults, create `conduit.toml` in the working directory:
+Conduit works without a configuration file. To override the defaults, create a `conduit.toml`. When `--config` / `CONDUIT_CONFIG` is not set, conduitd looks for `conduit.toml` in the working directory, then falls back to `~/.conduit/conduit.toml`; the first that exists is used. A config file that is present but malformed is a fatal error (conduitd will not silently fall back to defaults).
 
 ```toml
 # Upstream HTTP/SOCKS proxy for OAuth and token requests (optional).
@@ -242,7 +242,7 @@ to_file = true       # write to a daily-rolling file, or false for stdout
 dir = "~/.conduit/logs"   # defaults to <data-dir>/logs
 ```
 
-Every field is optional; omit the file entirely to use the built-in defaults. For each setting that also has an environment variable or CLI flag (the logging fields, `master_password`, and the gateway port), the resolution order is **environment variable / CLI flag → `conduit.toml` → built-in default** — the environment always wins. The only settings that live *only* in the environment (never the config file) are `CONDUIT_CONFIG`, `CONDUIT_DATA_DIR`, and the `conduitctl` / desktop variables.
+Every field — and every section, including `[gateway]` and `[log]` — is optional; omit the file entirely to use the built-in defaults, or include just the one section you want to change. For each setting that also has an environment variable or CLI flag (the logging fields, `master_password`, and the gateway port), the resolution order is **environment variable / CLI flag → `conduit.toml` → built-in default** — the environment always wins. The only settings that live *only* in the environment (never the config file) are `CONDUIT_CONFIG`, `CONDUIT_DATA_DIR`, and the `conduitctl` / desktop variables.
 
 The upstream proxy for OAuth and token requests is resolved from several sources, highest priority first: a per-credential `proxy_url` → `CONDUIT_PROXY_URL` → the `proxy_url` field in `conduit.toml` → the standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` variables (with `NO_PROXY` for bypass).
 
@@ -250,7 +250,7 @@ The upstream proxy for OAuth and token requests is resolved from several sources
 
 | Variable | Component | Default | Purpose |
 | --- | --- | --- | --- |
-| `CONDUIT_CONFIG` | `conduitd` | `conduit.toml` | Configuration file path |
+| `CONDUIT_CONFIG` | `conduitd` | `./conduit.toml`, then `~/.conduit/conduit.toml` | Configuration file path |
 | `CONDUIT_PORT` | `conduitd` | `4000` | Gateway port override |
 | `CONDUIT_DATA_DIR` | `conduitd` | `~/.conduit` | Local state directory |
 | `CONDUIT_MASTER_PASSWORD` | `conduitd` | _(empty)_ | Master password for secret encryption; also settable via `master_password` in `conduit.toml` |
