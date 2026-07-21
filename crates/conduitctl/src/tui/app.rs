@@ -530,7 +530,6 @@ impl App {
                     net::spawn_quota_refresh(self.client.clone(), id, self.tx.clone());
                 }
             }
-            Action::CycleCloakMode => self.cycle_claude_cloak_mode(),
             Action::ViewSecret => {
                 if self.tab == Tab::Providers {
                     // Toggle per-provider: hide if already decrypted for the selection.
@@ -1057,7 +1056,6 @@ impl App {
                     ("o", "re-auth"),
                     ("x", "token ↻"),
                     ("u", "remaining"),
-                    ("c", "cloak"),
                     ("d", "delete"),
                     ("/", "filter"),
                 ]);
@@ -1264,51 +1262,6 @@ impl App {
         self.mode = Mode::OauthFlow(OauthFlow::reauth(p));
     }
 
-    /// Cycle Claude OAuth `cloak_mode` for the selected provider: auto → always → never → auto.
-    fn cycle_claude_cloak_mode(&mut self) {
-        if !matches!(self.mode, Mode::Browse | Mode::Filter) || self.tab != Tab::Providers {
-            return;
-        }
-        let Some(p) = self
-            .selected_data_index()
-            .and_then(|i| self.providers.get(i).cloned())
-        else {
-            self.status = "Select a Claude OAuth provider first".into();
-            return;
-        };
-        let kind = p.kind.to_ascii_lowercase();
-        if !matches!(
-            kind.as_str(),
-            "claude-oauth" | "claude" | "anthropic-oauth"
-        ) {
-            self.status = format!(
-                "cloak_mode only applies to claude-oauth (got {})",
-                p.kind
-            );
-            return;
-        }
-        // Prefer cached secret view for current mode; default auto when unknown.
-        let current = self
-            .provider_secrets
-            .get(&p.id)
-            .and_then(|s| s.oauth.as_ref())
-            .and_then(|o| o.cloak_mode.as_deref())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("auto")
-            .to_ascii_lowercase();
-        let next = match current.as_str() {
-            "always" => "never",
-            "never" => "auto",
-            _ => "always",
-        };
-        self.status = format!("Setting cloak_mode={next}…");
-        self.loading = true;
-        let id = p.id.clone();
-        let body = crate::dto::UpdateOAuthSettingsBody::cloak_mode(next);
-        net::spawn_update_oauth_settings(self.client.clone(), id, body, self.tx.clone());
-    }
-
     fn start_edit(&mut self) {
         if !matches!(self.mode, Mode::Browse | Mode::Filter) {
             return;
@@ -1320,7 +1273,12 @@ impl App {
         match self.tab {
             Tab::Providers => {
                 if let Some(p) = self.providers.get(idx) {
-                    self.mode = Mode::ProviderForm(ProviderForm::edit(p));
+                    let cloak = self
+                        .provider_secrets
+                        .get(&p.id)
+                        .and_then(|s| s.oauth.as_ref())
+                        .and_then(|o| o.cloak_mode.as_deref());
+                    self.mode = Mode::ProviderForm(ProviderForm::edit(p, cloak));
                 }
             }
             Tab::Routes => {
@@ -1584,9 +1542,16 @@ impl App {
                 ProviderFormKind::Edit { id } => match f.to_update_body() {
                     Ok(body) => {
                         let id = id.clone();
+                        let oauth = f.to_oauth_settings_body();
                         self.status = "Updating provider…".into();
                         self.mode = Mode::Browse;
-                        net::spawn_update_provider(self.client.clone(), id, body, self.tx.clone());
+                        net::spawn_update_provider(
+                            self.client.clone(),
+                            id,
+                            body,
+                            oauth,
+                            self.tx.clone(),
+                        );
                     }
                     Err(e) => {
                         if let Mode::ProviderForm(f) = &mut self.mode {

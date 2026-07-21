@@ -143,7 +143,6 @@ fn map_browse(tab: Tab, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('o') if tab == Tab::Providers => Some(Action::OpenBrowser), // re-auth OAuth
         KeyCode::Char('x') if tab == Tab::Providers => Some(Action::OauthRefresh),
         KeyCode::Char('u') if tab == Tab::Providers => Some(Action::RefreshQuota),
-        KeyCode::Char('c') if tab == Tab::Providers => Some(Action::CycleCloakMode),
         KeyCode::Char('c') if tab == Tab::Usage => Some(Action::CycleUsageSort),
         // Overview heatmap says “press t”; Usage cycles detail panes (incl. by day).
         KeyCode::Char('t') if matches!(tab, Tab::Overview | Tab::Usage) => {
@@ -455,8 +454,8 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         };
-        let mut f = ProviderForm::edit(&p);
-        f.focus = 1; // base_url — last field
+        let mut f = ProviderForm::edit(&p, None);
+        f.focus = 1; // base_url — last field for non-Claude
         assert_eq!(f.fields.len(), 2);
         assert_eq!(
             map_key(&Mode::ProviderForm(f), Tab::Providers, key(KeyCode::Enter)),

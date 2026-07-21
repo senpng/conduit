@@ -80,15 +80,22 @@ impl ProviderForm {
         }
     }
 
-    pub fn edit(p: &ProviderView) -> Self {
+    /// Edit name / base_url. For Claude OAuth, also edit `cloak_mode`
+    /// (`auto` | `always` | `never`). Pass current mode when known (e.g. from
+    /// decrypted secret cache); defaults to `auto`.
+    pub fn edit(p: &ProviderView, cloak_mode: Option<&str>) -> Self {
         let kind_idx = PROVIDER_KINDS
             .iter()
             .position(|k| *k == p.kind.as_str())
             .unwrap_or(0);
-        // Kind is immutable on the API — only name + base_url are editable fields.
+        let mut fields = vec![InputField::new(&p.name), InputField::new(&p.base_url)];
+        if Self::is_claude_oauth_kind(&p.kind) {
+            let mode = normalize_cloak_mode_display(cloak_mode.unwrap_or("auto"));
+            fields.push(InputField::new(mode));
+        }
         Self {
             kind: ProviderFormKind::Edit { id: p.id.clone() },
-            fields: vec![InputField::new(&p.name), InputField::new(&p.base_url)],
+            fields,
             focus: 0,
             kind_idx,
             kind_display: Some(p.kind.clone()),
@@ -111,9 +118,15 @@ impl ProviderForm {
     }
 
     pub fn labels(&self) -> Vec<&'static str> {
-        match self.kind {
+        match &self.kind {
             ProviderFormKind::Create => vec!["Name", "Kind", "Base URL", "API Key (optional)"],
-            ProviderFormKind::Edit { .. } => vec!["Name", "Base URL"],
+            ProviderFormKind::Edit { .. } => {
+                if self.fields.len() >= 3 {
+                    vec!["Name", "Base URL", "Cloak mode (Ctrl+k)"]
+                } else {
+                    vec!["Name", "Base URL"]
+                }
+            }
             ProviderFormKind::SetSecret { .. } => vec!["API Key"],
         }
     }
@@ -143,11 +156,48 @@ impl ProviderForm {
                 self.fields[2].value = url.to_string();
                 self.fields[2].cursor = url.chars().count();
             }
+            return;
         }
+        // Edit form: Ctrl+k cycles Claude cloak_mode when that field exists.
+        if matches!(self.kind, ProviderFormKind::Edit { .. }) && self.fields.len() >= 3 {
+            self.cycle_cloak_mode();
+        }
+    }
+
+    /// Cycle cloak mode field: auto → always → never → auto.
+    pub fn cycle_cloak_mode(&mut self) {
+        let Some(field) = self.fields.get_mut(2) else {
+            return;
+        };
+        let next = match field.value.trim().to_ascii_lowercase().as_str() {
+            "always" => "never",
+            "never" => "auto",
+            _ => "always",
+        };
+        field.value = next.to_string();
+        field.cursor = next.chars().count();
+        // Jump focus to cloak field so the change is visible.
+        self.focus = 2;
     }
 
     pub fn is_oauth_kind_label(kind: &str) -> bool {
         kind.contains("oauth") || kind == "claude" || kind == "codex" || kind == "grok"
+    }
+
+    pub fn is_claude_oauth_kind(kind: &str) -> bool {
+        matches!(
+            kind.to_ascii_lowercase().as_str(),
+            "claude-oauth" | "claude" | "anthropic-oauth"
+        )
+    }
+
+    /// Cloak mode from edit form when present (Claude OAuth only).
+    pub fn cloak_mode_value(&self) -> Option<String> {
+        if !matches!(self.kind, ProviderFormKind::Edit { .. }) || self.fields.len() < 3 {
+            return None;
+        }
+        let raw = self.fields[2].value.trim();
+        Some(normalize_cloak_mode_display(raw).to_string())
     }
 
     pub fn to_create_body(&self) -> Result<CreateProviderBody, String> {
@@ -166,7 +216,7 @@ impl ProviderForm {
     }
 
     pub fn to_update_body(&self) -> Result<UpdateProviderBody, String> {
-        // Edit form fields: [0]=name, [1]=base_url (kind is not editable).
+        // Edit form fields: [0]=name, [1]=base_url [, 2]=cloak_mode for Claude.
         let name = self
             .fields
             .first()
@@ -180,10 +230,22 @@ impl ProviderForm {
         if name.is_empty() || base_url.is_empty() {
             return Err("name and base_url are required".into());
         }
+        if self.fields.len() >= 3 {
+            let mode = self.fields[2].value.trim().to_ascii_lowercase();
+            if !matches!(mode.as_str(), "auto" | "always" | "never") {
+                return Err("cloak mode must be auto, always, or never (Ctrl+k to cycle)".into());
+            }
+        }
         Ok(UpdateProviderBody {
             name: Some(name.to_string()),
             base_url: Some(base_url.to_string()),
         })
+    }
+
+    /// Optional OAuth settings body from the edit form (Claude cloak_mode).
+    pub fn to_oauth_settings_body(&self) -> Option<crate::dto::UpdateOAuthSettingsBody> {
+        self.cloak_mode_value()
+            .map(crate::dto::UpdateOAuthSettingsBody::cloak_mode)
     }
 
     pub fn to_secret_body(&self) -> Result<SetSecretBody, String> {
@@ -194,6 +256,15 @@ impl ProviderForm {
         Ok(SetSecretBody {
             api_key: api_key.to_string(),
         })
+    }
+}
+
+/// Normalize cloak mode for display / storage (defaults to `auto`).
+fn normalize_cloak_mode_display(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "always" => "always",
+        "never" => "never",
+        _ => "auto",
     }
 }
 
@@ -1133,13 +1204,37 @@ mod tests {
     #[test]
     fn provider_edit_body_uses_name_and_base_url_only() {
         let p = pv("id1", "old", "openai");
-        let mut f = ProviderForm::edit(&p);
+        let mut f = ProviderForm::edit(&p, None);
         assert_eq!(f.fields.len(), 2, "edit form must not include kind field");
         f.fields[0].value = "new".into();
         f.fields[1].value = "https://new.example".into();
         let body = f.to_update_body().unwrap();
         assert_eq!(body.name.as_deref(), Some("new"));
         assert_eq!(body.base_url.as_deref(), Some("https://new.example"));
+        assert!(f.to_oauth_settings_body().is_none());
+    }
+
+    #[test]
+    fn provider_edit_claude_includes_cloak_mode() {
+        let p = pv("id1", "claude", "claude-oauth");
+        let mut f = ProviderForm::edit(&p, Some("never"));
+        assert_eq!(f.fields.len(), 3);
+        assert_eq!(f.labels()[2], "Cloak mode (Ctrl+k)");
+        assert_eq!(f.fields[2].value, "never");
+        f.cycle_cloak_mode();
+        assert_eq!(f.fields[2].value, "auto");
+        f.cycle_kind(); // same as Ctrl+k on edit form
+        assert_eq!(f.fields[2].value, "always");
+        let oauth = f.to_oauth_settings_body().unwrap();
+        assert_eq!(oauth.cloak_mode.as_deref(), Some("always"));
+    }
+
+    #[test]
+    fn provider_edit_rejects_invalid_cloak_mode() {
+        let p = pv("id1", "claude", "claude-oauth");
+        let mut f = ProviderForm::edit(&p, Some("auto"));
+        f.fields[2].value = "bogus".into();
+        assert!(f.to_update_body().is_err());
     }
 
     fn kv(
