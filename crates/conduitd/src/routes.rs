@@ -374,14 +374,25 @@ pub async fn responses(
         }
         Err(error) => {
             let status = status_for_gateway_error(&error);
-            warn!(
-                endpoint = "/v1/responses",
-                alias = %alias,
-                client_request_id = %client_request_id,
-                status = %status,
-                error = %error,
-                "gateway request failed"
-            );
+            if is_upstream_fault(&error) {
+                warn!(
+                    endpoint = "/v1/responses",
+                    alias = %alias,
+                    client_request_id = %client_request_id,
+                    status = %status,
+                    error = %error,
+                    "gateway request failed (upstream)"
+                );
+            } else {
+                debug!(
+                    endpoint = "/v1/responses",
+                    alias = %alias,
+                    client_request_id = %client_request_id,
+                    status = %status,
+                    error = %error,
+                    "gateway request failed"
+                );
+            }
             (
                 status,
                 Json(OpenAiResponsesCodec::error_body(
@@ -491,6 +502,13 @@ pub(crate) fn status_for_gateway_error(err: &GatewayError) -> StatusCode {
         GatewayError::Quota(_) => StatusCode::FORBIDDEN,
         _ => StatusCode::BAD_GATEWAY,
     }
+}
+
+/// True when a failure is a genuine upstream/server fault (5xx) rather than a
+/// routine client error (401/404/429). Drives log severity so expected client
+/// errors stay at DEBUG while real faults surface at WARN.
+pub(crate) fn is_upstream_fault(err: &GatewayError) -> bool {
+    status_for_gateway_error(err).is_server_error()
 }
 
 /// GET /v1/models — OpenAI-compatible list from the live routing table.
@@ -703,25 +721,29 @@ pub async fn chat_completions(
                 GatewayError::Quota(qe) => {
                     OpenAiCodec::error_body("permission_error", None, &qe.to_string())
                 }
-                other => {
-                    warn!(
-                        endpoint = "/v1/chat/completions",
-                        alias = %alias,
-                        client_request_id = %request_id,
-                        error = %other,
-                        "pipeline error"
-                    );
-                    OpenAiCodec::error_body("upstream_error", None, &other.to_string())
-                }
+                other => OpenAiCodec::error_body("upstream_error", None, &other.to_string()),
             };
-            debug!(
-                endpoint = "/v1/chat/completions",
-                alias = %alias,
-                client_request_id = %request_id,
-                status = %status,
-                error = %e,
-                "gateway request failed"
-            );
+            // One record per failure. Upstream faults are WARN; classified client
+            // errors (401/404/429) are routine and log at DEBUG to avoid noise.
+            if is_upstream_fault(&e) {
+                warn!(
+                    endpoint = "/v1/chat/completions",
+                    alias = %alias,
+                    client_request_id = %request_id,
+                    status = %status,
+                    error = %e,
+                    "gateway request failed (upstream)"
+                );
+            } else {
+                debug!(
+                    endpoint = "/v1/chat/completions",
+                    alias = %alias,
+                    client_request_id = %request_id,
+                    status = %status,
+                    error = %e,
+                    "gateway request failed"
+                );
+            }
             (status, Json(body)).into_response()
         }
     }
@@ -930,25 +952,29 @@ pub async fn messages(
                 GatewayError::Quota(qe) => {
                     AnthropicCodec::error_body("permission_error", None, &qe.to_string())
                 }
-                other => {
-                    warn!(
-                        endpoint = "/v1/messages",
-                        alias = %alias,
-                        client_request_id = %request_id,
-                        error = %other,
-                        "pipeline error (messages)"
-                    );
-                    AnthropicCodec::error_body("api_error", None, &other.to_string())
-                }
+                other => AnthropicCodec::error_body("api_error", None, &other.to_string()),
             };
-            debug!(
-                endpoint = "/v1/messages",
-                alias = %alias,
-                client_request_id = %request_id,
-                status = %status,
-                error = %e,
-                "gateway request failed"
-            );
+            // One record per failure. Upstream faults are WARN; classified client
+            // errors (401/404/429) are routine and log at DEBUG to avoid noise.
+            if is_upstream_fault(&e) {
+                warn!(
+                    endpoint = "/v1/messages",
+                    alias = %alias,
+                    client_request_id = %request_id,
+                    status = %status,
+                    error = %e,
+                    "gateway request failed (upstream)"
+                );
+            } else {
+                debug!(
+                    endpoint = "/v1/messages",
+                    alias = %alias,
+                    client_request_id = %request_id,
+                    status = %status,
+                    error = %e,
+                    "gateway request failed"
+                );
+            }
             (status, Json(body)).into_response()
         }
     }

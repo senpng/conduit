@@ -140,7 +140,7 @@ fn spawn_tcp_forwarder(
         let listener = match tokio::net::TcpListener::from_std(listener) {
             Ok(l) => l,
             Err(e) => {
-                error!("oauth forwarder from_std: {e}");
+                error!(error = %e, "oauth forwarder from_std failed");
                 return;
             }
         };
@@ -164,7 +164,7 @@ fn spawn_tcp_forwarder(
                                         let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
                                     }
                                     Err(e) => {
-                                        warn!("oauth forwarder connect {to_port}: {e}");
+                                        warn!(error = %e, to_port, "oauth forwarder connect failed");
                                     }
                                 }
                             });
@@ -172,7 +172,7 @@ fn spawn_tcp_forwarder(
                         Err(e) => {
                             // WouldBlock / interrupted under load — continue until shutdown.
                             if e.kind() != std::io::ErrorKind::WouldBlock {
-                                warn!("oauth forwarder accept: {e}");
+                                warn!(error = %e, "oauth forwarder accept failed");
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         }
@@ -408,7 +408,7 @@ fn spawn_callback_server(
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) => {
-                error!("oauth callback bind {addr}: {e}");
+                error!(error = %e, %addr, "oauth callback bind failed");
                 let _ = state_cb.oauth.sessions.update(&sid, |s| {
                     s.status = SessionStatus::Error;
                     s.error = Some(format!("bind {addr}: {e}"));
@@ -422,7 +422,7 @@ fn spawn_callback_server(
             let _ = rx.await;
         });
         if let Err(e) = server.await {
-            warn!("oauth callback server error: {e}");
+            warn!(error = %e, session = %sid, "oauth callback server error");
         }
         state_cb.oauth.callbacks.lock().remove(&sid);
         info!(session = %sid, "oauth callback server stopped");
@@ -741,7 +741,7 @@ async fn persist_credential(
 
     // Reload routing table so new provider base_url is visible to routes.
     if let Err(e) = crate::server::reload_routing_table(state).await {
-        warn!("reload routing after oauth: {e}");
+        warn!(error = %e, "reload routing table after oauth failed");
     }
 
     info!(provider_id = %id, kind = %kind, "oauth credential stored");

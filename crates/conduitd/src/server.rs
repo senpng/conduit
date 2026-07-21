@@ -29,8 +29,9 @@ use tokio::net::TcpListener;
 use tower_http::{
     cors::{AllowHeaders, AllowOrigin, Any, CorsLayer},
     timeout::TimeoutLayer,
+    trace::TraceLayer,
 };
-use tracing::{info, warn};
+use tracing::{info, info_span, warn, Span};
 
 use crate::{
     config::Config,
@@ -295,6 +296,8 @@ pub async fn run(
             StatusCode::GATEWAY_TIMEOUT,
             Duration::from_secs(300),
         ))
+        // Outermost: one span per request wraps CORS + timeout + handler.
+        .layer(http_trace_layer())
         .with_state(state.clone());
 
     // ── Console router ──────────────────────────────────────────────────────────
@@ -389,6 +392,25 @@ impl conduit_oauth::SecretStore for SecretBackendStore {
             .await
             .map_err(|e| conduit_oauth::OAuthError::Credential(e.to_string()))
     }
+}
+
+/// Uniform request-level tracing for both gateway and console routers.
+///
+/// Creates one span per request (method + path) so every log emitted while a
+/// handler runs is correlated — including non-`#[instrument]` code paths and
+/// background work spawned within the request. TraceLayer's default
+/// `on_response` records status + latency at DEBUG.
+pub fn http_trace_layer() -> TraceLayer<
+    tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
+    impl Fn(&Request<Body>) -> Span + Clone,
+> {
+    TraceLayer::new_for_http().make_span_with(|req: &Request<Body>| {
+        info_span!(
+            "http",
+            method = %req.method(),
+            path = %req.uri().path(),
+        )
+    })
 }
 
 /// CORS policy for console (and gateway) when the UI origin is not the same as the API.
@@ -559,6 +581,8 @@ pub fn build_console_router(state: Arc<crate::state::DaemonState>) -> Router {
         // Innermost → outermost: OPTIONS short-circuit, then CorsLayer.
         .layer(middleware::from_fn(options_preflight_ok))
         .layer(console_cors_layer())
+        // Outermost: one span per request wraps preflight + CORS + handler.
+        .layer(http_trace_layer())
         .with_state(state)
 }
 
