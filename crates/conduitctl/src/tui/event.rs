@@ -21,6 +21,13 @@ pub fn map_key(mode: &Mode, tab: Tab, key: KeyEvent) -> Option<Action> {
             KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Enter => {
                 Some(Action::Cancel)
             }
+            // Scroll the keyboard reference (no wrap at ends).
+            KeyCode::Up | KeyCode::Char('k') => Some(Action::Up),
+            KeyCode::Down | KeyCode::Char('j') => Some(Action::Down),
+            KeyCode::PageUp => Some(Action::PageUp),
+            KeyCode::PageDown => Some(Action::PageDown),
+            KeyCode::Home | KeyCode::Char('g') => Some(Action::GoTop),
+            KeyCode::End | KeyCode::Char('G') => Some(Action::GoBottom),
             _ => None,
         },
         Mode::Confirm(_) => match key.code {
@@ -93,6 +100,17 @@ fn map_browse(tab: Tab, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('4') => Some(Action::Tab(3)),
         KeyCode::Char('5') => Some(Action::Tab(4)),
         KeyCode::Char('6') => Some(Action::Tab(5)),
+        // Ctrl+j / Ctrl+k — scroll Usage request detail (must beat plain j/k below).
+        KeyCode::Char('j')
+            if tab == Tab::Usage && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Some(Action::ScrollDetailDown)
+        }
+        KeyCode::Char('k')
+            if tab == Tab::Usage && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Some(Action::ScrollDetailUp)
+        }
         KeyCode::Up | KeyCode::Char('k') => Some(Action::Up),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::Down),
         KeyCode::PageUp => Some(Action::PageUp),
@@ -277,6 +295,67 @@ mod tests {
         assert_eq!(
             map_key(&Mode::Browse, Tab::Usage, key(KeyCode::Char('t'))),
             Some(Action::CycleUsageDetail)
+        );
+    }
+
+    #[test]
+    fn usage_ctrl_jk_scrolls_request_detail() {
+        assert_eq!(
+            map_key(
+                &Mode::Browse,
+                Tab::Usage,
+                key_mod(KeyCode::Char('j'), KeyModifiers::CONTROL)
+            ),
+            Some(Action::ScrollDetailDown)
+        );
+        assert_eq!(
+            map_key(
+                &Mode::Browse,
+                Tab::Usage,
+                key_mod(KeyCode::Char('k'), KeyModifiers::CONTROL)
+            ),
+            Some(Action::ScrollDetailUp)
+        );
+        // Plain j/k still move the list selection.
+        assert_eq!(
+            map_key(&Mode::Browse, Tab::Usage, key(KeyCode::Char('j'))),
+            Some(Action::Down)
+        );
+        assert_eq!(
+            map_key(&Mode::Browse, Tab::Usage, key(KeyCode::Char('k'))),
+            Some(Action::Up)
+        );
+    }
+
+    #[test]
+    fn help_jk_scrolls_keyboard_reference() {
+        assert_eq!(
+            map_key(&Mode::Help, Tab::Overview, key(KeyCode::Char('j'))),
+            Some(Action::Down)
+        );
+        assert_eq!(
+            map_key(&Mode::Help, Tab::Overview, key(KeyCode::Char('k'))),
+            Some(Action::Up)
+        );
+        assert_eq!(
+            map_key(&Mode::Help, Tab::Overview, key(KeyCode::PageDown)),
+            Some(Action::PageDown)
+        );
+        assert_eq!(
+            map_key(&Mode::Help, Tab::Overview, key(KeyCode::PageUp)),
+            Some(Action::PageUp)
+        );
+        assert_eq!(
+            map_key(&Mode::Help, Tab::Overview, key(KeyCode::Char('G'))),
+            Some(Action::GoBottom)
+        );
+        assert_eq!(
+            map_key(&Mode::Help, Tab::Overview, key(KeyCode::Char('g'))),
+            Some(Action::GoTop)
+        );
+        assert_eq!(
+            map_key(&Mode::Help, Tab::Overview, key(KeyCode::Esc)),
+            Some(Action::Cancel)
         );
     }
 

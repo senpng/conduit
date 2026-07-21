@@ -40,14 +40,8 @@ impl ProviderAddChooser {
         if n == 0 {
             return;
         }
-        let mut i = self.selected as i32 + delta;
-        if i < 0 {
-            i = n - 1;
-        }
-        if i >= n {
-            i = 0;
-        }
-        self.selected = i as usize;
+        // Clamp at ends — no circular wrap.
+        self.selected = (self.selected as i32 + delta).clamp(0, n - 1) as usize;
     }
 }
 

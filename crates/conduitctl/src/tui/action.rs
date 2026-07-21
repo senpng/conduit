@@ -67,6 +67,9 @@ pub enum Action {
     CycleUsageSort,
     /// Usage: toggle detail pane (recent | by_model | by_key | by_day)
     CycleUsageDetail,
+    /// Usage request detail: scroll right-hand pane (Ctrl+j / Ctrl+k)
+    ScrollDetailUp,
+    ScrollDetailDown,
     /// Start filter input (`/`)
     StartFilter,
     /// Cycle theme: auto → dark → light → auto (`T`)

@@ -41,9 +41,8 @@ fn list_window_start(selected: usize, len: usize, visible: usize) -> usize {
     start.min(max_start)
 }
 
-pub fn draw(frame: &mut Frame, app: &App) {
-    let theme = &app.theme;
-    fill_bg(frame, frame.area(), theme);
+pub fn draw(frame: &mut Frame, app: &mut App) {
+    fill_bg(frame, frame.area(), &app.theme);
 
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -62,54 +61,65 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_status_line(frame, root[3], app);
     draw_keybind_footer(frame, root[4], app);
 
-    match &app.mode {
-        Mode::Browse | Mode::Filter => {}
-        Mode::Help => draw_help(frame, theme),
-        Mode::Confirm(a) => draw_confirm(frame, theme, a),
-        Mode::Alert { title, body } => {
-            modal(
-                frame,
-                theme,
-                title,
-                body.lines()
-                    .map(|l| Line::from(l.to_string()))
-                    .collect(),
-                theme.border_active(),
-            );
-        }
-        Mode::SecretReveal {
-            title,
-            secret,
-            single_value,
-        } => {
-            let mut lines: Vec<Line> = secret
-                .lines()
-                .map(|l| {
-                    Line::from(Span::styled(
-                        l.to_string(),
-                        Style::default().fg(theme.warning),
-                    ))
-                })
-                .collect();
-            if lines.is_empty() {
-                lines.push(Line::from(Span::styled("(empty)", theme.subtle())));
+    // Overlays — re-borrow theme after body may have written scroll bounds.
+    let mut help_bounds: Option<(u16, u16)> = None;
+    {
+        let theme = &app.theme;
+        match &app.mode {
+            Mode::Browse | Mode::Filter => {}
+            Mode::Help => {
+                help_bounds = Some(draw_help(frame, theme, app.help_scroll));
             }
-            lines.push(Line::from(""));
-            // A lone token copies the same either way — drop the `a` hint.
-            let footer = if *single_value {
-                "y/c copy · Enter/Esc close"
-            } else {
-                "y/c copy full · a copy token/key · Enter/Esc close"
-            };
-            lines.push(Line::from(Span::styled(footer, theme.muted())));
-            modal(frame, theme, title, lines, Style::default().fg(theme.warning));
+            Mode::Confirm(a) => draw_confirm(frame, theme, a),
+            Mode::Alert { title, body } => {
+                modal(
+                    frame,
+                    theme,
+                    title,
+                    body.lines()
+                        .map(|l| Line::from(l.to_string()))
+                        .collect(),
+                    theme.border_active(),
+                );
+            }
+            Mode::SecretReveal {
+                title,
+                secret,
+                single_value,
+            } => {
+                let mut lines: Vec<Line> = secret
+                    .lines()
+                    .map(|l| {
+                        Line::from(Span::styled(
+                            l.to_string(),
+                            Style::default().fg(theme.warning),
+                        ))
+                    })
+                    .collect();
+                if lines.is_empty() {
+                    lines.push(Line::from(Span::styled("(empty)", theme.subtle())));
+                }
+                lines.push(Line::from(""));
+                // A lone token copies the same either way — drop the `a` hint.
+                let footer = if *single_value {
+                    "y/c copy · Enter/Esc close"
+                } else {
+                    "y/c copy full · a copy token/key · Enter/Esc close"
+                };
+                lines.push(Line::from(Span::styled(footer, theme.muted())));
+                modal(frame, theme, title, lines, Style::default().fg(theme.warning));
+            }
+            Mode::ProviderAddChooser(c) => draw_provider_add_chooser(frame, theme, c),
+            Mode::ProviderForm(f) => draw_provider_form(frame, theme, f),
+            Mode::KeyForm(f) => draw_key_form(frame, theme, f),
+            Mode::RouteWizard(w) => draw_route_wizard(frame, theme, w),
+            Mode::OauthFlow(f) => draw_oauth_flow(frame, theme, f),
+            Mode::PricingOverrideForm(f) => draw_pricing_override_form(frame, theme, f),
         }
-        Mode::ProviderAddChooser(c) => draw_provider_add_chooser(frame, theme, c),
-        Mode::ProviderForm(f) => draw_provider_form(frame, theme, f),
-        Mode::KeyForm(f) => draw_key_form(frame, theme, f),
-        Mode::RouteWizard(w) => draw_route_wizard(frame, theme, w),
-        Mode::OauthFlow(f) => draw_oauth_flow(frame, theme, f),
-        Mode::PricingOverrideForm(f) => draw_pricing_override_form(frame, theme, f),
+    }
+    if let Some((scroll, max)) = help_bounds {
+        app.help_scroll = scroll;
+        app.help_scroll_max = max;
     }
 }
 
@@ -232,7 +242,7 @@ fn draw_keybind_footer(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
     match app.tab {
         Tab::Overview => draw_overview(frame, area, app),
         Tab::Providers => draw_master_detail_providers(frame, area, app),
@@ -1948,7 +1958,7 @@ fn summary_total_tokens(s: &crate::dto::UsageSummaryView) -> u64 {
     }
 }
 
-fn draw_usage(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_usage(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     // Heatmap needs ~10 rows (legend + 7 weekdays + pad); give it room.
     let chunks = Layout::default()
@@ -2273,10 +2283,14 @@ fn find_cell<'a>(
 fn usage_master_detail(area: Rect) -> (Rect, Rect, bool) {
     let parts = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints(if area.width >= 120 {
-            [Constraint::Min(70), Constraint::Length(44)]
+        .constraints(if area.width >= 130 {
+            // Wide: fixed detail so request_id / model / provider fit without
+            // truncating as aggressively as the old 44-col pane.
+            [Constraint::Min(70), Constraint::Length(56)]
+        } else if area.width >= 100 {
+            [Constraint::Percentage(62), Constraint::Percentage(38)]
         } else if area.width >= 90 {
-            [Constraint::Percentage(68), Constraint::Percentage(32)]
+            [Constraint::Percentage(65), Constraint::Percentage(35)]
         } else {
             [Constraint::Percentage(100), Constraint::Length(0)]
         })
@@ -2285,7 +2299,7 @@ fn usage_master_detail(area: Rect) -> (Rect, Rect, bool) {
     (parts[0], parts[1], show)
 }
 
-fn draw_usage_detail(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_usage_detail(frame: &mut Frame, area: Rect, app: &mut App) {
     let sel = app.selected[Tab::Usage.index()];
     let period_total = app
         .usage_summary
@@ -2315,8 +2329,7 @@ fn draw_usage_detail(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_usage_recent(frame: &mut Frame, area: Rect, app: &App, sel: usize) {
-    let theme = &app.theme;
+fn draw_usage_recent(frame: &mut Frame, area: Rect, app: &mut App, sel: usize) {
     let title = {
         let total = app.usage_total;
         let from = if total == 0 {
@@ -2349,7 +2362,9 @@ fn draw_usage_recent(frame: &mut Frame, area: Rect, app: &App, sel: usize) {
         } else {
             "no requests recorded"
         };
-        empty_state(frame, area, theme, &title, hint);
+        empty_state(frame, area, &app.theme, &title, hint);
+        app.usage_detail_scroll = 0;
+        app.usage_detail_scroll_max = 0;
         return;
     }
     let (list_area, detail_area, show_detail) = usage_master_detail(area);
@@ -2372,48 +2387,69 @@ fn draw_usage_recent(frame: &mut Frame, area: Rect, app: &App, sel: usize) {
     // Server already sorted/paginated — display in API order.
     let sel = sel.min(app.usage_recent.len().saturating_sub(1));
 
-    let rows: Vec<Row> = app
-        .usage_recent
-        .iter()
-        .enumerate()
-        .map(|(view_i, u)| {
-            let row = Row::new(vec![
-                Cell::from(truncate(&format_local_time(&u.ts), ts_w)),
-                Cell::from(truncate(u.model_id.as_deref().unwrap_or(""), model_w)),
-                Cell::from(u.total_tokens.to_string()),
-                Cell::from(fmt_tok(u.cache_read_tokens)),
-                Cell::from(fmt_tok(u.cache_write_tokens)),
-                Cell::from(format_usd(u.cost_usd)),
-            ]);
-            if view_i == sel {
-                row.style(theme.selection())
-            } else {
-                row
-            }
-        })
-        .collect();
+    // List paint — theme borrow ends before we write scroll bounds back.
+    {
+        let theme = &app.theme;
+        let rows: Vec<Row> = app
+            .usage_recent
+            .iter()
+            .enumerate()
+            .map(|(view_i, u)| {
+                let row = Row::new(vec![
+                    Cell::from(truncate(&format_local_time(&u.ts), ts_w)),
+                    Cell::from(truncate(u.model_id.as_deref().unwrap_or(""), model_w)),
+                    Cell::from(u.total_tokens.to_string()),
+                    Cell::from(fmt_tok(u.cache_read_tokens)),
+                    Cell::from(fmt_tok(u.cache_write_tokens)),
+                    Cell::from(format_usd(u.cost_usd)),
+                ]);
+                if view_i == sel {
+                    row.style(theme.selection())
+                } else {
+                    row
+                }
+            })
+            .collect();
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(ts_w as u16),
-            Constraint::Min(model_w as u16),
-            Constraint::Length(8),
-            Constraint::Length(6),
-            Constraint::Length(6),
-            Constraint::Length(10),
-        ],
-    )
-    .header(
-        Row::new(vec!["TS", "MODEL", "TOK", "cR", "cW", "COST"]).style(theme.header_cell()),
-    )
-    .block(panel_block(theme, title, true));
-    render_scrollable_table(frame, table, list_area, sel);
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(ts_w as u16),
+                Constraint::Min(model_w as u16),
+                Constraint::Length(8),
+                Constraint::Length(6),
+                Constraint::Length(6),
+                Constraint::Length(10),
+            ],
+        )
+        .header(
+            Row::new(vec!["TS", "MODEL", "TOK", "cR", "cW", "COST"]).style(theme.header_cell()),
+        )
+        .block(panel_block(theme, title, true));
+        render_scrollable_table(frame, table, list_area, sel);
+    }
 
     if show_detail {
-        if let Some(u) = app.usage_recent.get(sel) {
-            draw_usage_record_detail(frame, detail_area, theme, u, &app.pricing);
+        if sel >= app.usage_recent.len() {
+            app.usage_detail_scroll = 0;
+            app.usage_detail_scroll_max = 0;
+        } else {
+            let scroll_in = app.usage_detail_scroll;
+            let (scroll, max_scroll) = draw_usage_record_detail(
+                frame,
+                detail_area,
+                &app.theme,
+                &app.usage_recent[sel],
+                &app.pricing,
+                scroll_in,
+            );
+            // Publish bounds so Ctrl+j stops at the bottom (no wrap).
+            app.usage_detail_scroll = scroll;
+            app.usage_detail_scroll_max = max_scroll;
         }
+    } else {
+        app.usage_detail_scroll = 0;
+        app.usage_detail_scroll_max = 0;
     }
 }
 
@@ -3246,13 +3282,15 @@ fn fmt_tok(n: u32) -> String {
     }
 }
 
+/// Returns `(clamped_scroll, max_scroll)` so the app can refuse further down-scroll.
 fn draw_usage_record_detail(
     frame: &mut Frame,
     area: Rect,
     theme: &Theme,
     u: &crate::dto::UsageRecordView,
     pricing: &[crate::dto::PricingView],
-) {
+    scroll: u16,
+) -> (u16, u16) {
     let mut lines = vec![
         Line::from(Span::styled(
             // Detail pane: show full model / ts (wrap handles overflow).
@@ -3334,10 +3372,11 @@ fn draw_usage_record_detail(
                 "key",
                 u.downstream_key_id
                     .as_deref()
-                    .map(|s| truncate(s, 20))
+                    .map(|s| truncate(s, 28))
                     .unwrap_or_else(|| "—".into()),
             ),
-            ("request_id", truncate(&u.request_id, 22)),
+            // 56-col pane − padding/label ≈ 34 usable value columns.
+            ("request_id", truncate(&u.request_id, 34)),
         ],
     ));
 
@@ -3390,12 +3429,50 @@ fn draw_usage_record_detail(
         )));
     }
 
+    // Estimate wrapped height (ratatui's line_count is unstable/private in 0.29).
+    // Clamp scroll so overshoot (resize / short content) pins to the bottom.
+    // No wrap: top/bottom are hard stops. Title carries a scroll hint when overflow.
+    let inner_w = area.width.saturating_sub(2).max(1) as usize;
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let total = wrapped_line_count(&lines, inner_w);
+    let max_scroll = total.saturating_sub(inner_h) as u16;
+    let scroll = scroll.min(max_scroll);
+    let title = if max_scroll == 0 {
+        "Request detail".into()
+    } else if scroll == 0 {
+        format!("Request detail  ↓^j  +{max_scroll}")
+    } else if scroll >= max_scroll {
+        "Request detail  ↑^k".into()
+    } else {
+        format!(
+            "Request detail  ^j/^k  {}/{}",
+            scroll + 1,
+            max_scroll + 1
+        )
+    };
+
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(panel_block(theme, "Request detail", true)),
+            .scroll((scroll, 0))
+            .block(panel_block(theme, title, true)),
         area,
     );
+    (scroll, max_scroll)
+}
+
+/// Approximate how many terminal rows `lines` occupy at `width` with wrap.
+fn wrapped_line_count(lines: &[Line<'_>], width: usize) -> usize {
+    if width == 0 {
+        return lines.len();
+    }
+    lines
+        .iter()
+        .map(|line| {
+            let w = line.width().max(1);
+            w.div_ceil(width).max(1)
+        })
+        .sum()
 }
 
 /// Best-effort match of a usage row to a pricing table entry.
@@ -3766,7 +3843,8 @@ fn draw_provider_add_chooser(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_help(frame: &mut Frame, theme: &Theme) {
+/// Keyboard reference modal. Returns `(clamped_scroll, max_scroll)` — no wrap.
+fn draw_help(frame: &mut Frame, theme: &Theme, scroll: u16) -> (u16, u16) {
     let body = "\
 Global
   1-6 / Tab     Switch tab          j/k ↑↓     Move
@@ -3775,6 +3853,8 @@ Global
   T             Theme auto/dark/light (also CONDUIT_THEME=…)
   t             Home → Usage by-day calendar · on Usage cycles detail
   ?             Help                q          Quit
+  j/k ↑↓        Scroll this help    PgUp/PgDn  Page this help
+  g / G         Help top / bottom   Esc/?/q    Close help
 
 Providers  (OAuth is an add method here)
   a             Add — choose API key or OAuth (Claude/Codex/Grok)
@@ -3808,6 +3888,7 @@ Usage
   Daily spend = GitHub-style heat calendar (cost intensity)
   By day: ↑↓ select day cells · zero days still listed
   Recent: PgUp/PgDn page · g/G first/last page
+  Recent detail: Ctrl+j / Ctrl+k scroll (no wrap)
   (right pane is detail; no Enter modal)
 
 Pricing
@@ -3821,13 +3902,49 @@ OAuth flow (from Providers → add / re-auth)
 Forms
   Tab fields · Enter on last = save · Ctrl-s / F2 save · Esc cancel
 ";
-    modal(
-        frame,
-        theme,
-        "Keyboard reference",
-        body.lines().map(|l| Line::from(l.to_string())).collect(),
-        theme.border_active(),
+    let lines: Vec<Line> = body
+        .lines()
+        .map(|l| Line::from(l.to_string()))
+        .collect();
+
+    // Slightly taller than generic modals so more of the reference fits.
+    let area = super::widgets::centered(frame.area(), 74, 70);
+    frame.render_widget(Clear, area);
+
+    let inner_w = area.width.saturating_sub(2).max(1) as usize;
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let total = wrapped_line_count(&lines, inner_w);
+    let max_scroll = total.saturating_sub(inner_h) as u16;
+    let scroll = scroll.min(max_scroll);
+    let title = if max_scroll == 0 {
+        "Keyboard reference".into()
+    } else if scroll == 0 {
+        format!("Keyboard reference  ↓j  +{max_scroll}")
+    } else if scroll >= max_scroll {
+        "Keyboard reference  ↑k".into()
+    } else {
+        format!(
+            "Keyboard reference  j/k  {}/{}",
+            scroll + 1,
+            max_scroll + 1
+        )
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border_active())
+        .title_top(Span::styled(format!(" {title} "), theme.title()))
+        .style(theme.surface());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .style(theme.surface()),
+        inner,
     );
+    (scroll, max_scroll)
 }
 
 fn draw_confirm(frame: &mut Frame, theme: &Theme, action: &ConfirmAction) {

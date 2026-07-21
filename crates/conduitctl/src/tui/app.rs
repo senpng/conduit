@@ -213,6 +213,15 @@ pub struct App {
 
     pub usage_sort: UsageSort,
     pub usage_detail: UsageDetail,
+    /// Vertical scroll offset (lines) for Usage → Recent request detail pane.
+    /// Clamped to `[0, usage_detail_scroll_max]`; reset when selection / pane changes.
+    /// No wrap-around at either end.
+    pub usage_detail_scroll: u16,
+    /// Max scroll from last paint (content lines − viewport). Updated in draw.
+    pub usage_detail_scroll_max: u16,
+    /// Vertical scroll for the Keyboard reference (`?`) modal. Same clamp rules.
+    pub help_scroll: u16,
+    pub help_scroll_max: u16,
 
     /// Selection index into the **filtered** view for each tab.
     pub selected: [usize; 6],
@@ -271,6 +280,10 @@ impl App {
             pricing_pane: PricingPane::Merged,
             usage_sort: UsageSort::default(),
             usage_detail: UsageDetail::default(),
+            usage_detail_scroll: 0,
+            usage_detail_scroll_max: 0,
+            help_scroll: 0,
+            help_scroll_max: 0,
             selected: [0; 6],
             filtered: Vec::new(),
             data_gen: 0,
@@ -311,6 +324,8 @@ impl App {
             Action::Help => {
                 if matches!(self.mode, Mode::Browse) {
                     self.mode = Mode::Help;
+                    self.help_scroll = 0;
+                    self.help_scroll_max = 0;
                 }
             }
             Action::Cancel | Action::ConfirmNo => self.close_overlay(),
@@ -321,60 +336,92 @@ impl App {
             }
             Action::Tab(i) => self.switch_tab(Tab::from_index(i)),
             Action::Up => {
-                if let Mode::ProviderAddChooser(c) = &mut self.mode {
+                if matches!(self.mode, Mode::Help) {
+                    // Keyboard reference: stop at top (no wrap).
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                } else if let Mode::ProviderAddChooser(c) = &mut self.mode {
                     c.move_sel(-1);
                 } else {
                     self.move_sel(-1);
                 }
             }
             Action::Down => {
-                if let Mode::ProviderAddChooser(c) = &mut self.mode {
+                if matches!(self.mode, Mode::Help) {
+                    // Keyboard reference: stop at bottom (no wrap).
+                    if self.help_scroll < self.help_scroll_max {
+                        self.help_scroll += 1;
+                    }
+                } else if let Mode::ProviderAddChooser(c) = &mut self.mode {
                     c.move_sel(1);
                 } else {
                     self.move_sel(1);
                 }
             }
             Action::PageUp => {
-                if self.tab == Tab::Usage && self.usage_detail == UsageDetail::Recent {
+                if matches!(self.mode, Mode::Help) {
+                    self.help_scroll = self.help_scroll.saturating_sub(10);
+                } else if self.tab == Tab::Usage && self.usage_detail == UsageDetail::Recent {
                     self.usage_prev_page();
                 } else {
                     self.move_sel(-10);
                 }
             }
             Action::PageDown => {
-                if self.tab == Tab::Usage && self.usage_detail == UsageDetail::Recent {
+                if matches!(self.mode, Mode::Help) {
+                    self.help_scroll = self
+                        .help_scroll
+                        .saturating_add(10)
+                        .min(self.help_scroll_max);
+                } else if self.tab == Tab::Usage && self.usage_detail == UsageDetail::Recent {
                     self.usage_next_page();
                 } else {
                     self.move_sel(10);
                 }
             }
             Action::GoTop => {
-                if self.tab == Tab::Usage && self.usage_detail == UsageDetail::Recent {
+                if matches!(self.mode, Mode::Help) {
+                    self.help_scroll = 0;
+                } else if self.tab == Tab::Usage && self.usage_detail == UsageDetail::Recent {
                     if self.usage_offset > 0 {
                         self.usage_offset = 0;
                         self.selected[Tab::Usage.index()] = 0;
+                        self.usage_detail_scroll = 0;
                         self.spawn_usage_load(false);
-                    } else {
+                    } else if self.selected[self.tab.index()] != 0 {
                         self.selected[self.tab.index()] = 0;
+                        self.usage_detail_scroll = 0;
                     }
                 } else {
                     self.selected[self.tab.index()] = 0;
+                    if self.tab == Tab::Usage {
+                        self.usage_detail_scroll = 0;
+                    }
                 }
             }
             Action::GoBottom => {
-                if self.tab == Tab::Usage && self.usage_detail == UsageDetail::Recent {
+                if matches!(self.mode, Mode::Help) {
+                    self.help_scroll = self.help_scroll_max;
+                } else if self.tab == Tab::Usage && self.usage_detail == UsageDetail::Recent {
                     let last_off = self.usage_last_offset();
                     if self.usage_offset < last_off {
                         self.usage_offset = last_off;
                         self.selected[Tab::Usage.index()] = 0;
+                        self.usage_detail_scroll = 0;
                         self.spawn_usage_load(false);
                     } else {
                         let n = self.list_len();
-                        self.selected[self.tab.index()] = n.saturating_sub(1);
+                        let last = n.saturating_sub(1);
+                        if self.selected[self.tab.index()] != last {
+                            self.selected[self.tab.index()] = last;
+                            self.usage_detail_scroll = 0;
+                        }
                     }
                 } else {
                     let n = self.list_len();
                     self.selected[self.tab.index()] = n.saturating_sub(1);
+                    if self.tab == Tab::Usage {
+                        self.usage_detail_scroll = 0;
+                    }
                 }
             }
             Action::StartFilter => {
@@ -451,12 +498,14 @@ impl App {
                 self.usage_period = shift_period(&self.usage_period, -1);
                 self.usage_offset = 0;
                 self.selected[Tab::Usage.index()] = 0;
+                self.usage_detail_scroll = 0;
                 self.request_refresh();
             }
             Action::PeriodNext => {
                 self.usage_period = shift_period(&self.usage_period, 1);
                 self.usage_offset = 0;
                 self.selected[Tab::Usage.index()] = 0;
+                self.usage_detail_scroll = 0;
                 self.request_refresh();
             }
             Action::OpenBrowser => {
@@ -596,6 +645,7 @@ impl App {
                     self.usage_sort = self.usage_sort.next();
                     self.usage_offset = 0;
                     self.selected[Tab::Usage.index()] = 0;
+                    self.usage_detail_scroll = 0;
                     self.status = format!("Usage sort: {}", self.usage_sort.label());
                     // Recent list is sorted server-side; re-fetch so pagination stays correct.
                     if self.usage_detail == UsageDetail::Recent {
@@ -612,6 +662,7 @@ impl App {
                     Tab::Overview => {
                         self.usage_detail = UsageDetail::ByDay;
                         self.selected[Tab::Usage.index()] = 0;
+                        self.usage_detail_scroll = 0;
                         self.status =
                             "Usage · by day — ↑↓ select a day on the calendar".into();
                         self.switch_tab(Tab::Usage);
@@ -620,6 +671,7 @@ impl App {
                         self.mode = Mode::Browse;
                         self.usage_detail = self.usage_detail.next();
                         self.selected[Tab::Usage.index()] = 0;
+                        self.usage_detail_scroll = 0;
                         self.status = format!("Usage detail: {}", self.usage_detail.label());
                         self.refresh_filtered();
                         if self.usage_detail == UsageDetail::Recent
@@ -632,6 +684,21 @@ impl App {
                     _ => {
                         self.status =
                             "t · daily spend calendar — press 1 (home) or 5 (Usage)".into();
+                    }
+                }
+            }
+            Action::ScrollDetailUp => {
+                if self.tab == Tab::Usage && self.usage_detail == UsageDetail::Recent {
+                    // Stop at top — no wrap to bottom.
+                    self.usage_detail_scroll = self.usage_detail_scroll.saturating_sub(1);
+                }
+            }
+            Action::ScrollDetailDown => {
+                if self.tab == Tab::Usage && self.usage_detail == UsageDetail::Recent {
+                    // Stop at bottom (max from last draw) — no wrap to top.
+                    let max = self.usage_detail_scroll_max;
+                    if self.usage_detail_scroll < max {
+                        self.usage_detail_scroll += 1;
                     }
                 }
             }
@@ -694,6 +761,7 @@ impl App {
         }
         self.usage_offset = next;
         self.selected[Tab::Usage.index()] = 0;
+        self.usage_detail_scroll = 0;
         self.spawn_usage_load(false);
     }
 
@@ -704,6 +772,7 @@ impl App {
         }
         self.usage_offset = self.usage_offset.saturating_sub(USAGE_PAGE_SIZE);
         self.selected[Tab::Usage.index()] = 0;
+        self.usage_detail_scroll = 0;
         self.spawn_usage_load(false);
     }
 
@@ -915,14 +984,9 @@ impl App {
                     if n == 0 {
                         return;
                     }
-                    let mut i = w.target_focus as i32 + delta;
-                    if i < 0 {
-                        i = n - 1;
-                    }
-                    if i >= n {
-                        i = 0;
-                    }
-                    w.target_focus = i as usize;
+                    // Clamp at ends — no wrap-around.
+                    let next = (w.target_focus as i32 + delta).clamp(0, n - 1) as usize;
+                    w.target_focus = next;
                 }
             }
             return;
@@ -932,14 +996,15 @@ impl App {
             return;
         }
         let idx = self.tab.index();
-        let mut s = self.selected[idx] as i32 + delta;
-        if s < 0 {
-            s = (n as i32) - 1;
+        // Clamp at first/last — no circular wrap (j on last stays put).
+        let next = (self.selected[idx] as i32 + delta).clamp(0, (n as i32) - 1) as usize;
+        if self.selected[idx] != next {
+            self.selected[idx] = next;
+            // New row → start detail at the top.
+            if self.tab == Tab::Usage {
+                self.usage_detail_scroll = 0;
+            }
         }
-        if s >= n as i32 {
-            s = 0;
-        }
-        self.selected[idx] = s as usize;
     }
 
     fn close_overlay(&mut self) {
@@ -1016,7 +1081,11 @@ impl App {
                     ("/", "filter"),
                 ]);
                 if self.usage_detail == UsageDetail::Recent {
-                    v.extend([("PgUp", "prev pg"), ("PgDn", "next pg")]);
+                    v.extend([
+                        ("PgUp", "prev pg"),
+                        ("PgDn", "next pg"),
+                        ("^j/^k", "detail"),
+                    ]);
                 }
                 if self.usage_detail == UsageDetail::ByDay {
                     v.extend([("↑↓", "day cell")]);
