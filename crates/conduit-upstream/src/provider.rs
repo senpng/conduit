@@ -390,7 +390,10 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         err
     }
 
-    #[instrument(skip(self, req, secret), fields(provider = %self.config.id, alias = %req.alias))]
+    #[instrument(
+        skip(self, req, secret),
+        fields(provider = %self.config.id, alias = %req.alias, request_id = %req.id)
+    )]
     pub async fn chat(
         &self,
         req: &CanonicalChatRequest,
@@ -428,6 +431,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
 
         let body_bytes = body.to_string().len();
         debug!(
+            request_id = %req.id,
             provider = %self.config.id,
             kind = %self.config.kind,
             url = %url,
@@ -450,6 +454,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         let started = std::time::Instant::now();
         let resp = builder.send().await.map_err(|e| {
             debug!(
+                request_id = %req.id,
                 provider = %self.config.id,
                 url = %url,
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -482,6 +487,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
             .await
             .map_err(|e| {
                 debug!(
+                    request_id = %req.id,
                     provider = %self.config.id,
                     error = %e,
                     "upstream chat response json parse failed"
@@ -492,6 +498,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         let (response, decode_loss) = C::decode_response(val, &req.alias)
             .map_err(|e| {
                 debug!(
+                    request_id = %req.id,
                     provider = %self.config.id,
                     error = %e,
                     "upstream chat response decode failed"
@@ -500,6 +507,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
             })?;
 
         debug!(
+            request_id = %req.id,
             provider = %self.config.id,
             kind = %self.config.kind,
             status = status.as_u16(),
@@ -515,7 +523,10 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         Ok((response, combined))
     }
 
-    #[instrument(skip(self, req, secret), fields(provider = %self.config.id, alias = %req.alias))]
+    #[instrument(
+        skip(self, req, secret),
+        fields(provider = %self.config.id, alias = %req.alias, request_id = %req.id)
+    )]
     pub async fn chat_stream(
         &self,
         req: &CanonicalChatRequest,
@@ -547,6 +558,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
 
         let body_bytes = body.to_string().len();
         debug!(
+            request_id = %req.id,
             provider = %self.config.id,
             kind = %self.config.kind,
             url = %url,
@@ -570,6 +582,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         .await
         .map_err(|_| {
             debug!(
+                request_id = %req.id,
                 provider = %self.config.id,
                 url = %url,
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -579,6 +592,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         })?
         .map_err(|e| {
             debug!(
+                request_id = %req.id,
                 provider = %self.config.id,
                 url = %url,
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -606,6 +620,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         }
 
         debug!(
+            request_id = %req.id,
             provider = %self.config.id,
             kind = %self.config.kind,
             status = status.as_u16(),

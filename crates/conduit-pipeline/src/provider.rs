@@ -107,6 +107,7 @@ pub async fn dispatch_non_stream(
 ) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
     let kind = resolve_kind(&resolved.provider_kind)?;
     debug!(
+        request_id = %request.id,
         provider_id = %resolved.provider_id,
         provider_kind = %kind,
         model_id = %resolved.model_id,
@@ -146,6 +147,7 @@ pub async fn dispatch_stream(
 > {
     let kind = resolve_kind(&resolved.provider_kind)?;
     debug!(
+        request_id = %request.id,
         provider_id = %resolved.provider_id,
         provider_kind = %kind,
         model_id = %resolved.model_id,

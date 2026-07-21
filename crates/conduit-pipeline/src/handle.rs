@@ -89,9 +89,12 @@ impl PipelineHandle {
             .with_client_headers(client_headers.clone());
         ctx.session_id = session_id.clone();
 
+        // Ensure every log under this request (including auth/oauth/upstream
+        // paths that don't take request_id as a parameter) can be grepped by rid.
+        tracing::Span::current().record("request_id", tracing::field::display(&ctx.request_id));
+
         debug!(
             request_id = %ctx.request_id,
-            client_request_id = %ctx.request.id,
             alias = %ctx.request.alias,
             stream,
             wire = %wire_format.as_str(),
@@ -195,12 +198,18 @@ impl PipelineHandle {
         body: serde_json::Value,
         downstream_bearer: Option<String>,
         client_headers: Vec<(String, String)>,
+        request_id: String,
     ) -> Result<serde_json::Value, GatewayError> {
         use conduit_ir::canonical::CanonicalChatRequest;
 
         let table_snap = self.deps.routing_table.load_full();
         // Minimal IR request for routing / quota / session only.
         let mut request = CanonicalChatRequest::new(alias, vec![]);
+        // Prefer the ingress-minted id so compact logs share the same rid as the
+        // gateway response header / route span.
+        if !request_id.is_empty() {
+            request.id = request_id;
+        }
         request.stream = false;
         let session_id = resolve_session_id(&client_headers, &request);
         let mut ctx = PipelineContext::new(
@@ -214,6 +223,7 @@ impl PipelineHandle {
         })
         .with_client_headers(client_headers.clone());
         ctx.session_id = session_id;
+        tracing::Span::current().record("request_id", tracing::field::display(&ctx.request_id));
 
         if let Err((_t, _s, err)) = self.run_ingress_checks(&mut ctx, downstream_bearer).await {
             return Err(err);
@@ -377,7 +387,8 @@ impl PipelineHandle {
             .check_model_allowed(&ctx.request.alias)
             .map_err(|e| ("ModelNotAllowed", 403u16, e))?;
 
-        let quota_req = ingress::build_quota_check(&policy, &ctx.request.alias);
+        let quota_req =
+            ingress::build_quota_check(&policy, &ctx.request.alias, ctx.request_id.clone());
         self.deps.quota.check(&quota_req).await.map_err(|e| {
             let status = match &e {
                 conduit_ir::error::QuotaError::RateLimitExceeded { .. } => 429u16,

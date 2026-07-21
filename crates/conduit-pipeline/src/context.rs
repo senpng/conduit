@@ -37,7 +37,8 @@ pub struct IngressWire {
 
 /// Mutable accumulator that flows through the entire pipeline.
 pub struct PipelineContext {
-    /// Correlation id for the usage ledger.
+    /// Correlation id shared with ingress (`CanonicalChatRequest.id`), usage
+    /// ledger, logs, and the `x-request-id` response header.
     pub request_id: String,
     pub started_at: DateTime<Utc>,
     pub request: CanonicalChatRequest,
@@ -67,8 +68,18 @@ impl PipelineContext {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
 
+        // One correlation id for the whole gateway request: reuse the ingress
+        // ULID on `CanonicalChatRequest.id` so logs, usage ledger, and the
+        // `x-request-id` response header all share the same value. Only mint a
+        // fresh ULID when callers (tests / compact path) leave `id` empty.
+        let request_id = if request.id.is_empty() {
+            Ulid::new().to_string()
+        } else {
+            request.id.clone()
+        };
+
         Self {
-            request_id: Ulid::new().to_string(),
+            request_id,
             started_at: Utc::now(),
             request,
             downstream_key_id,
@@ -111,5 +122,31 @@ impl PipelineContext {
         } else {
             self.usage.total_tokens = self.usage.prompt_tokens + self.usage.completion_tokens;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use conduit_ir::canonical::CanonicalChatRequest;
+    use conduit_router::table::RoutingTable;
+
+    #[test]
+    fn request_id_reuses_ingress_id() {
+        let mut req = CanonicalChatRequest::new("gpt", vec![]);
+        req.id = "01TESTINGRESSID0000000000000".into();
+        let table = Arc::new(RoutingTable::new([]));
+        let ctx = PipelineContext::new(req, None, table, WireFormat::OpenaiChat);
+        assert_eq!(ctx.request_id, "01TESTINGRESSID0000000000000");
+        assert_eq!(ctx.request_id, ctx.request.id);
+    }
+
+    #[test]
+    fn request_id_mints_when_ingress_empty() {
+        let mut req = CanonicalChatRequest::new("gpt", vec![]);
+        req.id.clear();
+        let table = Arc::new(RoutingTable::new([]));
+        let ctx = PipelineContext::new(req, None, table, WireFormat::OpenaiChat);
+        assert!(!ctx.request_id.is_empty());
     }
 }

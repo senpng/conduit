@@ -20,6 +20,8 @@ pub type RecordFn =
 /// Input for [`QuotaChecker::check`] / [`QuotaEngine::check`].
 #[derive(Debug, Clone)]
 pub struct QuotaCheckRequest {
+    /// Gateway correlation id (same as pipeline / `x-request-id`).
+    pub request_id: String,
     /// Opaque identifier for the downstream API key.
     pub downstream_key_id: String,
     /// Requests-per-minute cap, if any.

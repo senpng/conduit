@@ -95,6 +95,7 @@ impl QuotaEngine for InMemoryQuotaEngine {
                 .await
             {
                 debug!(
+                    request_id = %req.request_id,
                     key_id = %req.downstream_key_id,
                     alias = %req.model_alias,
                     limit,
@@ -105,6 +106,7 @@ impl QuotaEngine for InMemoryQuotaEngine {
                 });
             }
             debug!(
+                request_id = %req.request_id,
                 key_id = %req.downstream_key_id,
                 alias = %req.model_alias,
                 limit,
@@ -112,6 +114,7 @@ impl QuotaEngine for InMemoryQuotaEngine {
             );
         } else {
             debug!(
+                request_id = %req.request_id,
                 key_id = %req.downstream_key_id,
                 alias = %req.model_alias,
                 "quota check skipped (no rpm limit)"
@@ -157,6 +160,7 @@ mod tests {
 
     fn make_req(rpm: Option<u32>) -> QuotaCheckRequest {
         QuotaCheckRequest {
+            request_id: "req-engine-test".into(),
             downstream_key_id: "dk-engine-test".into(),
             rate_limit_rpm: rpm,
             model_alias: "gpt-4o".into(),

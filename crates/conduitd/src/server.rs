@@ -424,6 +424,10 @@ impl conduit_oauth::SecretStore for SecretBackendStore {
 /// handler runs is correlated — including non-`#[instrument]` code paths and
 /// background work spawned within the request. TraceLayer's default
 /// `on_response` records status + latency at DEBUG.
+///
+/// `request_id` is left empty here and filled by the gateway handler once the
+/// ingress ULID is minted, so auth / oauth / quota / upstream logs that only
+/// sit under this span become greppable by rid.
 pub fn http_trace_layer() -> TraceLayer<
     tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
     impl Fn(&Request<Body>) -> Span + Clone,
@@ -433,6 +437,7 @@ pub fn http_trace_layer() -> TraceLayer<
             "http",
             method = %req.method(),
             path = %req.uri().path(),
+            request_id = tracing::field::Empty,
         )
     })
 }
@@ -456,6 +461,7 @@ pub fn console_cors_layer() -> CorsLayer {
         ])
         // Mirror requested headers so Content-Type preflight is accepted.
         .allow_headers(AllowHeaders::mirror_request())
+        // Reflect any response header (console + gateway x-request-id).
         .expose_headers(Any)
         .allow_credentials(false)
         // Chrome Private Network Access: public/loopback-looking page → 127.0.0.1

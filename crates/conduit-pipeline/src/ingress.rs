@@ -65,8 +65,13 @@ pub fn accept_policy(
 }
 
 /// Builds a QuotaCheckRequest from the key policy for the quota engine.
-pub fn build_quota_check(policy: &KeyPolicy, alias: &str) -> QuotaCheckRequest {
+pub fn build_quota_check(
+    policy: &KeyPolicy,
+    alias: &str,
+    request_id: impl Into<String>,
+) -> QuotaCheckRequest {
     QuotaCheckRequest {
+        request_id: request_id.into(),
         downstream_key_id: policy.key_id.clone(),
         rate_limit_rpm: policy.rate_limit_rpm,
         model_alias: alias.to_string(),
@@ -113,7 +118,8 @@ mod tests {
         let accepted = accept_policy(raw, Some(policy)).unwrap();
         assert_eq!(accepted.key_id, "key_01STABLE");
         assert_ne!(accepted.key_id, raw);
-        let check = build_quota_check(&accepted, "gpt-4o");
+        let check = build_quota_check(&accepted, "gpt-4o", "req-test-1");
         assert_eq!(check.downstream_key_id, "key_01STABLE");
+        assert_eq!(check.request_id, "req-test-1");
     }
 }
