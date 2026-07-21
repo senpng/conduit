@@ -224,10 +224,27 @@ Run `cargo run -p conduitctl -- --help` or append `--help` to any subcommand for
 Conduit works without a configuration file. To override the defaults, create `conduit.toml` in the working directory:
 
 ```toml
+# Upstream HTTP/SOCKS proxy for OAuth and token requests (optional).
+proxy_url = "socks5://127.0.0.1:7890"
+
+# Master password for secret encryption. Prefer CONDUIT_MASTER_PASSWORD
+# so the password is not stored on disk in plaintext.
+master_password = "change-me"
+
 [gateway]
 port = 4000
 console_port = 4001
+
+[log]
+level = "info"       # log filter, e.g. "debug,sqlx::query=off"
+format = "pretty"    # "pretty" or "json"
+to_file = true       # write to a daily-rolling file, or false for stdout
+dir = "~/.conduit/logs"   # defaults to <data-dir>/logs
 ```
+
+Every field is optional; omit the file entirely to use the built-in defaults. For each setting that also has an environment variable or CLI flag (the logging fields, `master_password`, and the gateway port), the resolution order is **environment variable / CLI flag → `conduit.toml` → built-in default** — the environment always wins. The only settings that live *only* in the environment (never the config file) are `CONDUIT_CONFIG`, `CONDUIT_DATA_DIR`, and the `conduitctl` / desktop variables.
+
+The upstream proxy for OAuth and token requests is resolved from several sources, highest priority first: a per-credential `proxy_url` → `CONDUIT_PROXY_URL` → the `proxy_url` field in `conduit.toml` → the standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` variables (with `NO_PROXY` for bypass).
 
 ### Environment variables
 
@@ -236,9 +253,12 @@ console_port = 4001
 | `CONDUIT_CONFIG` | `conduitd` | `conduit.toml` | Configuration file path |
 | `CONDUIT_PORT` | `conduitd` | `4000` | Gateway port override |
 | `CONDUIT_DATA_DIR` | `conduitd` | `~/.conduit` | Local state directory |
-| `CONDUIT_MASTER_PASSWORD` | `conduitd` | _(empty)_ | Master password for secret encryption |
-| `CONDUIT_LOG` | `conduitd` | `info` | Log filter, for example `debug,sqlx::query=off` |
-| `CONDUIT_LOG_FORMAT` | `conduitd` | `pretty` | `pretty` or `json` |
+| `CONDUIT_MASTER_PASSWORD` | `conduitd` | _(empty)_ | Master password for secret encryption; also settable via `master_password` in `conduit.toml` |
+| `CONDUIT_LOG` | `conduitd` | `info` | Log filter, for example `debug,sqlx::query=off`; also `[log] level` in `conduit.toml` |
+| `CONDUIT_LOG_FORMAT` | `conduitd` | `pretty` | `pretty` or `json`; also `[log] format` in `conduit.toml` |
+| `CONDUIT_LOG_TO_FILE` | `conduitd` | `true` | Write logs to a daily-rolling file; set `false` to log to stdout (e.g. under systemd/journald); also `[log] to_file` in `conduit.toml` |
+| `CONDUIT_LOG_DIR` | `conduitd` | `<data-dir>/logs` | Directory for log files when file logging is enabled; also `[log] dir` in `conduit.toml` |
+| `CONDUIT_PROXY_URL` | `conduitd` | _(unset)_ | Upstream HTTP/SOCKS proxy; also settable via `proxy_url` in `conduit.toml` (see the precedence note above) |
 | `CONDUIT_CONSOLE_ADDR` | `conduitctl` | `http://127.0.0.1:4001` | Console API base URL |
 | `CONDUIT_OUTPUT` | `conduitctl` | `human` | `human` or `json` where supported |
 | `VITE_CONDUIT_CONSOLE_URL` | `conduit-ui` | `http://127.0.0.1:4001` | Desktop console API base URL |
