@@ -23,7 +23,7 @@ use super::context::ResolvedProvider;
 /// Known upstream protocol / codec families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderKind {
-    OpenAi,
+    OpenAI,
     Anthropic,
     /// Anthropic Messages API with OAuth Bearer + beta headers.
     ClaudeOAuth,
@@ -37,7 +37,7 @@ impl ProviderKind {
     /// Parse a configured provider-kind string.
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "openai" | "" => Ok(Self::OpenAi),
+            "openai" | "" => Ok(Self::OpenAI),
             "anthropic" => Ok(Self::Anthropic),
             "claude-oauth" | "anthropic-oauth" | "claude" => Ok(Self::ClaudeOAuth),
             "codex-oauth" | "codex" => Ok(Self::CodexOAuth),
@@ -48,7 +48,7 @@ impl ProviderKind {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::OpenAi => "openai",
+            Self::OpenAI => "openai",
             Self::Anthropic => "anthropic",
             Self::ClaudeOAuth => "claude-oauth",
             Self::CodexOAuth => "codex-oauth",
@@ -116,7 +116,7 @@ pub async fn dispatch_non_stream(
         "dispatch non-stream"
     );
     match kind {
-        ProviderKind::OpenAi => openai_non_stream(resolved, request, auth, rate_limit_sink).await,
+        ProviderKind::OpenAI => openai_non_stream(resolved, request, auth, rate_limit_sink).await,
         ProviderKind::Anthropic => {
             anthropic_non_stream(resolved, request, auth, rate_limit_sink).await
         }
@@ -156,7 +156,7 @@ pub async fn dispatch_stream(
         "dispatch stream"
     );
     match kind {
-        ProviderKind::OpenAi => openai_stream(resolved, request, auth, rate_limit_sink).await,
+        ProviderKind::OpenAI => openai_stream(resolved, request, auth, rate_limit_sink).await,
         ProviderKind::Anthropic => anthropic_stream(resolved, request, auth, rate_limit_sink).await,
         ProviderKind::ClaudeOAuth => {
             claude_oauth_stream(resolved, request, auth, rate_limit_sink).await
@@ -201,7 +201,7 @@ async fn codex_oauth_compact(
     auth: &UpstreamAuth,
     rate_limit_sink: Option<RateLimitHeaderSink>,
 ) -> Result<serde_json::Value, ProviderError> {
-    use conduit_codec::{prepare_responses_compact_body, OpenAiResponsesCodec};
+    use conduit_codec::{prepare_responses_compact_body, OpenAIResponsesCodec};
     let base_url = resolved
         .base_url
         .as_deref()
@@ -231,7 +231,7 @@ async fn codex_oauth_compact(
     };
     let prepared = prepare_responses_compact_body(body, &model);
     // Type param is unused for compact (raw JSON path) but required by ProviderClient.
-    ProviderClient::<OpenAiResponsesCodec>::new(cfg)
+    ProviderClient::<OpenAIResponsesCodec>::new(cfg)
         .responses_compact(prepared, &auth.token)
         .await
 }
@@ -249,7 +249,7 @@ async fn openai_non_stream(
     auth: &UpstreamAuth,
     rate_limit_sink: Option<RateLimitHeaderSink>,
 ) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
-    use conduit_codec::openai::OpenAiCodec;
+    use conduit_codec::openai::OpenAICodec;
     let base_url = resolved
         .base_url
         .as_deref()
@@ -259,7 +259,7 @@ async fn openai_non_stream(
         cfg = cfg.with_extra_headers(auth.extra_headers.clone());
     }
     cfg = apply_sink(cfg.with_request_overrides(resolved.request_overrides.clone()), rate_limit_sink);
-    ProviderClient::<OpenAiCodec>::new(cfg)
+    ProviderClient::<OpenAICodec>::new(cfg)
         .chat(request, &auth.token)
         .await
 }
@@ -419,7 +419,7 @@ async fn grok_oauth_non_stream(
     rate_limit_sink: Option<RateLimitHeaderSink>,
 ) -> Result<(CanonicalChatResponse, LossReport), ProviderError> {
     // CLIProxyAPI parity: OAuth chat → cli-chat-proxy (unless using_api) + Responses API.
-    use conduit_codec::OpenAiResponsesCodec;
+    use conduit_codec::OpenAIResponsesCodec;
     use conduit_oauth::{cli_proxy_headers, is_cli_chat_proxy_base, resolve_oauth_chat_base};
     let using_api = grok_using_api(resolved, auth);
     let base = resolve_oauth_chat_base(resolved.base_url.as_deref(), using_api);
@@ -437,7 +437,7 @@ async fn grok_oauth_non_stream(
             .with_request_overrides(resolved.request_overrides.clone()),
         rate_limit_sink,
     );
-    ProviderClient::<OpenAiResponsesCodec>::new(cfg)
+    ProviderClient::<OpenAIResponsesCodec>::new(cfg)
         .chat(request, &auth.token)
         .await
 }
@@ -454,7 +454,7 @@ async fn openai_stream(
     ),
     ProviderError,
 > {
-    use conduit_codec::openai::OpenAiCodec;
+    use conduit_codec::openai::OpenAICodec;
     let base_url = resolved
         .base_url
         .as_deref()
@@ -464,7 +464,7 @@ async fn openai_stream(
         cfg = cfg.with_extra_headers(auth.extra_headers.clone());
     }
     cfg = apply_sink(cfg.with_request_overrides(resolved.request_overrides.clone()), rate_limit_sink);
-    ProviderClient::<OpenAiCodec>::new(cfg)
+    ProviderClient::<OpenAICodec>::new(cfg)
         .chat_stream(request, &auth.token)
         .await
 }
@@ -540,7 +540,7 @@ async fn codex_oauth_stream(
     ),
     ProviderError,
 > {
-    use conduit_codec::OpenAiResponsesCodec;
+    use conduit_codec::OpenAIResponsesCodec;
     let req = sanitize_codex_request(request);
     let base = resolved
         .base_url
@@ -551,7 +551,7 @@ async fn codex_oauth_stream(
             .with_request_overrides(resolved.request_overrides.clone()),
         rate_limit_sink,
     );
-    ProviderClient::<OpenAiResponsesCodec>::new(cfg)
+    ProviderClient::<OpenAIResponsesCodec>::new(cfg)
         .chat_stream(&req, &auth.token)
         .await
 }
@@ -568,7 +568,7 @@ async fn grok_oauth_stream(
     ),
     ProviderError,
 > {
-    use conduit_codec::OpenAiResponsesCodec;
+    use conduit_codec::OpenAIResponsesCodec;
     use conduit_oauth::{cli_proxy_headers, is_cli_chat_proxy_base, resolve_oauth_chat_base};
     let using_api = grok_using_api(resolved, auth);
     let base = resolve_oauth_chat_base(resolved.base_url.as_deref(), using_api);
@@ -585,7 +585,7 @@ async fn grok_oauth_stream(
             .with_request_overrides(resolved.request_overrides.clone()),
         rate_limit_sink,
     );
-    ProviderClient::<OpenAiResponsesCodec>::new(cfg)
+    ProviderClient::<OpenAIResponsesCodec>::new(cfg)
         .chat_stream(request, &auth.token)
         .await
 }
@@ -618,7 +618,7 @@ mod tests {
 
     #[test]
     fn parse_known_kinds() {
-        assert_eq!(ProviderKind::parse("openai").unwrap(), ProviderKind::OpenAi);
+        assert_eq!(ProviderKind::parse("openai").unwrap(), ProviderKind::OpenAI);
         assert_eq!(
             ProviderKind::parse("anthropic").unwrap(),
             ProviderKind::Anthropic

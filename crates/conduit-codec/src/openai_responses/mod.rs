@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 
 use crate::WireCodec;
 
-pub struct OpenAiResponsesCodec;
+pub struct OpenAIResponsesCodec;
 
 /// Durable state required to expand a Responses `previous_response_id` turn.
 ///
@@ -799,7 +799,7 @@ pub fn apply_codex_chatgpt_account_body(mut body: Value) -> Value {
     body
 }
 
-impl WireCodec for OpenAiResponsesCodec {
+impl WireCodec for OpenAIResponsesCodec {
     fn encode_request(req: &CanonicalChatRequest, stream: bool) -> (Value, LossReport) {
         let mut loss = LossReport::default();
         let mut input: Vec<Value> = Vec::new();
@@ -2028,7 +2028,7 @@ mod tests {
                 CanonicalMessage::user("hello"),
             ],
         );
-        let (wire, _) = OpenAiResponsesCodec::encode_request(&req, false);
+        let (wire, _) = OpenAIResponsesCodec::encode_request(&req, false);
         assert_eq!(wire["model"], "gpt-5");
         assert!(wire["input"].as_array().unwrap().len() >= 2);
         assert_eq!(wire["stream"], false);
@@ -2059,7 +2059,7 @@ mod tests {
             "service_tier": "priority",
             "stream": true
         });
-        let req = OpenAiResponsesCodec::decode_request(
+        let req = OpenAIResponsesCodec::decode_request(
             body,
             "gpt-5".into(),
             true,
@@ -2103,7 +2103,7 @@ mod tests {
             }]
         });
 
-        let error = OpenAiResponsesCodec::decode_request(
+        let error = OpenAIResponsesCodec::decode_request(
             body,
             "gpt-5".into(),
             false,
@@ -2225,7 +2225,7 @@ mod tests {
             tool_name: Some("search".into()),
             ..Default::default()
         };
-        let tool_frame = OpenAiResponsesCodec::encode_chunk(&tool_start, "resp_1")
+        let tool_frame = OpenAIResponsesCodec::encode_chunk(&tool_start, "resp_1")
             .0
             .expect("tool start must emit an SSE frame");
         assert!(tool_frame.contains("response.output_item.added"));
@@ -2241,7 +2241,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let terminal_frame = OpenAiResponsesCodec::encode_chunk(&terminal, "resp_1")
+        let terminal_frame = OpenAIResponsesCodec::encode_chunk(&terminal, "resp_1")
             .0
             .expect("terminal chunk must emit an SSE frame");
         assert!(terminal_frame.contains("response.completed"));
@@ -2305,7 +2305,7 @@ mod tests {
         let mut req = req;
         req.sampling.temperature = Some(0.2);
         req.sampling.max_tokens = Some(64);
-        let (wire, _) = OpenAiResponsesCodec::encode_request(&req, false);
+        let (wire, _) = OpenAIResponsesCodec::encode_request(&req, false);
         let wire = apply_codex_chatgpt_account_body(wire);
         assert_eq!(wire["stream"], true);
         assert_eq!(wire["store"], false);
@@ -2334,7 +2334,7 @@ mod tests {
             }],
             "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
         });
-        let (resp, _) = OpenAiResponsesCodec::decode_response(body, "gpt-5").unwrap();
+        let (resp, _) = OpenAIResponsesCodec::decode_response(body, "gpt-5").unwrap();
         assert_eq!(resp.id, "resp_1");
         assert_eq!(content_to_text(&resp.choices[0].content), "hi there");
         assert_eq!(resp.usage.total_tokens, 5);
@@ -2343,7 +2343,7 @@ mod tests {
     #[test]
     fn decode_text_delta_chunk() {
         let data = r#"{"type":"response.output_text.delta","delta":"Hello"}"#;
-        let (chunks, _) = OpenAiResponsesCodec::decode_chunk(data).unwrap();
+        let (chunks, _) = OpenAIResponsesCodec::decode_chunk(data).unwrap();
         assert_eq!(chunks.len(), 1);
         match &chunks[0].delta {
             Some(BlockDelta::TextDelta { text }) => assert_eq!(text, "Hello"),
@@ -2354,7 +2354,7 @@ mod tests {
     #[test]
     fn decode_reasoning_summary_delta() {
         let data = r#"{"type":"response.reasoning_summary_text.delta","delta":"plan"}"#;
-        let (chunks, _) = OpenAiResponsesCodec::decode_chunk(data).unwrap();
+        let (chunks, _) = OpenAIResponsesCodec::decode_chunk(data).unwrap();
         assert!(matches!(
             &chunks[0].delta,
             Some(BlockDelta::ThinkingDelta { thinking }) if thinking == "plan"
@@ -2365,12 +2365,12 @@ mod tests {
     fn decode_function_call_added_and_args() {
         let mut st = ResponsesStreamState::default();
         let added = r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c1","name":"search"}}"#;
-        let (chunks, _) = OpenAiResponsesCodec::decode_chunk_stateful(&mut st, added).unwrap();
+        let (chunks, _) = OpenAIResponsesCodec::decode_chunk_stateful(&mut st, added).unwrap();
         assert_eq!(chunks[0].tool_use_id.as_deref(), Some("c1"));
         assert_eq!(chunks[0].tool_name.as_deref(), Some("search"));
 
         let args = r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"q\":1}"}"#;
-        let (chunks, _) = OpenAiResponsesCodec::decode_chunk_stateful(&mut st, args).unwrap();
+        let (chunks, _) = OpenAIResponsesCodec::decode_chunk_stateful(&mut st, args).unwrap();
         assert!(matches!(
             &chunks[0].delta,
             Some(BlockDelta::InputJsonDelta { partial_json }) if partial_json.contains("q")
@@ -2382,7 +2382,7 @@ mod tests {
     #[test]
     fn decode_tool_args_not_duplicated_after_deltas() {
         let mut st = ResponsesStreamState::default();
-        let _ = OpenAiResponsesCodec::decode_chunk_stateful(
+        let _ = OpenAIResponsesCodec::decode_chunk_stateful(
             &mut st,
             r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c1","name":"Bash","arguments":""}}"#,
         )
@@ -2392,11 +2392,11 @@ mod tests {
                 r#"{{"type":"response.function_call_arguments.delta","output_index":0,"delta":{}}}"#,
                 serde_json::to_string(part).unwrap()
             );
-            let (chunks, _) = OpenAiResponsesCodec::decode_chunk_stateful(&mut st, &ev).unwrap();
+            let (chunks, _) = OpenAIResponsesCodec::decode_chunk_stateful(&mut st, &ev).unwrap();
             assert_eq!(chunks.len(), 1);
         }
         // .done with full args must be ignored
-        let (chunks, _) = OpenAiResponsesCodec::decode_chunk_stateful(
+        let (chunks, _) = OpenAIResponsesCodec::decode_chunk_stateful(
             &mut st,
             r#"{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"command\":\"pwd\"}"}"#,
         )
@@ -2404,7 +2404,7 @@ mod tests {
         assert!(chunks.is_empty(), "done must not re-emit args: {chunks:?}");
 
         // output_item.done must not re-emit
-        let (chunks, _) = OpenAiResponsesCodec::decode_chunk_stateful(
+        let (chunks, _) = OpenAIResponsesCodec::decode_chunk_stateful(
             &mut st,
             r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"c1","name":"Bash","arguments":"{\"command\":\"pwd\"}"}}"#,
         )
@@ -2415,7 +2415,7 @@ mod tests {
         );
 
         // completed must not re-emit tool args
-        let (chunks, _) = OpenAiResponsesCodec::decode_chunk_stateful(
+        let (chunks, _) = OpenAIResponsesCodec::decode_chunk_stateful(
             &mut st,
             r#"{"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},"output":[{"type":"function_call","call_id":"c1","name":"Bash","arguments":"{\"command\":\"pwd\"}"}]}}"#,
         )
@@ -2437,7 +2437,7 @@ mod tests {
             r#"{"type":"response.completed","response":{"id":"r1","output":[{"type":"function_call","call_id":"c1","name":"Bash","arguments":"{\"command\":\"pwd\"}"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#,
         ];
         for ev in events {
-            let (chunks, _) = OpenAiResponsesCodec::decode_chunk_stateful(&mut st2, ev).unwrap();
+            let (chunks, _) = OpenAIResponsesCodec::decode_chunk_stateful(&mut st2, ev).unwrap();
             for c in chunks {
                 if let Some(BlockDelta::InputJsonDelta { partial_json }) = c.delta {
                     acc.push_str(&partial_json);
@@ -2462,7 +2462,7 @@ mod tests {
                 ]
             }
         }"#;
-        let (chunks, _) = OpenAiResponsesCodec::decode_chunk(data).unwrap();
+        let (chunks, _) = OpenAIResponsesCodec::decode_chunk(data).unwrap();
         assert!(
             chunks.iter().any(|c| matches!(
                 &c.delta,
@@ -2486,7 +2486,7 @@ mod tests {
     fn decode_completed_skips_text_if_already_streamed() {
         let mut st = ResponsesStreamState::default();
         let delta = r#"{"type":"response.output_text.delta","delta":"hi"}"#;
-        let _ = OpenAiResponsesCodec::decode_chunk_stateful(&mut st, delta).unwrap();
+        let _ = OpenAIResponsesCodec::decode_chunk_stateful(&mut st, delta).unwrap();
         let done = r#"{
             "type":"response.completed",
             "response":{
@@ -2495,7 +2495,7 @@ mod tests {
                 "output":[{"type":"message","content":[{"type":"output_text","text":"hi DUPLICATE"}]}]
             }
         }"#;
-        let (chunks, _) = OpenAiResponsesCodec::decode_chunk_stateful(&mut st, done).unwrap();
+        let (chunks, _) = OpenAIResponsesCodec::decode_chunk_stateful(&mut st, done).unwrap();
         assert!(
             !chunks.iter().any(|c| matches!(
                 &c.delta,
@@ -2525,7 +2525,7 @@ mod tests {
             name: None,
         };
         let req = CanonicalChatRequest::new("gpt-5.6-terra", vec![msg]);
-        let (wire, _) = OpenAiResponsesCodec::encode_request(&req, true);
+        let (wire, _) = OpenAIResponsesCodec::encode_request(&req, true);
         let input = wire["input"].as_array().unwrap();
         assert_eq!(input[0]["type"], "function_call_output");
         assert_eq!(input[0]["call_id"], "c1");

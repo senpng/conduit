@@ -281,7 +281,7 @@ fn collect_reasoning_node(node: &Value, out: &mut Vec<String>) {
 /// - Stamps `id` / `object` / `model` on every chunk.
 /// - Emits a role-only first frame (`delta.role = "assistant"`) before content.
 /// - Ends with `data: [DONE]` via [`Self::finish`].
-pub struct OpenAiStreamEncoder {
+pub struct OpenAIStreamEncoder {
     resp_id: String,
     model: String,
     /// Unix seconds, captured at stream open and reused for every frame.
@@ -290,7 +290,7 @@ pub struct OpenAiStreamEncoder {
     finished: bool,
 }
 
-impl OpenAiStreamEncoder {
+impl OpenAIStreamEncoder {
     pub fn new(resp_id: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             resp_id: resp_id.into(),
@@ -360,7 +360,7 @@ impl OpenAiStreamEncoder {
 /// Encode a canonical chunk into an OpenAI SSE `data: {...}\n\n` line.
 ///
 /// Stateless helper (each call uses `Utc::now()` for `created`). Prefer
-/// [`OpenAiStreamEncoder`] on the gateway hot path for fixed `created` + role.
+/// [`OpenAIStreamEncoder`] on the gateway hot path for fixed `created` + role.
 pub fn encode_chunk(chunk: &CanonicalChunk, resp_id: &str) -> Option<String> {
     encode_chunk_with_model(chunk, resp_id, "")
 }
@@ -540,7 +540,7 @@ mod tests {
 
     #[test]
     fn stream_encoder_fixes_created_emits_role_and_done() {
-        let mut enc = OpenAiStreamEncoder::new("chatcmpl_1", "grok-4.5");
+        let mut enc = OpenAIStreamEncoder::new("chatcmpl_1", "grok-4.5");
         let created = enc.created();
 
         let frames = enc.push(&CanonicalChunk::text_delta("hi"));

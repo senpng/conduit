@@ -17,9 +17,9 @@ pub use responses_to_chat::{
     convert_responses_to_chat_completions, should_treat_as_responses_format,
 };
 
-pub struct OpenAiCodec;
+pub struct OpenAICodec;
 
-impl WireCodec for OpenAiCodec {
+impl WireCodec for OpenAICodec {
     fn encode_request(req: &CanonicalChatRequest, stream: bool) -> (Value, LossReport) {
         let mut cloned = req.clone();
         let loss = degrade_tool_choice(&mut cloned);
@@ -178,10 +178,10 @@ impl WireCodec for OpenAiCodec {
     }
 }
 
-impl OpenAiCodec {
+impl OpenAICodec {
     /// Encode a stream chunk with an explicit model / route alias.
     ///
-    /// Prefer [`OpenAiStreamEncoder`] on the gateway path for CLIProxyAPI-parity
+    /// Prefer [`OpenAIStreamEncoder`] on the gateway path for CLIProxyAPI-parity
     /// (fixed `created`, role kickoff, `[DONE]`).
     pub fn encode_chunk_with_model(
         chunk: &CanonicalChunk,
@@ -195,7 +195,7 @@ impl OpenAiCodec {
     }
 }
 
-pub use stream::OpenAiStreamEncoder;
+pub use stream::OpenAIStreamEncoder;
 
 /// If `tool_choice` is `AnyOf`, degrade to `Required` on the cloned request
 /// and return the loss.
@@ -238,7 +238,7 @@ mod tests {
             });
             r
         };
-        let (wire, loss) = OpenAiCodec::encode_request(&req_orig, false);
+        let (wire, loss) = OpenAICodec::encode_request(&req_orig, false);
         assert_eq!(wire["tool_choice"].as_str().unwrap(), "required");
         // The original request is not mutated.
         assert!(matches!(
@@ -284,7 +284,7 @@ mod tests {
             },
             created_at: chrono::Utc::now(),
         };
-        let wire = OpenAiCodec::encode_response(&resp);
+        let wire = OpenAICodec::encode_response(&resp);
         assert_eq!(
             wire["choices"][0]["message"]["content"].as_str().unwrap(),
             "Hello!"
@@ -319,7 +319,7 @@ mod tests {
             usage: Usage::default(),
             created_at: chrono::Utc::now(),
         };
-        let wire = OpenAiCodec::encode_response(&resp);
+        let wire = OpenAICodec::encode_response(&resp);
         let msg = &wire["choices"][0]["message"];
         assert_eq!(msg["content"].as_str().unwrap(), "Calling tools");
         assert_eq!(msg["tool_calls"][0]["id"].as_str().unwrap(), "call_1");
@@ -348,7 +348,7 @@ mod tests {
             },
             created_at: chrono::Utc::now(),
         };
-        let wire = OpenAiCodec::encode_response(&resp);
+        let wire = OpenAICodec::encode_response(&resp);
         assert_eq!(
             wire["usage"]["prompt_tokens_details"]["cached_tokens"]
                 .as_u64()
@@ -380,7 +380,7 @@ mod tests {
             },
             created_at: chrono::Utc::now(),
         };
-        let wire = OpenAiCodec::encode_response(&resp);
+        let wire = OpenAICodec::encode_response(&resp);
         assert!(wire["usage"].get("prompt_tokens_details").is_none());
         assert!(wire["usage"].get("completion_tokens_details").is_none());
     }

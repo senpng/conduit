@@ -807,13 +807,13 @@ mod tests {
 
     #[test]
     fn compact_url_appends_compact_to_responses_base() {
-        use conduit_codec::OpenAiResponsesCodec;
+        use conduit_codec::OpenAIResponsesCodec;
         let cfg = ProviderClientConfig::codex_oauth(
             "codex-1",
             "https://chatgpt.com/backend-api/codex",
             vec![],
         );
-        let client = ProviderClient::<OpenAiResponsesCodec>::new(cfg);
+        let client = ProviderClient::<OpenAIResponsesCodec>::new(cfg);
         assert_eq!(
             client.compact_url(),
             "https://chatgpt.com/backend-api/codex/responses/compact"
@@ -823,7 +823,7 @@ mod tests {
             "https://example.com/backend-api/codex/responses",
             vec![],
         );
-        let client2 = ProviderClient::<OpenAiResponsesCodec>::new(cfg2);
+        let client2 = ProviderClient::<OpenAIResponsesCodec>::new(cfg2);
         assert_eq!(
             client2.compact_url(),
             "https://example.com/backend-api/codex/responses/compact"
@@ -832,7 +832,7 @@ mod tests {
 
     #[tokio::test]
     async fn responses_compact_posts_to_compact_path_and_returns_json() {
-        use conduit_codec::OpenAiResponsesCodec;
+        use conduit_codec::OpenAIResponsesCodec;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -848,7 +848,7 @@ mod tests {
             .await;
 
         let cfg = ProviderClientConfig::codex_oauth("codex-test", server.uri(), vec![]);
-        let client = ProviderClient::<OpenAiResponsesCodec>::new(cfg);
+        let client = ProviderClient::<OpenAIResponsesCodec>::new(cfg);
         let body = json!({
             "model": "gpt-5.4",
             "instructions": "",

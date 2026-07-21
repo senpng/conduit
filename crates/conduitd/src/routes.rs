@@ -10,9 +10,9 @@ use axum::{
     Json,
 };
 use conduit_codec::{
-    anthropic::AnthropicCodec, convert_responses_to_chat_completions, openai::OpenAiCodec,
+    anthropic::AnthropicCodec, convert_responses_to_chat_completions, openai::OpenAICodec,
     response_output_items, responses_store_enabled, should_treat_as_responses_format,
-    OpenAiResponsesCodec, ResponsesStreamEncoder, WireCodec,
+    OpenAIResponsesCodec, ResponsesStreamEncoder, WireCodec,
 };
 use conduit_ir::error::GatewayError;
 use conduit_store::ResponseContinuationRepo;
@@ -204,7 +204,7 @@ pub async fn responses(
             return with_request_id(
                 (
                     StatusCode::BAD_REQUEST,
-                    Json(OpenAiResponsesCodec::error_body(
+                    Json(OpenAIResponsesCodec::error_body(
                         "invalid_request_error",
                         None,
                         "model field required",
@@ -238,7 +238,7 @@ pub async fn responses(
             return with_request_id(
                 (
                     StatusCode::BAD_REQUEST,
-                    Json(OpenAiResponsesCodec::error_body(
+                    Json(OpenAIResponsesCodec::error_body(
                         "invalid_request_error",
                         None,
                         &format!(
@@ -259,7 +259,7 @@ pub async fn responses(
             return with_request_id(
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    Json(OpenAiResponsesCodec::error_body(
+                    Json(OpenAIResponsesCodec::error_body(
                         "server_error",
                         None,
                         "responses continuation store unavailable",
@@ -272,7 +272,7 @@ pub async fn responses(
     };
     let continuation_input = adapted_body.get("input").cloned().unwrap_or(Value::Null);
 
-    let canonical_req = match OpenAiResponsesCodec::decode_request(
+    let canonical_req = match OpenAIResponsesCodec::decode_request(
         adapted_body,
         alias.clone(),
         stream,
@@ -292,7 +292,7 @@ pub async fn responses(
             return with_request_id(
                 (
                     StatusCode::BAD_REQUEST,
-                    Json(OpenAiResponsesCodec::error_body(
+                    Json(OpenAIResponsesCodec::error_body(
                         "invalid_request_error",
                         None,
                         &msg,
@@ -326,7 +326,7 @@ pub async fn responses(
                 stream = false,
                 "gateway response complete"
             );
-            let mut response = OpenAiResponsesCodec::encode_response(&response);
+            let mut response = OpenAIResponsesCodec::encode_response(&response);
             response["store"] = Value::Bool(store_continuation);
             if store_continuation {
                 if let Err(error) = persist_continuation(
@@ -381,7 +381,7 @@ pub async fn responses(
                                 error = %error,
                                 "gateway responses stream chunk error"
                             );
-                            vec![OpenAiResponsesCodec::stream_error_sse(&error.to_string())]
+                            vec![OpenAIResponsesCodec::stream_error_sse(&error.to_string())]
                         }
                     };
                     if is_terminal && store_continuation {
@@ -443,7 +443,7 @@ pub async fn responses(
             with_request_id(
                 (
                     status,
-                    Json(OpenAiResponsesCodec::error_body(
+                    Json(OpenAIResponsesCodec::error_body(
                         "error",
                         None,
                         &error.to_string(),
@@ -477,7 +477,7 @@ pub async fn responses_compact(
         return with_request_id(
             (
                 StatusCode::BAD_REQUEST,
-                Json(OpenAiResponsesCodec::error_body(
+                Json(OpenAIResponsesCodec::error_body(
                     "invalid_request_error",
                     None,
                     "Streaming not supported for compact responses",
@@ -493,7 +493,7 @@ pub async fn responses_compact(
             return with_request_id(
                 (
                     StatusCode::BAD_REQUEST,
-                    Json(OpenAiResponsesCodec::error_body(
+                    Json(OpenAIResponsesCodec::error_body(
                         "invalid_request_error",
                         None,
                         "model field required",
@@ -546,7 +546,7 @@ pub async fn responses_compact(
             with_request_id(
                 (
                     status,
-                    Json(OpenAiResponsesCodec::error_body(
+                    Json(OpenAIResponsesCodec::error_body(
                         "error",
                         None,
                         &error.to_string(),
@@ -657,7 +657,7 @@ pub async fn chat_completions(
             return with_request_id(
                 (
                     StatusCode::BAD_REQUEST,
-                    Json(OpenAiCodec::error_body(
+                    Json(OpenAICodec::error_body(
                         "invalid_request_error",
                         None,
                         "model field required",
@@ -678,7 +678,7 @@ pub async fn chat_completions(
         "gateway request accept"
     );
 
-    let canonical_req = match OpenAiCodec::decode_request(
+    let canonical_req = match OpenAICodec::decode_request(
         body.clone(),
         alias.clone(),
         stream,
@@ -698,7 +698,7 @@ pub async fn chat_completions(
             return with_request_id(
                 (
                     StatusCode::BAD_REQUEST,
-                    Json(OpenAiCodec::error_body(
+                    Json(OpenAICodec::error_body(
                         "invalid_request_error",
                         None,
                         &msg,
@@ -729,7 +729,7 @@ pub async fn chat_completions(
                 stream = false,
                 "gateway response complete"
             );
-            let body = OpenAiCodec::encode_response(&resp);
+            let body = OpenAICodec::encode_response(&resp);
             with_request_id(Json(body).into_response(), &request_id)
         }
         Ok(conduit_pipeline::handle::PipelineResult::Streaming(stream)) => {
@@ -746,7 +746,7 @@ pub async fn chat_completions(
             let stream_request_id = request_id.clone();
             let sse_stream = async_stream::stream! {
                 let mut encoder =
-                    conduit_codec::openai::OpenAiStreamEncoder::new(resp_id.clone(), model);
+                    conduit_codec::openai::OpenAIStreamEncoder::new(resp_id.clone(), model);
                 let mut stream = stream;
                 while let Some(result) = stream.next().await {
                     match result {
@@ -763,7 +763,7 @@ pub async fn chat_completions(
                                 error = %e,
                                 "gateway stream chunk error"
                             );
-                            yield Ok(OpenAiCodec::stream_error_sse(&e.to_string()));
+                            yield Ok(OpenAICodec::stream_error_sse(&e.to_string()));
                         }
                     }
                 }
@@ -793,20 +793,20 @@ pub async fn chat_completions(
             let status = status_for_gateway_error(&e);
             let body = match &e {
                 GatewayError::Unauthorized(msg) => {
-                    OpenAiCodec::error_body("authentication_error", Some("invalid_api_key"), msg)
+                    OpenAICodec::error_body("authentication_error", Some("invalid_api_key"), msg)
                 }
-                GatewayError::Routing(msg) => OpenAiCodec::error_body("not_found_error", None, msg),
+                GatewayError::Routing(msg) => OpenAICodec::error_body("not_found_error", None, msg),
                 GatewayError::Quota(conduit_ir::error::QuotaError::RateLimitExceeded {
                     ..
-                }) => OpenAiCodec::error_body(
+                }) => OpenAICodec::error_body(
                     "rate_limit_error",
                     Some("rate_limit_exceeded"),
                     "rate limit exceeded",
                 ),
                 GatewayError::Quota(qe) => {
-                    OpenAiCodec::error_body("permission_error", None, &qe.to_string())
+                    OpenAICodec::error_body("permission_error", None, &qe.to_string())
                 }
-                other => OpenAiCodec::error_body("upstream_error", None, &other.to_string()),
+                other => OpenAICodec::error_body("upstream_error", None, &other.to_string()),
             };
             // One record per failure. Upstream faults are WARN; classified client
             // errors (401/404/429) are routine and log at DEBUG to avoid noise.
@@ -1167,7 +1167,7 @@ mod auth_status_tests {
             chat.get("messages").and_then(|m| m.as_array()).is_some(),
             "conversion must produce messages: {chat}"
         );
-        let req = OpenAiCodec::decode_request(
+        let req = OpenAICodec::decode_request(
             chat,
             "gpt-4o".into(),
             false,
@@ -1283,7 +1283,7 @@ mod auth_status_tests {
             "conversation_id": "conv-live-1",
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let req = OpenAiCodec::decode_request(body, "gpt-4o".into(), false, "req-1".into(), "k1".into())
+        let req = OpenAICodec::decode_request(body, "gpt-4o".into(), false, "req-1".into(), "k1".into())
             .expect("decode openai request");
         assert_eq!(
             req.meta

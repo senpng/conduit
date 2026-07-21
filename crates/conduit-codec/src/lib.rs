@@ -8,13 +8,13 @@ use conduit_ir::{
     loss::LossReport,
 };
 pub use openai::{
-    convert_responses_to_chat_completions, should_treat_as_responses_format, OpenAiCodec,
+    convert_responses_to_chat_completions, should_treat_as_responses_format, OpenAICodec,
 };
 pub use openai_responses::{
     apply_codex_chatgpt_account_body, can_reset_responses_continuation,
     merge_responses_continuation, prepare_responses_compact_body, prepare_responses_continuation,
     reset_responses_continuation, response_output_items, responses_store_enabled,
-    sanitize_responses_reasoning_encrypted_content, OpenAiResponsesCodec, ResponsesContinuation,
+    sanitize_responses_reasoning_encrypted_content, OpenAIResponsesCodec, ResponsesContinuation,
     ResponsesContinuationRequest, ResponsesStreamEncoder,
 };
 use serde_json::Value;

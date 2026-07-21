@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn converted_body_decodes_via_chat_codec() {
-        use crate::openai::OpenAiCodec;
+        use crate::openai::OpenAICodec;
         use crate::WireCodec;
 
         let body = json!({
@@ -527,7 +527,7 @@ mod tests {
         assert!(should_treat_as_responses_format(&body));
         let chat = convert_responses_to_chat_completions(&body, false);
         assert!(chat.get("messages").is_some());
-        let req = OpenAiCodec::decode_request(
+        let req = OpenAICodec::decode_request(
             chat,
             "gpt-4o".into(),
             false,
