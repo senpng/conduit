@@ -21,7 +21,10 @@ pub mod proxy;
 pub mod refresh;
 pub mod resolver;
 pub mod session;
-pub mod usage;
+/// Subscription **remaining-quota** probe (how much upstream capacity is left).
+/// Distinct from the daemon's request **usage ledger** (`conduit-store`), which
+/// records what *this* gateway spent — the two share no types.
+pub mod quota_probe;
 
 pub use credential::{
     oauth_extra_headers, AuthMode, OAuthCredential, OAuthProviderKind, ResolvedCredential,
@@ -44,9 +47,9 @@ pub use proxy::{env_no_proxy, env_proxy_url, resolve_effective_proxy};
 pub use refresh::RefreshCoordinator;
 pub use resolver::{CredentialResolver, SecretStore};
 pub use session::{OAuthSession, SessionStatus, SessionStore, SessionView, SESSION_TTL};
-pub use usage::{
+pub use quota_probe::{
     fetch_oauth_usage, format_remaining_short, is_billing_source, parse_claude_usage,
-    parse_codex_usage, parse_grok_billing_protobuf, OauthUsage, UsageWindow,
+    parse_codex_usage, parse_grok_billing_protobuf, OAuthQuotaProbe, QuotaWindow,
 };
 
 /// Metadata for console UI listing.

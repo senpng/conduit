@@ -9,6 +9,12 @@
 //! Mirrors CodexBar's OAuth remaining strategy: reuse the stored OAuth access
 //! token, call the same private usage/billing APIs the official CLIs use, and
 //! normalize to **remaining percent** (0–100) for the console / TUI.
+//!
+//! Not to be confused with the daemon's request **usage ledger**
+//! (`conduit-store::usage_repo`): that records what this gateway *spent*, while
+//! this probe reports how much subscription quota is *left upstream*. The two
+//! are separate concerns and share no types — hence [`OAuthQuotaProbe`] /
+//! [`QuotaWindow`] here rather than a "usage" name.
 
 use serde_json::Value;
 use secrecy::ExposeSecret;
@@ -27,9 +33,9 @@ const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const GROK_BILLING_URL: &str =
     "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig";
 
-/// One rolling usage window (session / weekly / monthly credits).
+/// One rolling quota window (session / weekly / monthly credits).
 #[derive(Debug, Clone, PartialEq)]
-pub struct UsageWindow {
+pub struct QuotaWindow {
     /// Remaining capacity as 0–100 percent.
     pub remaining_pct: f64,
     /// Used capacity as 0–100 percent (when known).
@@ -38,14 +44,14 @@ pub struct UsageWindow {
     pub resets_at: Option<String>,
 }
 
-/// Normalized OAuth subscription usage for display.
+/// Normalized OAuth subscription remaining-quota snapshot for display.
 #[derive(Debug, Clone, PartialEq)]
-pub struct OauthUsage {
+pub struct OAuthQuotaProbe {
     pub provider_kind: OAuthProviderKind,
     /// Session / short window (≈5h for Claude; Codex no longer exposes this).
-    pub session: Option<UsageWindow>,
+    pub session: Option<QuotaWindow>,
     /// Longer window: weekly for Claude/Codex, **monthly credits** for Grok.
-    pub weekly: Option<UsageWindow>,
+    pub weekly: Option<QuotaWindow>,
     /// Raw source tag for the snapshot store.
     pub source: &'static str,
     /// Short excerpt for debug details.
@@ -57,7 +63,7 @@ pub async fn fetch_oauth_usage(
     kind: OAuthProviderKind,
     resolved: &ResolvedCredential,
     proxy_url: Option<&str>,
-) -> Result<OauthUsage, OAuthError> {
+) -> Result<OAuthQuotaProbe, OAuthError> {
     match kind {
         OAuthProviderKind::Claude => fetch_claude(resolved, proxy_url).await,
         OAuthProviderKind::Codex => fetch_codex(resolved, proxy_url).await,
@@ -76,7 +82,7 @@ async fn build_client(proxy_url: Option<&str>) -> Result<reqwest::Client, OAuthE
 async fn fetch_claude(
     resolved: &ResolvedCredential,
     proxy_url: Option<&str>,
-) -> Result<OauthUsage, OAuthError> {
+) -> Result<OAuthQuotaProbe, OAuthError> {
     let _ = resolved.auth_mode; // token is authoritative
     let client = build_client(proxy_url).await?;
     let token = resolved.access_token.expose_secret();
@@ -113,7 +119,7 @@ async fn fetch_claude(
 async fn fetch_codex(
     resolved: &ResolvedCredential,
     proxy_url: Option<&str>,
-) -> Result<OauthUsage, OAuthError> {
+) -> Result<OAuthQuotaProbe, OAuthError> {
     let client = build_client(proxy_url).await?;
     let token = resolved.access_token.expose_secret();
     let mut req = client
@@ -158,7 +164,7 @@ async fn fetch_codex(
 async fn fetch_grok(
     resolved: &ResolvedCredential,
     proxy_url: Option<&str>,
-) -> Result<OauthUsage, OAuthError> {
+) -> Result<OAuthQuotaProbe, OAuthError> {
     let _ = matches!(resolved.auth_mode, AuthMode::OAuth(OAuthProviderKind::Xai));
     let client = build_client(proxy_url).await?;
     let token = resolved.access_token.expose_secret();
@@ -269,7 +275,7 @@ fn classify_grok_rpc_status(status: i32, message: &str) -> OAuthError {
 }
 
 /// Parse Claude `/api/oauth/usage` JSON into windows.
-pub fn parse_claude_usage(body: &str) -> Result<OauthUsage, OAuthError> {
+pub fn parse_claude_usage(body: &str) -> Result<OAuthQuotaProbe, OAuthError> {
     let v: Value = serde_json::from_str(body)
         .map_err(|e| OAuthError::Provider(format!("claude usage json: {e}")))?;
 
@@ -305,7 +311,7 @@ pub fn parse_claude_usage(body: &str) -> Result<OauthUsage, OAuthError> {
                     .get("resets_at")
                     .and_then(|x| x.as_str())
                     .map(|s| s.to_string());
-                let win = Some(UsageWindow {
+                let win = Some(QuotaWindow {
                     used_pct: normalize_used_pct(used),
                     remaining_pct: used_to_remaining(used),
                     resets_at: resets,
@@ -327,7 +333,7 @@ pub fn parse_claude_usage(body: &str) -> Result<OauthUsage, OAuthError> {
         }
     }
 
-    Ok(OauthUsage {
+    Ok(OAuthQuotaProbe {
         provider_kind: OAuthProviderKind::Claude,
         session,
         weekly,
@@ -336,7 +342,7 @@ pub fn parse_claude_usage(body: &str) -> Result<OauthUsage, OAuthError> {
     })
 }
 
-fn window_from_utilization(node: Option<&Value>) -> Option<UsageWindow> {
+fn window_from_utilization(node: Option<&Value>) -> Option<QuotaWindow> {
     let node = node?;
     if node.is_null() {
         return None;
@@ -354,7 +360,7 @@ fn window_from_utilization(node: Option<&Value>) -> Option<UsageWindow> {
         .get("resets_at")
         .and_then(|x| x.as_str())
         .map(|s| s.to_string());
-    Some(UsageWindow {
+    Some(QuotaWindow {
         used_pct: normalize_used_pct(used),
         remaining_pct: used_to_remaining(used),
         resets_at,
@@ -366,7 +372,7 @@ fn window_from_utilization(node: Option<&Value>) -> Option<UsageWindow> {
 /// Product change: Codex dropped the ≈5h session cap; only the weekly (≈7d)
 /// limit remains. We still classify a short `limit_window_seconds` as session
 /// if upstream ever returns one (legacy dual-window payloads).
-pub fn parse_codex_usage(body: &str) -> Result<OauthUsage, OAuthError> {
+pub fn parse_codex_usage(body: &str) -> Result<OAuthQuotaProbe, OAuthError> {
     let v: Value = serde_json::from_str(body)
         .map_err(|e| OAuthError::Provider(format!("codex usage json: {e}")))?;
 
@@ -436,7 +442,7 @@ pub fn parse_codex_usage(body: &str) -> Result<OauthUsage, OAuthError> {
             "codex usage: no rate_limit windows".into(),
         ));
     }
-    Ok(OauthUsage {
+    Ok(OAuthQuotaProbe {
         provider_kind: OAuthProviderKind::Codex,
         session,
         weekly,
@@ -451,7 +457,7 @@ fn codex_window_secs(node: &Value) -> Option<u64> {
         .and_then(|x| x.as_u64().or_else(|| x.as_i64().map(|i| i.max(0) as u64)))
 }
 
-fn window_from_codex_node(node: Option<&Value>) -> Option<UsageWindow> {
+fn window_from_codex_node(node: Option<&Value>) -> Option<QuotaWindow> {
     let node = node?;
     if node.is_null() {
         return None;
@@ -479,7 +485,7 @@ fn window_from_codex_node(node: Option<&Value>) -> Option<UsageWindow> {
                 None
             }
         });
-    Some(UsageWindow {
+    Some(QuotaWindow {
         used_pct: normalize_used_pct(used),
         remaining_pct: used_to_remaining(used),
         resets_at,
@@ -492,7 +498,7 @@ fn window_from_codex_node(node: Option<&Value>) -> Option<UsageWindow> {
 /// - fixed32 floats in 0..=100 → credit_usage_percent (used %)
 /// - varint unix timestamps ≈ 1.7e9..2.1e9 → period end / reset
 /// - empty usage period with only reset → treat used as 0%
-pub fn parse_grok_billing_protobuf(data: &[u8]) -> Result<OauthUsage, OAuthError> {
+pub fn parse_grok_billing_protobuf(data: &[u8]) -> Result<OAuthQuotaProbe, OAuthError> {
     let mut payloads = grpc_web_data_frames(data);
     if payloads.is_empty() && looks_like_protobuf(data) {
         payloads.push(data.to_vec());
@@ -570,7 +576,7 @@ pub fn parse_grok_billing_protobuf(data: &[u8]) -> Result<OauthUsage, OAuthError
 
     let used_pct = normalize_used_pct(used);
     let remaining_pct = used_to_remaining(used);
-    let monthly = UsageWindow {
+    let monthly = QuotaWindow {
         remaining_pct,
         used_pct,
         resets_at,
@@ -583,7 +589,7 @@ pub fn parse_grok_billing_protobuf(data: &[u8]) -> Result<OauthUsage, OAuthError
         .collect::<Vec<_>>()
         .join(" ");
 
-    Ok(OauthUsage {
+    Ok(OAuthQuotaProbe {
         provider_kind: OAuthProviderKind::Xai,
         // Grok has no 5h session window from this endpoint.
         session: None,
@@ -815,7 +821,7 @@ pub fn used_to_remaining(used: f64) -> f64 {
 /// Claude: `5h 95% · 7d 66%`
 /// Codex: `7d 60%` (weekly only; session only if legacy short window present)
 /// Grok: `mo 72%` (monthly credits remaining)
-pub fn format_remaining_short(usage: &OauthUsage) -> String {
+pub fn format_remaining_short(usage: &OAuthQuotaProbe) -> String {
     match usage.provider_kind {
         OAuthProviderKind::Xai => {
             if let Some(w) = &usage.weekly {
