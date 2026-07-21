@@ -236,8 +236,10 @@ fn draw_status_line(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_keybind_footer(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let binds = app.context_keybinds();
+    // Single-row footer: fit chips to terminal width; overflow becomes "… +N".
+    // Full map is always on `?` (Keyboard reference).
     frame.render_widget(
-        Paragraph::new(keybind_line(theme, &binds)).style(theme.base()),
+        Paragraph::new(keybind_line(theme, &binds, area.width as usize)).style(theme.base()),
         area,
     );
 }

@@ -433,16 +433,97 @@ pub fn modal(
     );
 }
 
-pub fn keybind_line(theme: &Theme, pairs: &[(&str, &str)]) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for (i, (key, label)) in pairs.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled("  ·  ", theme.subtle()));
+/// Display columns for one ` key  label` chip (spaces around key + one before label).
+fn keybind_chip_width(key: &str, label: &str) -> usize {
+    // " {key} " + " {label}"
+    1 + display_width(key) + 1 + 1 + display_width(label)
+}
+
+/// Footer keybind strip: fit as many chips as `max_width` allows, then
+/// `… +N` for the rest (no wrap, no multi-line). Order is left-to-right so
+/// put high-priority binds first (`? help`, `q quit`, …).
+///
+/// When everything fits, behaves like a plain join with `  ·  ` separators.
+pub fn keybind_line(theme: &Theme, pairs: &[(&str, &str)], max_width: usize) -> Line<'static> {
+    if pairs.is_empty() || max_width == 0 {
+        return Line::from("");
+    }
+
+    const SEP: &str = "  ·  ";
+    const SEP_W: usize = 4; // display width of SEP
+
+    // How many leading chips fit, reserving room for an overflow marker when needed.
+    let mut fit = pairs.len();
+    while fit > 0 {
+        let mut w = 0usize;
+        for (i, (k, l)) in pairs[..fit].iter().enumerate() {
+            if i > 0 {
+                w = w.saturating_add(SEP_W);
+            }
+            w = w.saturating_add(keybind_chip_width(k, l));
         }
-        spans.push(Span::styled(format!(" {key} "), theme.key_hint().bg(theme.surface_alt)));
+        let hidden = pairs.len() - fit;
+        let total = if hidden > 0 {
+            // "  ·  … +N"  (N can be multi-digit)
+            let marker = format!("… +{hidden}");
+            w.saturating_add(SEP_W).saturating_add(display_width(&marker))
+        } else {
+            w
+        };
+        if total <= max_width || fit == 1 {
+            break;
+        }
+        fit -= 1;
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, (key, label)) in pairs[..fit].iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(SEP, theme.subtle()));
+        }
+        spans.push(Span::styled(
+            format!(" {key} "),
+            theme.key_hint().bg(theme.surface_alt),
+        ));
         spans.push(Span::styled(format!(" {label}"), theme.muted()));
     }
+    let hidden = pairs.len() - fit;
+    if hidden > 0 {
+        spans.push(Span::styled(SEP, theme.subtle()));
+        spans.push(Span::styled(format!("… +{hidden}"), theme.subtle()));
+    }
     Line::from(spans)
+}
+
+/// How many chips `keybind_line` would show at `max_width` (test helper / diagnostics).
+#[cfg(test)]
+pub fn keybind_fit_count(pairs: &[(&str, &str)], max_width: usize) -> usize {
+    if pairs.is_empty() || max_width == 0 {
+        return 0;
+    }
+    const SEP_W: usize = 4;
+    let mut fit = pairs.len();
+    while fit > 0 {
+        let mut w = 0usize;
+        for (i, (k, l)) in pairs[..fit].iter().enumerate() {
+            if i > 0 {
+                w = w.saturating_add(SEP_W);
+            }
+            w = w.saturating_add(keybind_chip_width(k, l));
+        }
+        let hidden = pairs.len() - fit;
+        let total = if hidden > 0 {
+            let marker = format!("… +{hidden}");
+            w.saturating_add(SEP_W).saturating_add(display_width(&marker))
+        } else {
+            w
+        };
+        if total <= max_width || fit == 1 {
+            break;
+        }
+        fit -= 1;
+    }
+    fit
 }
 
 /// Display columns a string occupies in a terminal cell grid (CJK/emoji = 2,
@@ -641,6 +722,41 @@ mod width_tests {
     fn zero_width_is_empty() {
         assert_eq!(truncate("anything", 0), "");
         assert_eq!(pad_display("x", 0), "");
+    }
+}
+
+#[cfg(test)]
+mod keybind_footer_tests {
+    use super::*;
+
+    #[test]
+    fn wide_enough_shows_all() {
+        let pairs = [("?", "help"), ("q", "quit"), ("r", "refresh")];
+        assert_eq!(keybind_fit_count(&pairs, 200), 3);
+    }
+
+    #[test]
+    fn narrow_truncates_from_right() {
+        // Priority is left-to-right: `? help` should survive first.
+        let pairs = [
+            ("?", "help"),
+            ("q", "quit"),
+            ("r", "refresh"),
+            ("a", "add"),
+            ("e", "edit"),
+            ("d", "delete"),
+            ("/", "filter"),
+        ];
+        // Roughly one chip (~10 cols) + marker.
+        let n = keybind_fit_count(&pairs, 28);
+        assert!(n >= 1, "at least one chip fits");
+        assert!(n < pairs.len(), "must drop some chips at width 28");
+    }
+
+    #[test]
+    fn zero_width_shows_nothing() {
+        let pairs = [("?", "help")];
+        assert_eq!(keybind_fit_count(&pairs, 0), 0);
     }
 }
 
