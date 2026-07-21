@@ -1112,6 +1112,10 @@ pub async fn usage_summary(
             "avg_ttfb_ms": outcome.avg_ttfb_ms,
             "avg_duration_ms": outcome.avg_duration_ms,
             "tokens_per_sec": outcome.tokens_per_sec,
+            // Process-lifetime count of ledger records that could not be
+            // persisted at all (see usage_wire). For a billing ledger this
+            // MUST stay 0; a non-zero value signals a reconciliation gap.
+            "ledger_dropped_records": crate::usage_wire::dropped_records(),
             "key_id": key_id,
             "entries": entries.iter().map(|e| json!({
                 "downstream_key_id": e.downstream_key_id,

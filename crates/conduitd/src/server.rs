@@ -77,7 +77,7 @@ pub async fn run(
     };
 
     // ── Quota engine: RPM + usage ledger ─────────────────────────────────────
-    let record_fn = make_record_fn(pool.clone());
+    let (record_fn, usage_writer) = make_record_fn(pool.clone());
     let quota = Arc::new(InMemoryQuotaEngine::new(record_fn));
 
     // Periodically purge stale RPM buckets so the in-memory counter's memory is
@@ -343,6 +343,14 @@ pub async fn run(
     console_res?;
 
     // ── Graceful shutdown sequence (each step with 30s timeout) ──────────────
+    // Drain the usage ledger writer BEFORE closing the pool: flush every queued
+    // billing record so a normal restart/deploy loses nothing. (Must precede
+    // pool.close() — the writer needs the pool to flush.)
+    info!("draining usage ledger...");
+    if usage_writer.drain(std::time::Duration::from_secs(30)).await {
+        info!("usage ledger drained cleanly");
+    }
+
     info!("closing database...");
     tokio::time::timeout(std::time::Duration::from_secs(30), state.pool.close())
         .await
@@ -523,10 +531,7 @@ pub fn build_console_router(state: Arc<crate::state::DaemonState>) -> Router {
             post(crate::oauth::refresh_provider_oauth),
         )
         // Upstream provider cooldown (429 / usage_limit)
-        .route(
-            "/console/cooldowns",
-            get(crate::console::list_cooldowns),
-        )
+        .route("/console/cooldowns", get(crate::console::list_cooldowns))
         .route(
             "/console/cooldowns",
             delete(crate::console::clear_all_cooldowns),
