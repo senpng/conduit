@@ -119,6 +119,24 @@ If `conduit.toml` is absent, Conduit uses its built-in defaults:
 - data directory: `~/.conduit`
 - tracing: enabled
 
+#### Running in the background
+
+Pass `-d` / `--daemon` (Unix only) to fork `conduitd` into the background,
+detached from the controlling terminal. The child PID is written to a PID file
+(default `~/.conduit/conduitd.pid`, override with `--pid-file` /
+`CONDUIT_PID_FILE`):
+
+```bash
+conduitd -d                            # run detached; PID → ~/.conduit/conduitd.pid
+kill $(cat ~/.conduit/conduitd.pid)    # stop gracefully (SIGTERM drains + closes cleanly)
+```
+
+In daemon mode stdout/stderr are redirected to `/dev/null`, so keep file
+logging enabled (the default) to retain logs — they are written to
+`~/.conduit/logs/conduitd.log`. Because the working directory changes when
+detaching, pass an absolute path to `--config` rather than relying on
+`conduit.toml` discovery in the current directory.
+
 Confirm that the daemon is available:
 
 ```bash
@@ -242,7 +260,7 @@ to_file = true       # write to a daily-rolling file, or false for stdout
 dir = "~/.conduit/logs"   # defaults to <data-dir>/logs
 ```
 
-Every field — and every section, including `[gateway]` and `[log]` — is optional; omit the file entirely to use the built-in defaults, or include just the one section you want to change. For each setting that also has an environment variable or CLI flag (the logging fields, `master_password`, and the gateway port), the resolution order is **environment variable / CLI flag → `conduit.toml` → built-in default** — the environment always wins. The only settings that live *only* in the environment (never the config file) are `CONDUIT_CONFIG`, `CONDUIT_DATA_DIR`, and the `conduitctl` / desktop variables.
+Every field — and every section, including `[gateway]` and `[log]` — is optional; omit the file entirely to use the built-in defaults, or include just the one section you want to change. For each setting that also has an environment variable or CLI flag (the logging fields, `master_password`, and the gateway port), the resolution order is **environment variable / CLI flag → `conduit.toml` → built-in default** — the environment always wins. The only settings that live *only* in the environment (never the config file) are `CONDUIT_CONFIG`, `CONDUIT_DATA_DIR`, `CONDUIT_DAEMON`, `CONDUIT_PID_FILE`, and the `conduitctl` / desktop variables.
 
 The upstream proxy for OAuth and token requests is resolved from several sources, highest priority first: a per-credential `proxy_url` → `CONDUIT_PROXY_URL` → the `proxy_url` field in `conduit.toml` → the standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` variables (with `NO_PROXY` for bypass).
 
@@ -253,6 +271,8 @@ The upstream proxy for OAuth and token requests is resolved from several sources
 | `CONDUIT_CONFIG` | `conduitd` | `./conduit.toml`, then `~/.conduit/conduit.toml` | Configuration file path |
 | `CONDUIT_PORT` | `conduitd` | `4000` | Gateway port override |
 | `CONDUIT_DATA_DIR` | `conduitd` | `~/.conduit` | Local state directory |
+| `CONDUIT_DAEMON` | `conduitd` | `false` | Fork into the background (Unix); same as `-d` / `--daemon` |
+| `CONDUIT_PID_FILE` | `conduitd` | `<data-dir>/conduitd.pid` | PID file written in daemon mode; same as `--pid-file` |
 | `CONDUIT_MASTER_PASSWORD` | `conduitd` | _(empty)_ | Master password for secret encryption; also settable via `master_password` in `conduit.toml` |
 | `CONDUIT_LOG` | `conduitd` | `info` | Log filter, for example `debug,sqlx::query=off`; also `[log] level` in `conduit.toml` |
 | `CONDUIT_LOG_FORMAT` | `conduitd` | `pretty` | `pretty` or `json`; also `[log] format` in `conduit.toml` |

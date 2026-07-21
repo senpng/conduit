@@ -316,13 +316,37 @@ pub async fn run(
     let gateway_listener = TcpListener::bind(gateway_addr).await?;
     let console_listener = TcpListener::bind(console_addr).await?;
 
-    // Broadcast a single Ctrl-C to both servers so gateway *and* console drain
-    // gracefully (previously only the gateway had graceful shutdown; console
-    // connections were cut abruptly when the select! completed).
+    // Broadcast a single shutdown signal to both servers so gateway *and*
+    // console drain gracefully (previously only the gateway had graceful
+    // shutdown; console connections were cut abruptly when the select!
+    // completed). We listen for SIGINT (Ctrl-C) and, on Unix, SIGTERM — the
+    // latter is what `kill <pid>` / a daemon `stop` sends, and must run the
+    // same drain sequence rather than terminating abruptly.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let console_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            match signal(SignalKind::terminate()) {
+                Ok(mut term) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = term.recv() => {}
+                    }
+                }
+                Err(e) => {
+                    // Fall back to SIGINT-only if the SIGTERM handler cannot be
+                    // installed rather than losing graceful shutdown entirely.
+                    tracing::warn!(error = %e, "failed to install SIGTERM handler; SIGINT only");
+                    tokio::signal::ctrl_c().await.ok();
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.ok();
+        }
         info!("shutdown signal received");
         let _ = shutdown_tx.send(true);
     });

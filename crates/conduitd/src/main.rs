@@ -24,6 +24,18 @@ pub struct Args {
     #[arg(long, env = "CONDUIT_DATA_DIR", default_value = "~/.conduit")]
     pub data_dir: std::path::PathBuf,
 
+    /// Fork into the background (daemonize) after startup checks.
+    /// Detaches from the controlling terminal and redirects stdin/stdout/
+    /// stderr to /dev/null. Keep file logging enabled (the default) so logs
+    /// are still captured. Unix only.
+    #[arg(short = 'd', long, env = "CONDUIT_DAEMON")]
+    pub daemon: bool,
+
+    /// PID file path when running with --daemon.
+    /// Defaults to <data-dir>/conduitd.pid.
+    #[arg(long, env = "CONDUIT_PID_FILE")]
+    pub pid_file: Option<std::path::PathBuf>,
+
     /// Master password for AES-256-GCM secret encryption (Argon2id KEK).
     /// Prefer the env var so the password is not visible in process listings.
     /// Overrides `master_password` in conduit.toml.
@@ -54,15 +66,15 @@ pub struct Args {
     pub log_dir: Option<std::path::PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
 
     let data_dir = expand_tilde(&args.data_dir);
 
-    // Load config before initializing tracing so that logging settings can
-    // come from the config file. Defer any load message until the subscriber
-    // is up, otherwise it would be lost.
+    // Load config before daemonizing / initializing tracing so that logging
+    // settings can come from the config file, and — crucially in daemon mode —
+    // so a bad config is reported on the foreground terminal before stderr is
+    // redirected to /dev/null. Defer the load note until the subscriber is up.
     //
     // A present-but-invalid config is fatal: we exit rather than silently
     // running with defaults, which would drop every configured setting.
@@ -74,6 +86,57 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Daemonize BEFORE building the tokio runtime or initializing tracing.
+    // fork() keeps only the calling thread, so the runtime's worker threads
+    // and the tracing-appender writer thread must be created in the child,
+    // after the fork — otherwise they would be lost and file logging would
+    // silently stop. The parent process exits inside `daemonize`.
+    if args.daemon {
+        let log_to_file = args.log_to_file.or(cfg.log.to_file).unwrap_or(true);
+        if !log_to_file {
+            eprintln!(
+                "conduitd: warning: --daemon with file logging disabled — stdout/stderr \
+                 are redirected to /dev/null, so logs will be lost. Keep --log-to-file=true."
+            );
+        }
+
+        // The data dir is normally created inside server::run; create it here
+        // so the PID file (and the daemon's working directory) can live there.
+        if let Err(e) = std::fs::create_dir_all(&data_dir) {
+            eprintln!(
+                "conduitd: failed to create data dir {}: {e}",
+                data_dir.display()
+            );
+            std::process::exit(1);
+        }
+
+        let pid_file = args
+            .pid_file
+            .clone()
+            .unwrap_or_else(|| data_dir.join("conduitd.pid"));
+        if let Err(e) = daemonize(&pid_file, &data_dir) {
+            eprintln!("conduitd: {e:#}");
+            std::process::exit(1);
+        }
+    }
+
+    // Build the runtime AFTER the fork so its worker threads belong to the
+    // daemonized child. Mirrors `#[tokio::main]`'s multi-thread runtime.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run_async(args, cfg, load_note, data_dir))
+}
+
+/// Initialize tracing and run the servers. Runs inside the (possibly
+/// daemonized) child's tokio runtime — `init_tracing` must happen here,
+/// after any fork, so the appender's writer thread survives.
+async fn run_async(
+    args: Args,
+    cfg: config::Config,
+    load_note: Option<&'static str>,
+    data_dir: std::path::PathBuf,
+) -> Result<()> {
     // Resolve logging settings: CLI/env (Some) > config file (Some) > default.
     let log_format = args
         .log_format
@@ -106,6 +169,27 @@ async fn main() -> Result<()> {
         .map(secrecy::SecretString::new);
 
     server::run(cfg, port, data_dir, master_password).await
+}
+
+/// Fork the process into the background (Unix daemonize).
+///
+/// Performs the standard double-fork + `setsid`, redirects stdin/stdout/stderr
+/// to `/dev/null`, sets the working directory to `data_dir`, and writes the
+/// child PID to `pid_file` under an exclusive lock. The file is not removed on
+/// exit — a later daemon start re-locks and overwrites it, so a leftover PID
+/// file is harmless. The parent process exits inside `start()`, so all code
+/// after this call runs in the daemon child.
+fn daemonize(pid_file: &std::path::Path, data_dir: &std::path::Path) -> Result<()> {
+    use daemonize::Daemonize;
+
+    Daemonize::new()
+        .pid_file(pid_file)
+        // Default is chdir("/"); use data_dir instead so relative paths behave
+        // predictably. Note: with the cwd changed, `conduit.toml` discovery is
+        // best driven by an explicit --config in daemon mode.
+        .working_directory(data_dir)
+        .start()
+        .map_err(|e| anyhow::anyhow!("daemonize failed: {e}"))
 }
 
 /// Initialize the global tracing subscriber.
