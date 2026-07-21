@@ -24,9 +24,35 @@ fn offset_modifier(tz_offset_minutes: i32) -> String {
     format!("{:+} minutes", clamp_tz_offset_minutes(tz_offset_minutes))
 }
 
-/// Local calendar date of stored UTC RFC3339 `ts`:
-/// `date(replace(substr(ts, 1, 19), 'T', ' '), "{:+} minutes")`
-/// where `ts` is from `Utc::now().to_rfc3339()` (first 19 chars = `YYYY-MM-DDTHH:MM:SS`).
+/// SQL fragment: stored UTC `ts` → local calendar day, shifted by `?1` (the
+/// offset modifier). Expands to
+/// `date(replace(substr(ts, 1, 19), 'T', ' '), ?1)` — `ts` comes from
+/// `Utc::now().to_rfc3339()`, whose first 19 chars are `YYYY-MM-DDTHH:MM:SS`.
+/// Reused across every day-bucketed aggregate so the shift math lives in
+/// exactly one place.
+const LOCAL_DAY: &str = "date(replace(substr(ts, 1, 19), 'T', ' '), ?1)";
+
+/// SQL fragment: size-weighted generation throughput
+/// (`Σcompletion_tokens / Σ(duration_ms − ttfb_ms)`, ms → s), aliased
+/// `tokens_per_sec`. `NULL` when no eligible row exists (division guarded by
+/// `NULLIF(..., 0)`). The numerator/denominator filters must stay identical so
+/// rows without `duration_ms` never leak into the numerator.
+const TOKENS_PER_SEC: &str = r#"SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+             THEN completion_tokens ELSE 0 END) * 1000.0
+    / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
+        -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
+        -- returns NULL if any argument is NULL, unlike agg MAX().
+        THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
+        ELSE NULL END), 0) AS tokens_per_sec"#;
+
+/// Shared `WHERE` for period + key aggregates, using the same `IS NULL OR`
+/// null-skip pattern as [`UsageRepo::list_page`]:
+/// - `?1` — offset modifier (used by [`LOCAL_DAY`])
+/// - `?2` — `YYYY-MM%` day pattern, or `NULL` for all-time
+/// - `?3` — downstream key id, or `NULL` for all keys
+///
+/// Bind `(off, period_pat, key_id)` in that order after any leading params.
+const PERIOD_KEY_WHERE: &str = "WHERE (?2 IS NULL OR date(replace(substr(ts, 1, 19), 'T', ' '), ?1) LIKE ?2)\n       AND (?3 IS NULL OR downstream_key_id = ?3)";
 
 pub struct UsageRepo<'a> {
     pool: &'a SqlitePool,
@@ -302,10 +328,8 @@ impl<'a> UsageRepo<'a> {
         tz_offset_minutes: i32,
     ) -> Result<Vec<UsageSummaryRow>, StoreError> {
         let off = offset_modifier(tz_offset_minutes);
-        let rows = match period_day_like(period) {
-            Some(pattern) => {
-                sqlx::query(
-                    r#"SELECT
+        let sql = format!(
+            r#"SELECT
                    COALESCE(downstream_key_id, '') AS downstream_key_id,
                    COUNT(*) AS request_count,
                    COALESCE(SUM(cost_usd), 0) AS total_usd,
@@ -313,33 +337,17 @@ impl<'a> UsageRepo<'a> {
                    COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
                    COALESCE(SUM(total_tokens), 0) AS total_tokens
                FROM usage_records
-               WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?
+               {PERIOD_KEY_WHERE}
                GROUP BY COALESCE(downstream_key_id, '')
-               ORDER BY total_usd DESC"#,
-                )
-                .bind(&off)
-                .bind(&pattern)
-                .fetch_all(self.pool)
-                .await
-            }
-            None => {
-                sqlx::query(
-                    r#"SELECT
-                   COALESCE(downstream_key_id, '') AS downstream_key_id,
-                   COUNT(*) AS request_count,
-                   COALESCE(SUM(cost_usd), 0) AS total_usd,
-                   COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
-                   COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
-                   COALESCE(SUM(total_tokens), 0) AS total_tokens
-               FROM usage_records
-               GROUP BY COALESCE(downstream_key_id, '')
-               ORDER BY total_usd DESC"#,
-                )
-                .fetch_all(self.pool)
-                .await
-            }
-        }
-        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+               ORDER BY total_usd DESC"#
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&off)
+            .bind(period_day_like(period))
+            .bind(None::<String>)
+            .fetch_all(self.pool)
+            .await
+            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
 
         Ok(rows
             .into_iter()
@@ -366,49 +374,26 @@ impl<'a> UsageRepo<'a> {
         tz_offset_minutes: i32,
     ) -> Result<Vec<UsageDayRow>, StoreError> {
         let off = offset_modifier(tz_offset_minutes);
-        let rows = match key_id {
-            Some(kid) => {
-                sqlx::query(
-                    r#"SELECT
-                       date(replace(substr(ts, 1, 19), 'T', ' '), ?) AS day,
-                       COUNT(*) AS request_count,
-                       COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens
-                   FROM usage_records
-                   WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) >= ?
-                     AND downstream_key_id = ?
-                   GROUP BY date(replace(substr(ts, 1, 19), 'T', ' '), ?)
-                   ORDER BY day ASC"#,
-                )
-                .bind(&off)
-                .bind(&off)
-                .bind(since_day)
-                .bind(kid)
-                .bind(&off)
-                .fetch_all(self.pool)
-                .await
-            }
-            None => {
-                sqlx::query(
-                    r#"SELECT
-                       date(replace(substr(ts, 1, 19), 'T', ' '), ?) AS day,
-                       COUNT(*) AS request_count,
-                       COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens
-                   FROM usage_records
-                   WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) >= ?
-                   GROUP BY date(replace(substr(ts, 1, 19), 'T', ' '), ?)
-                   ORDER BY day ASC"#,
-                )
-                .bind(&off)
-                .bind(&off)
-                .bind(since_day)
-                .bind(&off)
-                .fetch_all(self.pool)
-                .await
-            }
-        }
-        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        // `?1` offset, `?2` since_day lower bound, `?3` optional key.
+        let sql = format!(
+            r#"SELECT
+                   {LOCAL_DAY} AS day,
+                   COUNT(*) AS request_count,
+                   COALESCE(SUM(cost_usd), 0) AS total_usd,
+                   COALESCE(SUM(total_tokens), 0) AS total_tokens
+               FROM usage_records
+               WHERE {LOCAL_DAY} >= ?2
+                 AND (?3 IS NULL OR downstream_key_id = ?3)
+               GROUP BY {LOCAL_DAY}
+               ORDER BY day ASC"#
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&off)
+            .bind(since_day)
+            .bind(key_id)
+            .fetch_all(self.pool)
+            .await
+            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
 
         Ok(rows
             .into_iter()
@@ -433,84 +418,24 @@ impl<'a> UsageRepo<'a> {
         tz_offset_minutes: i32,
     ) -> Result<Vec<UsageDayRow>, StoreError> {
         let off = offset_modifier(tz_offset_minutes);
-        let pattern = period_day_like(period);
-        let rows = match (pattern.as_deref(), key_id) {
-            (Some(pat), Some(kid)) => {
-                sqlx::query(
-                    r#"SELECT
-                       date(replace(substr(ts, 1, 19), 'T', ' '), ?) AS day,
-                       COUNT(*) AS request_count,
-                       COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens
-                   FROM usage_records
-                   WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?
-                     AND downstream_key_id = ?
-                   GROUP BY date(replace(substr(ts, 1, 19), 'T', ' '), ?)
-                   ORDER BY day ASC"#,
-                )
-                .bind(&off)
-                .bind(&off)
-                .bind(pat)
-                .bind(kid)
-                .bind(&off)
-                .fetch_all(self.pool)
-                .await
-            }
-            (Some(pat), None) => {
-                sqlx::query(
-                    r#"SELECT
-                       date(replace(substr(ts, 1, 19), 'T', ' '), ?) AS day,
-                       COUNT(*) AS request_count,
-                       COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens
-                   FROM usage_records
-                   WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?
-                   GROUP BY date(replace(substr(ts, 1, 19), 'T', ' '), ?)
-                   ORDER BY day ASC"#,
-                )
-                .bind(&off)
-                .bind(&off)
-                .bind(pat)
-                .bind(&off)
-                .fetch_all(self.pool)
-                .await
-            }
-            (None, Some(kid)) => {
-                sqlx::query(
-                    r#"SELECT
-                       date(replace(substr(ts, 1, 19), 'T', ' '), ?) AS day,
-                       COUNT(*) AS request_count,
-                       COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens
-                   FROM usage_records
-                   WHERE downstream_key_id = ?
-                   GROUP BY date(replace(substr(ts, 1, 19), 'T', ' '), ?)
-                   ORDER BY day ASC"#,
-                )
-                .bind(&off)
-                .bind(kid)
-                .bind(&off)
-                .fetch_all(self.pool)
-                .await
-            }
-            (None, None) => {
-                sqlx::query(
-                    r#"SELECT
-                       date(replace(substr(ts, 1, 19), 'T', ' '), ?) AS day,
-                       COUNT(*) AS request_count,
-                       COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens
-                   FROM usage_records
-                   GROUP BY date(replace(substr(ts, 1, 19), 'T', ' '), ?)
-                   ORDER BY day ASC"#,
-                )
-                .bind(&off)
-                .bind(&off)
-                .fetch_all(self.pool)
-                .await
-            }
-        }
-        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        let sql = format!(
+            r#"SELECT
+                   {LOCAL_DAY} AS day,
+                   COUNT(*) AS request_count,
+                   COALESCE(SUM(cost_usd), 0) AS total_usd,
+                   COALESCE(SUM(total_tokens), 0) AS total_tokens
+               FROM usage_records
+               {PERIOD_KEY_WHERE}
+               GROUP BY {LOCAL_DAY}
+               ORDER BY day ASC"#
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&off)
+            .bind(period_day_like(period))
+            .bind(key_id)
+            .fetch_all(self.pool)
+            .await
+            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
 
         Ok(rows
             .into_iter()
@@ -532,111 +457,27 @@ impl<'a> UsageRepo<'a> {
         tz_offset_minutes: i32,
     ) -> Result<Vec<UsageModelRow>, StoreError> {
         let off = offset_modifier(tz_offset_minutes);
-        let pattern = period_day_like(period);
-        let rows = match (pattern.as_deref(), key_id) {
-            (Some(pat), Some(kid)) => {
-                sqlx::query(
-                    r#"SELECT
-                       COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
-                       provider_kind,
-                       COUNT(*) AS request_count,
-                       COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens,
-                       SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                                THEN completion_tokens ELSE 0 END) * 1000.0
-                           / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                               -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
-                               -- returns NULL if any argument is NULL, unlike agg MAX().
-                               THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
-                               ELSE NULL END), 0) AS tokens_per_sec
-                   FROM usage_records
-                   WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ? AND downstream_key_id = ?
-                   GROUP BY COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
-                            provider_kind
-                   ORDER BY total_usd DESC"#,
-                )
-                .bind(&off)
-                .bind(pat)
-                .bind(kid)
-                .fetch_all(self.pool)
-                .await
-            }
-            (Some(pat), None) => {
-                sqlx::query(
-                    r#"SELECT
-                       COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
-                       provider_kind,
-                       COUNT(*) AS request_count,
-                       COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens,
-                       SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                                THEN completion_tokens ELSE 0 END) * 1000.0
-                           / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                               -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
-                               -- returns NULL if any argument is NULL, unlike agg MAX().
-                               THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
-                               ELSE NULL END), 0) AS tokens_per_sec
-                   FROM usage_records
-                   WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?
-                   GROUP BY COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
-                            provider_kind
-                   ORDER BY total_usd DESC"#,
-                )
-                .bind(&off)
-                .bind(pat)
-                .fetch_all(self.pool)
-                .await
-            }
-            (None, Some(kid)) => {
-                sqlx::query(
-                    r#"SELECT
-                       COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
-                       provider_kind,
-                       COUNT(*) AS request_count,
-                       COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens,
-                       SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                                THEN completion_tokens ELSE 0 END) * 1000.0
-                           / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                               -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
-                               -- returns NULL if any argument is NULL, unlike agg MAX().
-                               THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
-                               ELSE NULL END), 0) AS tokens_per_sec
-                   FROM usage_records
-                   WHERE downstream_key_id = ?
-                   GROUP BY COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
-                            provider_kind
-                   ORDER BY total_usd DESC"#,
-                )
-                .bind(kid)
-                .fetch_all(self.pool)
-                .await
-            }
-            (None, None) => {
-                sqlx::query(
-                    r#"SELECT
-                       COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
-                       provider_kind,
-                       COUNT(*) AS request_count,
-                       COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens,
-                       SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                                THEN completion_tokens ELSE 0 END) * 1000.0
-                           / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                               -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
-                               -- returns NULL if any argument is NULL, unlike agg MAX().
-                               THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
-                               ELSE NULL END), 0) AS tokens_per_sec
-                   FROM usage_records
-                   GROUP BY COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
-                            provider_kind
-                   ORDER BY total_usd DESC"#,
-                )
-                .fetch_all(self.pool)
-                .await
-            }
-        }
-        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        let sql = format!(
+            r#"SELECT
+                   COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
+                   provider_kind,
+                   COUNT(*) AS request_count,
+                   COALESCE(SUM(cost_usd), 0) AS total_usd,
+                   COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                   {TOKENS_PER_SEC}
+               FROM usage_records
+               {PERIOD_KEY_WHERE}
+               GROUP BY COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
+                        provider_kind
+               ORDER BY total_usd DESC"#
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&off)
+            .bind(period_day_like(period))
+            .bind(key_id)
+            .fetch_all(self.pool)
+            .await
+            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
 
         Ok(rows
             .into_iter()
@@ -659,10 +500,8 @@ impl<'a> UsageRepo<'a> {
         tz_offset_minutes: i32,
     ) -> Result<Vec<UsageKeyModelRow>, StoreError> {
         let off = offset_modifier(tz_offset_minutes);
-        let rows = match period_day_like(period) {
-            Some(pattern) => {
-                sqlx::query(
-                    r#"SELECT
+        let sql = format!(
+            r#"SELECT
                    COALESCE(downstream_key_id, '') AS downstream_key_id,
                    COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
                    provider_kind,
@@ -670,37 +509,19 @@ impl<'a> UsageRepo<'a> {
                    COALESCE(SUM(cost_usd), 0) AS total_usd,
                    COALESCE(SUM(total_tokens), 0) AS total_tokens
                FROM usage_records
-               WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?
+               {PERIOD_KEY_WHERE}
                GROUP BY COALESCE(downstream_key_id, ''),
                         COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
                         provider_kind
-               ORDER BY total_usd DESC"#,
-                )
-                .bind(&off)
-                .bind(&pattern)
-                .fetch_all(self.pool)
-                .await
-            }
-            None => {
-                sqlx::query(
-                    r#"SELECT
-                   COALESCE(downstream_key_id, '') AS downstream_key_id,
-                   COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
-                   provider_kind,
-                   COUNT(*) AS request_count,
-                   COALESCE(SUM(cost_usd), 0) AS total_usd,
-                   COALESCE(SUM(total_tokens), 0) AS total_tokens
-               FROM usage_records
-               GROUP BY COALESCE(downstream_key_id, ''),
-                        COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
-                        provider_kind
-               ORDER BY total_usd DESC"#,
-                )
-                .fetch_all(self.pool)
-                .await
-            }
-        }
-        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+               ORDER BY total_usd DESC"#
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&off)
+            .bind(period_day_like(period))
+            .bind(None::<String>)
+            .fetch_all(self.pool)
+            .await
+            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
 
         Ok(rows
             .into_iter()
@@ -723,52 +544,28 @@ impl<'a> UsageRepo<'a> {
         tz_offset_minutes: i32,
     ) -> Result<Vec<UsageDayModelRow>, StoreError> {
         let off = offset_modifier(tz_offset_minutes);
-        let rows = match period_day_like(period) {
-            Some(pattern) => {
-                sqlx::query(
-                    r#"SELECT
-                   date(replace(substr(ts, 1, 19), 'T', ' '), ?) AS day,
+        let sql = format!(
+            r#"SELECT
+                   {LOCAL_DAY} AS day,
                    COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
                    provider_kind,
                    COUNT(*) AS request_count,
                    COALESCE(SUM(cost_usd), 0) AS total_usd,
                    COALESCE(SUM(total_tokens), 0) AS total_tokens
                FROM usage_records
-               WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?
-               GROUP BY date(replace(substr(ts, 1, 19), 'T', ' '), ?),
+               {PERIOD_KEY_WHERE}
+               GROUP BY {LOCAL_DAY},
                         COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
                         provider_kind
-               ORDER BY day ASC, total_usd DESC"#,
-                )
-                .bind(&off)
-                .bind(&off)
-                .bind(&pattern)
-                .bind(&off)
-                .fetch_all(self.pool)
-                .await
-            }
-            None => {
-                sqlx::query(
-                    r#"SELECT
-                   date(replace(substr(ts, 1, 19), 'T', ' '), ?) AS day,
-                   COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)') AS label,
-                   provider_kind,
-                   COUNT(*) AS request_count,
-                   COALESCE(SUM(cost_usd), 0) AS total_usd,
-                   COALESCE(SUM(total_tokens), 0) AS total_tokens
-               FROM usage_records
-               GROUP BY date(replace(substr(ts, 1, 19), 'T', ' '), ?),
-                        COALESCE(NULLIF(alias, ''), NULLIF(model_id, ''), '(unknown)'),
-                        provider_kind
-               ORDER BY day ASC, total_usd DESC"#,
-                )
-                .bind(&off)
-                .bind(&off)
-                .fetch_all(self.pool)
-                .await
-            }
-        }
-        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+               ORDER BY day ASC, total_usd DESC"#
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&off)
+            .bind(period_day_like(period))
+            .bind(None::<String>)
+            .fetch_all(self.pool)
+            .await
+            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
 
         Ok(rows
             .into_iter()
@@ -792,99 +589,24 @@ impl<'a> UsageRepo<'a> {
         tz_offset_minutes: i32,
     ) -> Result<UsageOutcomeSummary, StoreError> {
         let off = offset_modifier(tz_offset_minutes);
-        let pattern = period_day_like(period);
-        let row = match (pattern.as_deref(), key_id) {
-            (Some(pat), Some(kid)) => {
-                sqlx::query(
-                    r#"SELECT
-                           COUNT(*) AS request_count,
-                           COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
-                               AS success_count,
-                           AVG(ttfb_ms) AS avg_ttfb_ms,
-                           AVG(duration_ms) AS avg_duration_ms,
-                           SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                                    THEN completion_tokens ELSE 0 END) * 1000.0
-                               / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                                   -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
-                                   -- returns NULL if any argument is NULL, unlike agg MAX().
-                                   THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
-                                   ELSE NULL END), 0) AS tokens_per_sec
-                       FROM usage_records
-                       WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ? AND downstream_key_id = ?"#,
-                )
-                .bind(&off)
-                .bind(pat)
-                .bind(kid)
-                .fetch_one(self.pool)
-                .await
-            }
-            (Some(pat), None) => {
-                sqlx::query(
-                    r#"SELECT
-                           COUNT(*) AS request_count,
-                           COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
-                               AS success_count,
-                           AVG(ttfb_ms) AS avg_ttfb_ms,
-                           AVG(duration_ms) AS avg_duration_ms,
-                           SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                                    THEN completion_tokens ELSE 0 END) * 1000.0
-                               / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                                   -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
-                                   -- returns NULL if any argument is NULL, unlike agg MAX().
-                                   THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
-                                   ELSE NULL END), 0) AS tokens_per_sec
-                       FROM usage_records
-                       WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?"#,
-                )
-                .bind(&off)
-                .bind(pat)
-                .fetch_one(self.pool)
-                .await
-            }
-            (None, Some(kid)) => {
-                sqlx::query(
-                    r#"SELECT
-                           COUNT(*) AS request_count,
-                           COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
-                               AS success_count,
-                           AVG(ttfb_ms) AS avg_ttfb_ms,
-                           AVG(duration_ms) AS avg_duration_ms,
-                           SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                                    THEN completion_tokens ELSE 0 END) * 1000.0
-                               / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                                   -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
-                                   -- returns NULL if any argument is NULL, unlike agg MAX().
-                                   THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
-                                   ELSE NULL END), 0) AS tokens_per_sec
-                       FROM usage_records
-                       WHERE downstream_key_id = ?"#,
-                )
-                .bind(kid)
-                .fetch_one(self.pool)
-                .await
-            }
-            (None, None) => {
-                sqlx::query(
-                    r#"SELECT
-                           COUNT(*) AS request_count,
-                           COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
-                               AS success_count,
-                           AVG(ttfb_ms) AS avg_ttfb_ms,
-                           AVG(duration_ms) AS avg_duration_ms,
-                           SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                                    THEN completion_tokens ELSE 0 END) * 1000.0
-                               / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                                   -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
-                                   -- returns NULL if any argument is NULL, unlike agg MAX().
-                                   THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
-                                   ELSE NULL END), 0) AS tokens_per_sec
-                       FROM usage_records"#,
-                )
-                .fetch_one(self.pool)
-                .await
-            }
-        }
-        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        let sql = format!(
+            r#"SELECT
+                   COUNT(*) AS request_count,
+                   COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
+                       AS success_count,
+                   AVG(ttfb_ms) AS avg_ttfb_ms,
+                   AVG(duration_ms) AS avg_duration_ms,
+                   {TOKENS_PER_SEC}
+               FROM usage_records
+               {PERIOD_KEY_WHERE}"#
+        );
+        let row = sqlx::query(&sql)
+            .bind(&off)
+            .bind(period_day_like(period))
+            .bind(key_id)
+            .fetch_one(self.pool)
+            .await
+            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
 
         let request_count = row.get::<i64, _>("request_count").max(0) as u64;
         let success_count = row.get::<i64, _>("success_count").max(0) as u64;
@@ -912,123 +634,30 @@ impl<'a> UsageRepo<'a> {
         tz_offset_minutes: i32,
     ) -> Result<Vec<UsageProviderRow>, StoreError> {
         let off = offset_modifier(tz_offset_minutes);
-        let pattern = period_day_like(period);
-        let rows = match (pattern.as_deref(), key_id) {
-            (Some(pat), Some(kid)) => {
-                sqlx::query(
-                    r#"SELECT
-                       COALESCE(NULLIF(provider_id, ''), '(unknown)') AS provider_id,
-                       provider_kind,
-                       COUNT(*) AS request_count,
-                       COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
-                           AS success_count,
-                       AVG(ttfb_ms) AS avg_ttfb_ms,
-                       AVG(duration_ms) AS avg_duration_ms,
-                       SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                                THEN completion_tokens ELSE 0 END) * 1000.0
-                           / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                               -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
-                               -- returns NULL if any argument is NULL, unlike agg MAX().
-                               THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
-                               ELSE NULL END), 0) AS tokens_per_sec,
-                       COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens
-                   FROM usage_records
-                   WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ? AND downstream_key_id = ?
-                   GROUP BY COALESCE(NULLIF(provider_id, ''), '(unknown)'), provider_kind
-                   ORDER BY total_tokens DESC"#,
-                )
-                .bind(&off)
-                .bind(pat)
-                .bind(kid)
-                .fetch_all(self.pool)
-                .await
-            }
-            (Some(pat), None) => {
-                sqlx::query(
-                    r#"SELECT
-                       COALESCE(NULLIF(provider_id, ''), '(unknown)') AS provider_id,
-                       provider_kind,
-                       COUNT(*) AS request_count,
-                       COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
-                           AS success_count,
-                       AVG(ttfb_ms) AS avg_ttfb_ms,
-                       AVG(duration_ms) AS avg_duration_ms,
-                       SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                                THEN completion_tokens ELSE 0 END) * 1000.0
-                           / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                               -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
-                               -- returns NULL if any argument is NULL, unlike agg MAX().
-                               THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
-                               ELSE NULL END), 0) AS tokens_per_sec,
-                       COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens
-                   FROM usage_records
-                   WHERE date(replace(substr(ts, 1, 19), 'T', ' '), ?) LIKE ?
-                   GROUP BY COALESCE(NULLIF(provider_id, ''), '(unknown)'), provider_kind
-                   ORDER BY total_tokens DESC"#,
-                )
-                .bind(&off)
-                .bind(pat)
-                .fetch_all(self.pool)
-                .await
-            }
-            (None, Some(kid)) => {
-                sqlx::query(
-                    r#"SELECT
-                       COALESCE(NULLIF(provider_id, ''), '(unknown)') AS provider_id,
-                       provider_kind,
-                       COUNT(*) AS request_count,
-                       COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
-                           AS success_count,
-                       AVG(ttfb_ms) AS avg_ttfb_ms,
-                       AVG(duration_ms) AS avg_duration_ms,
-                       SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                                THEN completion_tokens ELSE 0 END) * 1000.0
-                           / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                               -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
-                               -- returns NULL if any argument is NULL, unlike agg MAX().
-                               THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
-                               ELSE NULL END), 0) AS tokens_per_sec,
-                       COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens
-                   FROM usage_records
-                   WHERE downstream_key_id = ?
-                   GROUP BY COALESCE(NULLIF(provider_id, ''), '(unknown)'), provider_kind
-                   ORDER BY total_tokens DESC"#,
-                )
-                .bind(kid)
-                .fetch_all(self.pool)
-                .await
-            }
-            (None, None) => {
-                sqlx::query(
-                    r#"SELECT
-                       COALESCE(NULLIF(provider_id, ''), '(unknown)') AS provider_id,
-                       provider_kind,
-                       COUNT(*) AS request_count,
-                       COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
-                           AS success_count,
-                       AVG(ttfb_ms) AS avg_ttfb_ms,
-                       AVG(duration_ms) AS avg_duration_ms,
-                       SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                                THEN completion_tokens ELSE 0 END) * 1000.0
-                           / NULLIF(SUM(CASE WHEN duration_ms IS NOT NULL AND completion_tokens > 0
-                               -- COALESCE(ttfb_ms,0) is required: SQLite's scalar MAX()
-                               -- returns NULL if any argument is NULL, unlike agg MAX().
-                               THEN MAX(duration_ms - COALESCE(ttfb_ms, 0), 0)
-                               ELSE NULL END), 0) AS tokens_per_sec,
-                       COALESCE(SUM(cost_usd), 0) AS total_usd,
-                       COALESCE(SUM(total_tokens), 0) AS total_tokens
-                   FROM usage_records
-                   GROUP BY COALESCE(NULLIF(provider_id, ''), '(unknown)'), provider_kind
-                   ORDER BY total_tokens DESC"#,
-                )
-                .fetch_all(self.pool)
-                .await
-            }
-        }
-        .map_err(|e| StoreError::Sqlx(e.to_string()))?;
+        let sql = format!(
+            r#"SELECT
+                   COALESCE(NULLIF(provider_id, ''), '(unknown)') AS provider_id,
+                   provider_kind,
+                   COUNT(*) AS request_count,
+                   COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0)
+                       AS success_count,
+                   AVG(ttfb_ms) AS avg_ttfb_ms,
+                   AVG(duration_ms) AS avg_duration_ms,
+                   {TOKENS_PER_SEC},
+                   COALESCE(SUM(cost_usd), 0) AS total_usd,
+                   COALESCE(SUM(total_tokens), 0) AS total_tokens
+               FROM usage_records
+               {PERIOD_KEY_WHERE}
+               GROUP BY COALESCE(NULLIF(provider_id, ''), '(unknown)'), provider_kind
+               ORDER BY total_tokens DESC"#
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&off)
+            .bind(period_day_like(period))
+            .bind(key_id)
+            .fetch_all(self.pool)
+            .await
+            .map_err(|e| StoreError::Sqlx(e.to_string()))?;
 
         Ok(rows
             .into_iter()
@@ -1064,6 +693,48 @@ fn period_day_like(period: &str) -> Option<String> {
     } else {
         // Local day is `YYYY-MM-DD`; prefix match scopes one calendar month.
         Some(format!("{}%", period.trim()))
+    }
+}
+
+impl UsageRecordRow {
+    /// A row with a freshly minted `id` + `ts` and the ledger's semantic
+    /// defaults (`status = "ok"`, `attempt_count = 1`, everything else empty).
+    ///
+    /// Callers fill the fields they know via struct-update
+    /// (`UsageRecordRow { request_id, .., ..UsageRecordRow::stamped() }`),
+    /// so adding a ledger column only touches this one default site.
+    pub fn stamped() -> Self {
+        UsageRecordRow {
+            id: ulid::Ulid::new().to_string(),
+            ts: Utc::now().to_rfc3339(),
+            request_id: String::new(),
+            downstream_key_id: None,
+            alias: None,
+            provider_id: None,
+            provider_kind: None,
+            model_id: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            reasoning_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cost_usd: 0.0,
+            stream: false,
+            status: "ok".into(),
+            error_class: None,
+            http_status: None,
+            finish_reason: None,
+            duration_ms: None,
+            ttfb_ms: None,
+            route_strategy: None,
+            attempt_no: 0,
+            attempt_count: 1,
+            session_id: None,
+            affinity_hit: None,
+            pool_id: None,
+            selected_reason: None,
+        }
     }
 }
 
@@ -1328,8 +999,6 @@ pub fn new_usage_record(
     stream: bool,
 ) -> UsageRecordRow {
     UsageRecordRow {
-        id: ulid::Ulid::new().to_string(),
-        ts: Utc::now().to_rfc3339(),
         request_id: request_id.into(),
         downstream_key_id,
         alias,
@@ -1344,19 +1013,7 @@ pub fn new_usage_record(
         cache_write_tokens,
         cost_usd,
         stream,
-        status: "ok".into(),
-        error_class: None,
-        http_status: None,
-        finish_reason: None,
-        duration_ms: None,
-        ttfb_ms: None,
-        route_strategy: None,
-        attempt_no: 0,
-        attempt_count: 1,
-        session_id: None,
-        affinity_hit: None,
-        pool_id: None,
-        selected_reason: None,
+        ..UsageRecordRow::stamped()
     }
 }
 
