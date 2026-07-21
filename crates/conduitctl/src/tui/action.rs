@@ -61,6 +61,8 @@ pub enum Action {
     CycleKind,
     /// Providers tab: set / rotate upstream API key
     SetSecret,
+    /// Providers tab: cycle Claude OAuth cloak_mode (auto → always → never)
+    CycleCloakMode,
     /// Pricing: toggle merged table ↔ operator overrides
     TogglePricingView,
     /// Usage: cycle sort (cost / tokens / date)

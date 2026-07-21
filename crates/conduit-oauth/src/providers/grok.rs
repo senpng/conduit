@@ -306,6 +306,7 @@ impl GrokOAuth {
             proxy_url: None,
             // OAuth subscription default: chat-proxy (using_api=false).
             using_api: Some(false),
+            cloak_mode: None,
             extra: Default::default(),
         }))
     }
@@ -438,6 +439,7 @@ impl GrokOAuth {
             token_endpoint: Some(endpoint),
             proxy_url: None,
             using_api: Some(false),
+            cloak_mode: None,
             extra: Default::default(),
         })
     }

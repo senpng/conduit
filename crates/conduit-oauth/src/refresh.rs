@@ -166,6 +166,10 @@ impl RefreshCoordinator {
         if fresh.using_api.is_none() {
             fresh.using_api = cred.using_api;
         }
+        // Preserve Claude cloak_mode across token refresh.
+        if fresh.cloak_mode.is_none() {
+            fresh.cloak_mode = cred.cloak_mode.clone();
+        }
         // Merge unknown extra keys without wiping using_api/proxy carried in extra.
         for (k, v) in &cred.extra {
             fresh.extra.entry(k.clone()).or_insert_with(|| v.clone());
@@ -202,6 +206,7 @@ mod tests {
             token_endpoint: None,
             proxy_url: None,
             using_api: None,
+            cloak_mode: None,
             extra: Default::default(),
         };
         let out = coord.ensure_fresh(cred).await.unwrap();

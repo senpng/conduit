@@ -132,6 +132,14 @@ pub struct OAuthCredential {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub using_api: Option<bool>,
 
+    /// Claude OAuth cloak mode: `auto` | `always` | `never` (CLIProxyAPI parity).
+    ///
+    /// - `auto` (default): cloak only when client UA is not `claude-cli`
+    /// - `always`: always inject billing/system cloak + fake user_id
+    /// - `never`: never cloak (pass body as-is after other transforms)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloak_mode: Option<String>,
+
     /// Preserve unknown fields on round-trip.
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, Value>,
@@ -227,6 +235,7 @@ impl OAuthCredential {
         "token_endpoint",
         "proxy_url",
         "using_api",
+        "cloak_mode",
     ];
 
     /// Promote known values out of `extra`, then drop reserved keys so flatten
@@ -293,6 +302,23 @@ impl OAuthCredential {
                 _ => {}
             }
         }
+        if self.cloak_mode.is_none() {
+            if let Some(s) = self
+                .extra
+                .get("cloak_mode")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if let Ok(m) = normalize_cloak_mode(s) {
+                    self.cloak_mode = Some(m);
+                }
+            }
+        } else if let Some(ref raw) = self.cloak_mode.clone() {
+            if let Ok(m) = normalize_cloak_mode(raw) {
+                self.cloak_mode = Some(m);
+            }
+        }
         for k in Self::RESERVED_EXTRA_KEYS {
             self.extra.remove(*k);
         }
@@ -329,6 +355,33 @@ impl OAuthCredential {
         }
     }
 
+    /// Claude OAuth cloak mode (`auto` | `always` | `never`). Default `auto`.
+    pub fn cloak_mode(&self) -> &str {
+        if let Some(ref m) = self.cloak_mode {
+            let t = m.trim();
+            if !t.is_empty() {
+                return t;
+            }
+        }
+        if let Some(s) = self
+            .extra
+            .get("cloak_mode")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return s;
+        }
+        "auto"
+    }
+
+    /// Set cloak mode after validating (`auto` / `always` / `never`).
+    pub fn set_cloak_mode(&mut self, mode: &str) -> Result<(), OAuthError> {
+        self.cloak_mode = Some(normalize_cloak_mode(mode)?);
+        self.extra.remove("cloak_mode");
+        Ok(())
+    }
+
     /// Effective plan type (field or `extra.plan_type`).
     pub fn plan_type_str(&self) -> Option<&str> {
         self.plan_type
@@ -343,6 +396,18 @@ impl OAuthCredential {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
             })
+    }
+}
+
+/// Normalize cloak mode string. Accepts case-insensitive `auto`/`always`/`never`.
+pub fn normalize_cloak_mode(mode: &str) -> Result<String, OAuthError> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok("auto".into()),
+        "always" => Ok("always".into()),
+        "never" => Ok("never".into()),
+        other => Err(OAuthError::Credential(format!(
+            "invalid cloak_mode '{other}' (expected auto|always|never)"
+        ))),
     }
 }
 
@@ -388,7 +453,16 @@ pub fn oauth_extra_headers(
         // Claude OAuth fingerprint headers (betas, version, UA, session, stainless)
         // are applied per-request in `conduit_upstream::claude_oauth` so they are
         // not duplicated via CompositeAuth (reqwest `header` appends).
-        OAuthProviderKind::Claude => vec![],
+        // Per-credential cloak_mode is passed as a synthetic header consumed by
+        // `claude_oauth_opts` (never forwarded as an HTTP request header).
+        OAuthProviderKind::Claude => {
+            let mode = cred.cloak_mode();
+            if mode.eq_ignore_ascii_case("auto") {
+                vec![]
+            } else {
+                vec![("x-conduit-cloak-mode".into(), mode.to_ascii_lowercase())]
+            }
+        }
         OAuthProviderKind::Codex => {
             // CLIProxyAPI `applyCodexHeaders` defaults (ChatGPT-account OAuth path).
             let mut h = vec![
@@ -448,12 +522,14 @@ mod tests {
             token_endpoint: None,
             proxy_url: None,
             using_api: None,
+            cloak_mode: None,
             extra: Default::default(),
         };
         let bytes = c.to_json_bytes().unwrap();
         let back = OAuthCredential::from_json_bytes(&bytes).unwrap();
         assert_eq!(back.access_token, "at");
         assert_eq!(back.kind().unwrap(), OAuthProviderKind::Claude);
+        assert_eq!(back.cloak_mode(), "auto");
     }
 
     #[test]
@@ -495,6 +571,7 @@ mod tests {
             token_endpoint: None,
             proxy_url: None,
             using_api: None,
+            cloak_mode: None,
             extra: Default::default(),
         };
         c.extra
@@ -538,6 +615,7 @@ mod tests {
             token_endpoint: None,
             proxy_url: None,
             using_api: Some(true),
+            cloak_mode: None,
             extra: Default::default(),
         };
         assert!(c.using_api());
@@ -546,6 +624,76 @@ mod tests {
         c.extra
             .insert("using_api".into(), Value::String("true".into()));
         assert!(c.using_api());
+    }
+
+    #[test]
+    fn cloak_mode_defaults_and_normalizes() {
+        let mut c = OAuthCredential {
+            provider_type: "claude".into(),
+            auth_kind: "oauth".into(),
+            access_token: "t".into(),
+            refresh_token: "r".into(),
+            id_token: None,
+            token_type: None,
+            expired: None,
+            last_refresh: None,
+            email: None,
+            account_id: None,
+            plan_type: None,
+            organization_id: None,
+            organization_name: None,
+            sub: None,
+            base_url: None,
+            token_endpoint: None,
+            proxy_url: None,
+            using_api: None,
+            cloak_mode: None,
+            extra: Default::default(),
+        };
+        assert_eq!(c.cloak_mode(), "auto");
+        c.set_cloak_mode("ALWAYS").unwrap();
+        assert_eq!(c.cloak_mode(), "always");
+        assert!(c.set_cloak_mode("bogus").is_err());
+        c.cloak_mode = None;
+        c.extra
+            .insert("cloak_mode".into(), Value::String("Never".into()));
+        assert_eq!(c.cloak_mode(), "Never");
+        c.sanitize_extra();
+        assert_eq!(c.cloak_mode.as_deref(), Some("never"));
+        assert!(!c.extra.contains_key("cloak_mode"));
+    }
+
+    #[test]
+    fn oauth_extra_headers_emit_cloak_mode_when_not_auto() {
+        let mut c = OAuthCredential {
+            provider_type: "claude".into(),
+            auth_kind: "oauth".into(),
+            access_token: "t".into(),
+            refresh_token: "r".into(),
+            id_token: None,
+            token_type: None,
+            expired: None,
+            last_refresh: None,
+            email: None,
+            account_id: None,
+            plan_type: None,
+            organization_id: None,
+            organization_name: None,
+            sub: None,
+            base_url: None,
+            token_endpoint: None,
+            proxy_url: None,
+            using_api: None,
+            cloak_mode: Some("always".into()),
+            extra: Default::default(),
+        };
+        let h = oauth_extra_headers(OAuthProviderKind::Claude, &c);
+        assert_eq!(
+            h,
+            vec![("x-conduit-cloak-mode".into(), "always".into())]
+        );
+        c.cloak_mode = Some("auto".into());
+        assert!(oauth_extra_headers(OAuthProviderKind::Claude, &c).is_empty());
     }
 
     #[test]
@@ -569,6 +717,7 @@ mod tests {
             token_endpoint: None,
             proxy_url: None,
             using_api: None,
+            cloak_mode: None,
             extra: Default::default(),
         };
         assert!(c.needs_refresh(Duration::minutes(5)));

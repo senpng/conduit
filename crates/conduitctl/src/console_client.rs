@@ -103,6 +103,16 @@ impl ConsoleClient {
         self.get_json(&url).await
     }
 
+    /// PATCH OAuth non-secret settings (e.g. Claude `cloak_mode`).
+    pub async fn update_provider_oauth_settings(
+        &self,
+        id: &str,
+        body: &crate::dto::UpdateOAuthSettingsBody,
+    ) -> Result<Value, ConsoleError> {
+        let url = format!("{}/console/providers/{}/oauth-settings", self.base, id);
+        self.patch_json(&url, body).await
+    }
+
     pub async fn delete_provider(&self, id: &str) -> Result<(), ConsoleError> {
         let url = format!("{}/console/providers/{}", self.base, id);
         self.delete_ok(&url).await
@@ -158,6 +168,15 @@ impl ConsoleClient {
         body: &B,
     ) -> Result<T, ConsoleError> {
         let resp = self.http.put(url).json(body).send().await?;
+        self.json_response(resp).await
+    }
+
+    async fn patch_json<B: serde::Serialize, T: DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &B,
+    ) -> Result<T, ConsoleError> {
+        let resp = self.http.patch(url).json(body).send().await?;
         self.json_response(resp).await
     }
 

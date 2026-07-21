@@ -222,6 +222,7 @@ mod tests {
             token_endpoint: None,
             proxy_url: None,
             using_api: None,
+            cloak_mode: None,
             extra: Default::default(),
         };
         store
@@ -240,9 +241,10 @@ mod tests {
         assert_eq!(r.access_token.expose_secret(), "oauth-at");
         // Claude betas/fingerprint headers are applied per-request by conduit-upstream
         // claude_oauth relay (not stored on the credential resolve path).
+        // Default cloak_mode=auto → no synthetic header (avoids header noise).
         assert!(
             r.extra_headers.is_empty(),
-            "claude oauth extra_headers should be empty to avoid header duplication"
+            "claude oauth auto cloak should not emit x-conduit-cloak-mode"
         );
         assert!(!r.using_api);
     }

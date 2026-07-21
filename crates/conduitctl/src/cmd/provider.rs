@@ -26,6 +26,14 @@ pub enum ProviderCommand {
         #[arg(long)]
         api_key: Option<String>,
     },
+    /// Set Claude OAuth cloak mode (`auto` | `always` | `never`).
+    Cloak {
+        /// Provider id (claude-oauth)
+        id: String,
+        /// Cloak mode: auto, always, or never
+        #[arg(long)]
+        mode: String,
+    },
     Remove {
         id: String,
     },
@@ -64,6 +72,18 @@ pub async fn run(console_addr: &str, args: ProviderArgs, _output: &str) -> Resul
                         .and_then(|v| v.as_str())
                         .unwrap_or("(unknown)");
                     println!("Provider {} added (name={})", id, name);
+                }
+                Err(ConsoleError::Http { status, body }) => {
+                    anyhow::bail!("failed: HTTP {} — {}", status, body);
+                }
+                Err(e) => anyhow::bail!("failed: {}", e),
+            }
+        }
+        ProviderCommand::Cloak { id, mode } => {
+            let body = conduitctl::dto::UpdateOAuthSettingsBody::cloak_mode(mode.trim());
+            match client.update_provider_oauth_settings(&id, &body).await {
+                Ok(resp) => {
+                    println!("{}", serde_json::to_string_pretty(&resp)?);
                 }
                 Err(ConsoleError::Http { status, body }) => {
                     anyhow::bail!("failed: HTTP {} — {}", status, body);

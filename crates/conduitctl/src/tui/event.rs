@@ -143,6 +143,7 @@ fn map_browse(tab: Tab, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('o') if tab == Tab::Providers => Some(Action::OpenBrowser), // re-auth OAuth
         KeyCode::Char('x') if tab == Tab::Providers => Some(Action::OauthRefresh),
         KeyCode::Char('u') if tab == Tab::Providers => Some(Action::RefreshQuota),
+        KeyCode::Char('c') if tab == Tab::Providers => Some(Action::CycleCloakMode),
         KeyCode::Char('c') if tab == Tab::Usage => Some(Action::CycleUsageSort),
         // Overview heatmap says “press t”; Usage cycles detail panes (incl. by day).
         KeyCode::Char('t') if matches!(tab, Tab::Overview | Tab::Usage) => {

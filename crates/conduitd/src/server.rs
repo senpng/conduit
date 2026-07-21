@@ -530,6 +530,10 @@ pub fn build_console_router(state: Arc<crate::state::DaemonState>) -> Router {
             "/console/providers/{id}/secret",
             put(crate::console::set_provider_secret).get(crate::console::get_provider_secret),
         )
+        .route(
+            "/console/providers/{id}/oauth-settings",
+            axum::routing::patch(crate::console::update_provider_oauth_settings),
+        )
         // Routes
         .route("/console/routes", get(crate::console::list_routes))
         .route("/console/routes", post(crate::console::create_route))

@@ -530,6 +530,7 @@ impl App {
                     net::spawn_quota_refresh(self.client.clone(), id, self.tx.clone());
                 }
             }
+            Action::CycleCloakMode => self.cycle_claude_cloak_mode(),
             Action::ViewSecret => {
                 if self.tab == Tab::Providers {
                     // Toggle per-provider: hide if already decrypted for the selection.
@@ -1056,6 +1057,7 @@ impl App {
                     ("o", "re-auth"),
                     ("x", "token ↻"),
                     ("u", "remaining"),
+                    ("c", "cloak"),
                     ("d", "delete"),
                     ("/", "filter"),
                 ]);
@@ -1260,6 +1262,51 @@ impl App {
             return;
         }
         self.mode = Mode::OauthFlow(OauthFlow::reauth(p));
+    }
+
+    /// Cycle Claude OAuth `cloak_mode` for the selected provider: auto → always → never → auto.
+    fn cycle_claude_cloak_mode(&mut self) {
+        if !matches!(self.mode, Mode::Browse | Mode::Filter) || self.tab != Tab::Providers {
+            return;
+        }
+        let Some(p) = self
+            .selected_data_index()
+            .and_then(|i| self.providers.get(i).cloned())
+        else {
+            self.status = "Select a Claude OAuth provider first".into();
+            return;
+        };
+        let kind = p.kind.to_ascii_lowercase();
+        if !matches!(
+            kind.as_str(),
+            "claude-oauth" | "claude" | "anthropic-oauth"
+        ) {
+            self.status = format!(
+                "cloak_mode only applies to claude-oauth (got {})",
+                p.kind
+            );
+            return;
+        }
+        // Prefer cached secret view for current mode; default auto when unknown.
+        let current = self
+            .provider_secrets
+            .get(&p.id)
+            .and_then(|s| s.oauth.as_ref())
+            .and_then(|o| o.cloak_mode.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("auto")
+            .to_ascii_lowercase();
+        let next = match current.as_str() {
+            "always" => "never",
+            "never" => "auto",
+            _ => "always",
+        };
+        self.status = format!("Setting cloak_mode={next}…");
+        self.loading = true;
+        let id = p.id.clone();
+        let body = crate::dto::UpdateOAuthSettingsBody::cloak_mode(next);
+        net::spawn_update_oauth_settings(self.client.clone(), id, body, self.tx.clone());
     }
 
     fn start_edit(&mut self) {
@@ -2372,6 +2419,14 @@ fn format_provider_secret_modal(view: &crate::dto::ProviderSecretView) -> String
         if let Some(ua) = o.using_api {
             push(&mut lines, "using_api", &ua.to_string());
         }
+        // Always surface cloak_mode for Claude OAuth (default auto).
+        let cloak = o
+            .cloak_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("auto");
+        push(&mut lines, "cloak_mode", cloak);
         lines.push(String::new());
         push(&mut lines, "access_token", &o.access_token);
         push(&mut lines, "refresh_token", &o.refresh_token);
