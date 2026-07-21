@@ -98,48 +98,6 @@ pub fn spawn_provider_secret(
     });
 }
 
-/// PATCH Claude OAuth settings (cloak_mode), then re-fetch secret so the detail pane updates.
-pub fn spawn_update_oauth_settings(
-    client: ConsoleClient,
-    provider_id: String,
-    body: crate::dto::UpdateOAuthSettingsBody,
-    tx: UnboundedSender<Msg>,
-) {
-    tokio::spawn(async move {
-        match client
-            .update_provider_oauth_settings(&provider_id, &body)
-            .await
-        {
-            Ok(v) => {
-                let mode = v
-                    .get("cloak_mode")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("?");
-                let _ = tx.send(Msg::Mutated {
-                    ok: true,
-                    message: format!("cloak_mode={mode}"),
-                    refresh: RefreshKind::None,
-                    secret: None,
-                });
-                // Refresh decrypted secret so cloak_mode shows in detail.
-                let r = client
-                    .get_provider_secret(&provider_id)
-                    .await
-                    .map_err(|e| e.to_string());
-                let _ = tx.send(Msg::ProviderSecret(r));
-            }
-            Err(e) => {
-                let _ = tx.send(Msg::Mutated {
-                    ok: false,
-                    message: format!("cloak_mode: {e}"),
-                    refresh: RefreshKind::None,
-                    secret: None,
-                });
-            }
-        }
-    });
-}
-
 /// Decrypt a downstream key's raw token for the reveal modal.
 pub fn spawn_key_secret(client: ConsoleClient, key_id: String, tx: UnboundedSender<Msg>) {
     tokio::spawn(async move {
