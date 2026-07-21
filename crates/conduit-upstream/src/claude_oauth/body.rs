@@ -276,4 +276,66 @@ mod tests {
         );
         assert!(prepared.body.get("thinking").is_none());
     }
+
+    #[test]
+    fn claude_cli_auto_cloak_preserves_client_user_id() {
+        // CLIProxyAPI ShouldCloak(auto): claude-cli UA → no cloak → keep body metadata.
+        let client_uid = "user_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb_account_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa_session_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "system": "You are Claude Code",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": client_uid}
+        });
+        let opts = ClaudeOAuthRelayOptions {
+            client_headers: vec![(
+                "User-Agent".into(),
+                "claude-cli/2.1.63 (external, cli)".into(),
+            )],
+            ..Default::default()
+        };
+        let prepared = prepare_oauth_body(body, "claude-sonnet-4", "sk-ant-oat-cli", &opts);
+        // No billing cloak for real Claude Code.
+        let sys_text = match &prepared.body["system"] {
+            serde_json::Value::String(s) => s.as_str(),
+            serde_json::Value::Array(a) => a
+                .first()
+                .and_then(|b| b["text"].as_str())
+                .unwrap_or(""),
+            _ => "",
+        };
+        assert!(
+            !sys_text.starts_with("x-anthropic-billing-header:"),
+            "claude-cli must not be cloaked: {sys_text}"
+        );
+        assert_eq!(
+            prepared.body["metadata"]["user_id"].as_str().unwrap(),
+            client_uid
+        );
+    }
+
+    #[test]
+    fn non_cli_auto_cloak_injects_fake_user_id() {
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "system": "custom agent",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let opts = ClaudeOAuthRelayOptions {
+            client_headers: vec![("User-Agent".into(), "curl/8.0".into())],
+            ..Default::default()
+        };
+        let prepared = prepare_oauth_body(body, "claude-sonnet-4", "sk-ant-oat-curl", &opts);
+        let uid = prepared.body["metadata"]["user_id"]
+            .as_str()
+            .expect("fake user_id injected for non-cli");
+        assert!(
+            uid.starts_with("user_") && uid.contains("_account_") && uid.contains("_session_"),
+            "uid={uid}"
+        );
+        assert!(prepared.body["system"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("x-anthropic-billing-header:"));
+    }
 }

@@ -66,6 +66,21 @@ pub fn encode_request(req: &CanonicalChatRequest, stream: bool) -> Value {
         }
     }
 
+    // Claude Code / Anthropic `metadata` (esp. `user_id`) is stored on IR as
+    // `meta.extra["metadata"]` during decode. Re-emit so OAuth cloak can either
+    // preserve a real Claude Code user_id or inject a fake one for non-CLI.
+    if let Some(meta) = req.meta.extra.get("metadata") {
+        if !meta.is_null() {
+            body["metadata"] = meta.clone();
+        }
+    }
+    // Native Anthropic thinking config is stashed the same way.
+    if let Some(thinking) = req.meta.extra.get("thinking") {
+        if !thinking.is_null() && body.get("thinking").is_none() {
+            body["thinking"] = thinking.clone();
+        }
+    }
+
     body
 }
 
@@ -257,5 +272,35 @@ mod tests {
         }];
         let result = encode_content(&content);
         assert!(result.is_empty(), "unsupported MIME should be skipped");
+    }
+
+    #[test]
+    fn preserves_metadata_user_id() {
+        let mut req =
+            CanonicalChatRequest::new("claude-3-5-sonnet", vec![CanonicalMessage::user("Hi")]);
+        req.meta.extra.insert(
+            "metadata".into(),
+            json!({
+                "user_id": "user_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_account_11111111-1111-1111-1111-111111111111_session_22222222-2222-2222-2222-222222222222"
+            }),
+        );
+        let v = encode_request(&req, false);
+        assert_eq!(
+            v["metadata"]["user_id"].as_str().unwrap(),
+            "user_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_account_11111111-1111-1111-1111-111111111111_session_22222222-2222-2222-2222-222222222222"
+        );
+    }
+
+    #[test]
+    fn preserves_thinking_from_meta_extra() {
+        let mut req =
+            CanonicalChatRequest::new("claude-3-5-sonnet", vec![CanonicalMessage::user("Hi")]);
+        req.meta.extra.insert(
+            "thinking".into(),
+            json!({"type": "enabled", "budget_tokens": 2048}),
+        );
+        let v = encode_request(&req, false);
+        assert_eq!(v["thinking"]["type"], "enabled");
+        assert_eq!(v["thinking"]["budget_tokens"], 2048);
     }
 }

@@ -65,6 +65,17 @@ pub fn merge_anthropic_betas(client_headers: &[(String, String)], extra: &[Strin
     base
 }
 
+/// CLIProxyAPI `EnsureHeader`: prefer non-empty client header, else default.
+fn ensure_header_value(
+    client: &[(String, String)],
+    name: &str,
+    default: impl Into<String>,
+) -> String {
+    client_header(client, name)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| default.into())
+}
+
 /// Build the full Claude Code OAuth header set (CLIProxyAPI parity).
 /// Does **not** include Authorization — caller adds Bearer.
 pub fn build_claude_oauth_headers(
@@ -75,7 +86,18 @@ pub fn build_claude_oauth_headers(
 ) -> Vec<(String, String)> {
     let defaults: &ClaudeHeaderDefaults = &opts.header_defaults;
     let profile = resolve_device_profile(access_token, &opts.client_headers, defaults);
-    let session_id = cached_session_id(access_token);
+    // Prefer real Claude Code session when the client sent one; only mint a
+    // stable per-token UUID when absent (CLIProxyAPI EnsureHeader parity).
+    let session_id = ensure_header_value(
+        &opts.client_headers,
+        "X-Claude-Code-Session-Id",
+        cached_session_id(access_token),
+    );
+    let client_request_id = ensure_header_value(
+        &opts.client_headers,
+        "x-client-request-id",
+        Uuid::new_v4().to_string(),
+    );
     let betas = merge_anthropic_betas(&opts.client_headers, extra_betas);
     let timeout = defaults
         .timeout
@@ -84,15 +106,16 @@ pub fn build_claude_oauth_headers(
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_TIMEOUT);
 
-    // Anthropic-Version: prefer client if present (EnsureHeader parity).
+    // Anthropic-Version / X-App: prefer client if present (EnsureHeader parity).
     let anthropic_version =
         client_header(&opts.client_headers, "Anthropic-Version").unwrap_or("2023-06-01");
+    let x_app = client_header(&opts.client_headers, "X-App").unwrap_or("cli");
 
     let mut headers = vec![
         ("Content-Type".into(), "application/json".into()),
         ("Anthropic-Beta".into(), betas),
         ("Anthropic-Version".into(), anthropic_version.into()),
-        ("X-App".into(), "cli".into()),
+        ("X-App".into(), x_app.into()),
         ("X-Stainless-Retry-Count".into(), "0".into()),
         ("X-Stainless-Runtime".into(), "node".into()),
         ("X-Stainless-Lang".into(), "js".into()),
@@ -108,7 +131,7 @@ pub fn build_claude_oauth_headers(
         ("X-Stainless-Os".into(), profile.os.clone()),
         ("X-Stainless-Arch".into(), profile.arch.clone()),
         ("X-Claude-Code-Session-Id".into(), session_id),
-        ("x-client-request-id".into(), Uuid::new_v4().to_string()),
+        ("x-client-request-id".into(), client_request_id),
         ("User-Agent".into(), profile.user_agent.clone()),
         ("Connection".into(), "keep-alive".into()),
     ];
@@ -198,5 +221,60 @@ mod tests {
             .map(|(_, v)| v.as_str())
             .unwrap();
         assert_eq!(ua, "claude-cli/2.1.70 (external, cli)");
+    }
+
+    #[test]
+    fn session_id_prefers_client_header() {
+        let opts = ClaudeOAuthRelayOptions {
+            client_headers: vec![(
+                "X-Claude-Code-Session-Id".into(),
+                "client-session-uuid".into(),
+            )],
+            ..Default::default()
+        };
+        let h = build_claude_oauth_headers("tok-session-prefer", false, &[], &opts);
+        let sid = h
+            .iter()
+            .find(|(k, _)| k == "X-Claude-Code-Session-Id")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(sid, "client-session-uuid");
+    }
+
+    #[test]
+    fn session_id_falls_back_to_cached_per_token() {
+        let token = "tok-session-fallback-unique";
+        let h1 = build_claude_oauth_headers(token, false, &[], &ClaudeOAuthRelayOptions::default());
+        let h2 = build_claude_oauth_headers(token, false, &[], &ClaudeOAuthRelayOptions::default());
+        let sid1 = h1
+            .iter()
+            .find(|(k, _)| k == "X-Claude-Code-Session-Id")
+            .map(|(_, v)| v.as_str())
+            .unwrap()
+            .to_string();
+        let sid2 = h2
+            .iter()
+            .find(|(k, _)| k == "X-Claude-Code-Session-Id")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert!(!sid1.is_empty());
+        assert_eq!(sid1, sid2, "same token should reuse cached session id");
+        // Must be a UUID-shaped fallback, not empty.
+        assert!(uuid::Uuid::parse_str(&sid1).is_ok(), "sid={sid1}");
+    }
+
+    #[test]
+    fn client_request_id_prefers_client() {
+        let opts = ClaudeOAuthRelayOptions {
+            client_headers: vec![("x-client-request-id".into(), "req-from-client".into())],
+            ..Default::default()
+        };
+        let h = build_claude_oauth_headers("tok", false, &[], &opts);
+        let rid = h
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("x-client-request-id"))
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(rid, "req-from-client");
     }
 }
