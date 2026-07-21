@@ -129,10 +129,21 @@ impl WireCodec for OpenAICodec {
             "completion_tokens": resp.usage.completion_tokens,
             "total_tokens": resp.usage.total_tokens,
         });
-        if resp.usage.cache_read_tokens > 0 {
-            usage["prompt_tokens_details"] = json!({
-                "cached_tokens": resp.usage.cache_read_tokens,
-            });
+        if resp.usage.cache_read_tokens > 0 || resp.usage.cache_write_tokens > 0 {
+            let mut details = serde_json::Map::new();
+            if resp.usage.cache_read_tokens > 0 {
+                details.insert(
+                    "cached_tokens".into(),
+                    json!(resp.usage.cache_read_tokens),
+                );
+            }
+            if resp.usage.cache_write_tokens > 0 {
+                details.insert(
+                    "cache_write_tokens".into(),
+                    json!(resp.usage.cache_write_tokens),
+                );
+            }
+            usage["prompt_tokens_details"] = Value::Object(details);
         }
         if resp.usage.reasoning_tokens > 0 {
             usage["completion_tokens_details"] = json!({
@@ -343,6 +354,7 @@ mod tests {
                 completion_tokens: 50,
                 total_tokens: 150,
                 cache_read_tokens: 80,
+                cache_write_tokens: 40,
                 reasoning_tokens: 30,
                 ..Default::default()
             },
@@ -354,6 +366,12 @@ mod tests {
                 .as_u64()
                 .unwrap(),
             80
+        );
+        assert_eq!(
+            wire["usage"]["prompt_tokens_details"]["cache_write_tokens"]
+                .as_u64()
+                .unwrap(),
+            40
         );
         assert_eq!(
             wire["usage"]["completion_tokens_details"]["reasoning_tokens"]

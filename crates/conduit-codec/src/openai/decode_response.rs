@@ -146,10 +146,12 @@ pub(crate) fn decode_usage(usage: &Value) -> Usage {
         .as_u64()
         .unwrap_or((prompt_tokens + completion_tokens) as u64) as u32;
 
-    // Cache tokens (prompt_tokens_details.cached_tokens)
-    let cache_read_tokens = usage["prompt_tokens_details"]["cached_tokens"]
-        .as_u64()
-        .unwrap_or(0) as u32;
+    // Cache tokens (prompt_tokens_details.*). Field names mirror Responses API's
+    // input_tokens_details: cached_tokens = read, cache_write_tokens = write.
+    // Older models only emit cached_tokens; write stays 0 when absent.
+    let details = &usage["prompt_tokens_details"];
+    let cache_read_tokens = details["cached_tokens"].as_u64().unwrap_or(0) as u32;
+    let cache_write_tokens = details["cache_write_tokens"].as_u64().unwrap_or(0) as u32;
 
     // Reasoning tokens (completion_tokens_details.reasoning_tokens) — o1/o3
     let reasoning_tokens = usage["completion_tokens_details"]["reasoning_tokens"]
@@ -162,7 +164,7 @@ pub(crate) fn decode_usage(usage: &Value) -> Usage {
         total_tokens,
         reasoning_tokens,
         cache_read_tokens,
-        cache_write_tokens: 0,
+        cache_write_tokens,
     }
 }
 
@@ -275,6 +277,32 @@ mod tests {
         });
         let resp = decode_response(body, "gpt-4o").unwrap().0;
         assert_eq!(resp.usage.cache_read_tokens, 80);
+        assert_eq!(resp.usage.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn cache_write_tokens_mapped() {
+        let body = json!({
+            "id": "chatcmpl-cache-write",
+            "model": "gpt-5.6",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 200,
+                "completion_tokens": 10,
+                "total_tokens": 210,
+                "prompt_tokens_details": {
+                    "cached_tokens": 50,
+                    "cache_write_tokens": 120
+                }
+            }
+        });
+        let resp = decode_response(body, "gpt-5.6").unwrap().0;
+        assert_eq!(resp.usage.cache_read_tokens, 50);
+        assert_eq!(resp.usage.cache_write_tokens, 120);
     }
 
     #[test]
