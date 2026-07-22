@@ -60,6 +60,9 @@ pub struct ProviderForm {
     pub kind_idx: usize,
     /// Display-only kind for edit mode (API cannot change kind).
     pub kind_display: Option<String>,
+    /// Cloak value when the form opened; silent secret prefill only overwrites
+    /// while the field still matches this seed (user edits win).
+    cloak_seed: Option<String>,
     pub error: Option<String>,
 }
 
@@ -76,6 +79,7 @@ impl ProviderForm {
             focus: 0,
             kind_idx: 0,
             kind_display: None,
+            cloak_seed: None,
             error: None,
         }
     }
@@ -89,9 +93,11 @@ impl ProviderForm {
             .position(|k| *k == p.kind.as_str())
             .unwrap_or(0);
         let mut fields = vec![InputField::new(&p.name), InputField::new(&p.base_url)];
+        let mut cloak_seed = None;
         if Self::is_claude_oauth_kind(&p.kind) {
             let mode = normalize_cloak_mode_display(cloak_mode.unwrap_or("auto"));
             fields.push(InputField::new(mode));
+            cloak_seed = Some(mode.to_string());
         }
         Self {
             kind: ProviderFormKind::Edit { id: p.id.clone() },
@@ -99,6 +105,7 @@ impl ProviderForm {
             focus: 0,
             kind_idx,
             kind_display: Some(p.kind.clone()),
+            cloak_seed,
             error: None,
         }
     }
@@ -113,6 +120,7 @@ impl ProviderForm {
             focus: 0,
             kind_idx: 0,
             kind_display: None,
+            cloak_seed: None,
             error: None,
         }
     }
@@ -178,6 +186,29 @@ impl ProviderForm {
         field.cursor = next.chars().count();
         // Jump focus to cloak field so the change is visible.
         self.focus = 2;
+        // Leave `cloak_seed` as the original open value so silent prefill
+        // sees current != seed and does not clobber this user change.
+    }
+
+    /// Apply cloak mode from a decrypted credential (edit form only).
+    ///
+    /// Only overwrites while the field still matches [`Self::cloak_seed`], so a
+    /// slow silent prefill cannot undo a user Ctrl+k / typed change.
+    pub fn apply_cloak_mode(&mut self, mode: &str) {
+        if !matches!(self.kind, ProviderFormKind::Edit { .. }) || self.fields.len() < 3 {
+            return;
+        }
+        let normalized = normalize_cloak_mode_display(mode);
+        let field = &mut self.fields[2];
+        let current = normalize_cloak_mode_display(&field.value);
+        if let Some(seed) = self.cloak_seed.as_deref() {
+            if current != seed {
+                return;
+            }
+        }
+        field.value = normalized.to_string();
+        field.cursor = normalized.chars().count();
+        self.cloak_seed = Some(normalized.to_string());
     }
 
     pub fn is_oauth_kind_label(kind: &str) -> bool {
@@ -1227,6 +1258,23 @@ mod tests {
         assert_eq!(f.fields[2].value, "always");
         let oauth = f.to_oauth_settings_body().unwrap();
         assert_eq!(oauth.cloak_mode.as_deref(), Some("always"));
+    }
+
+    #[test]
+    fn silent_cloak_prefill_does_not_clobber_user_cycle() {
+        let p = pv("id1", "claude", "claude-oauth");
+        // Opened without cache → seed is default auto.
+        let mut f = ProviderForm::edit(&p, None);
+        assert_eq!(f.fields[2].value, "auto");
+        f.cycle_cloak_mode(); // user → always
+        assert_eq!(f.fields[2].value, "always");
+        // Late secret reply with stored "never" must not overwrite user choice.
+        f.apply_cloak_mode("never");
+        assert_eq!(f.fields[2].value, "always");
+        // If user left the seed value, prefill applies.
+        let mut f2 = ProviderForm::edit(&p, None);
+        f2.apply_cloak_mode("never");
+        assert_eq!(f2.fields[2].value, "never");
     }
 
     #[test]

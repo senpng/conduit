@@ -84,9 +84,13 @@ pub fn spawn_providers(client: ConsoleClient, gen: u64, tx: UnboundedSender<Msg>
 }
 
 /// Decrypt provider secret for detail pane.
+///
+/// `show_modal`: when true, the UI opens the secret reveal dialog; when false,
+/// only the in-memory cache is updated (edit prefill / post-save refresh).
 pub fn spawn_provider_secret(
     client: ConsoleClient,
     provider_id: String,
+    show_modal: bool,
     tx: UnboundedSender<Msg>,
 ) {
     tokio::spawn(async move {
@@ -94,7 +98,10 @@ pub fn spawn_provider_secret(
             .get_provider_secret(&provider_id)
             .await
             .map_err(|e| e.to_string());
-        let _ = tx.send(Msg::ProviderSecret(r));
+        let _ = tx.send(Msg::ProviderSecret {
+            result: r,
+            show_modal,
+        });
     });
 }
 
@@ -401,12 +408,16 @@ pub fn spawn_update_provider(
                             if let Some(mode) = v.get("cloak_mode").and_then(|x| x.as_str()) {
                                 message = format!("Provider {id} updated (cloak_mode={mode})");
                             }
-                            // Refresh decrypted secret so detail shows new cloak_mode.
+                            // Refresh decrypted secret so detail shows new cloak_mode
+                            // without re-opening the secret modal.
                             let r = client
                                 .get_provider_secret(&id)
                                 .await
                                 .map_err(|e| e.to_string());
-                            let _ = tx.send(Msg::ProviderSecret(r));
+                            let _ = tx.send(Msg::ProviderSecret {
+                                result: r,
+                                show_modal: false,
+                            });
                         }
                         Err(e) => {
                             let _ = tx.send(Msg::Mutated {

@@ -62,7 +62,13 @@ pub enum Msg {
     OauthCancelled(Result<(), String>),
     KeyCreated(Result<KeyCreateResponse, String>),
     /// Decrypted provider secret for detail / modal.
-    ProviderSecret(Result<ProviderSecretView, String>),
+    ///
+    /// `show_modal`: open the full secret reveal dialog (user pressed `v`).
+    /// When false, only refresh the in-memory cache (edit prefill / post-save).
+    ProviderSecret {
+        result: Result<ProviderSecretView, String>,
+        show_modal: bool,
+    },
     /// Decrypted downstream key raw token for the reveal modal.
     KeySecret(Result<KeySecretView, String>),
 }

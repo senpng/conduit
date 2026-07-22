@@ -540,7 +540,12 @@ impl App {
                         }
                         self.status = "Decrypting secret…".into();
                         self.loading = true;
-                        net::spawn_provider_secret(self.client.clone(), id, self.tx.clone());
+                        net::spawn_provider_secret(
+                            self.client.clone(),
+                            id,
+                            true,
+                            self.tx.clone(),
+                        );
                     } else {
                         self.status = "Select a provider first".into();
                     }
@@ -1280,6 +1285,18 @@ impl App {
                         .get(&p.id)
                         .and_then(|s| s.oauth.as_ref())
                         .and_then(|o| o.cloak_mode.as_deref());
+                    // Prefetch OAuth secret so cloak_mode is real, not default `auto`.
+                    // Silent (no modal) — form field updates when the reply lands.
+                    if cloak.is_none()
+                        && super::forms::ProviderForm::is_claude_oauth_kind(&p.kind)
+                    {
+                        net::spawn_provider_secret(
+                            self.client.clone(),
+                            p.id.clone(),
+                            false,
+                            self.tx.clone(),
+                        );
+                    }
                     self.mode = Mode::ProviderForm(ProviderForm::edit(p, cloak));
                 }
             }
@@ -1958,34 +1975,68 @@ impl App {
                     };
                 }
             }
-            Msg::ProviderSecret(r) => {
+            Msg::ProviderSecret {
+                result,
+                show_modal,
+            } => {
                 self.loading = false;
-                match r {
+                match result {
                     Ok(view) => {
-                        let title = format!(
-                            "Secret · {} ({})",
-                            if view.provider_name.is_empty() {
-                                view.provider_id.as_str()
-                            } else {
-                                view.provider_name.as_str()
-                            },
-                            view.secret_kind
-                        );
-                        let body = format_provider_secret_modal(&view);
                         let id = view.provider_id.clone();
-                        self.provider_secrets.insert(id, view);
-                        self.mode = Mode::SecretReveal {
-                            title,
-                            secret: body,
-                            single_value: false,
-                        };
-                        self.status =
-                            "Secret decrypted — shown in detail & modal (v to hide; others keep)"
-                                .into();
+                        // If the edit form is open for this Claude provider, patch
+                        // cloak_mode from the freshly decrypted credential so the
+                        // field is not stuck on the default `auto`.
+                        if let Mode::ProviderForm(f) = &mut self.mode {
+                            if matches!(
+                                &f.kind,
+                                super::forms::ProviderFormKind::Edit { id: edit_id }
+                                    if *edit_id == id
+                            ) {
+                                if let Some(mode) = view
+                                    .oauth
+                                    .as_ref()
+                                    .and_then(|o| o.cloak_mode.as_deref())
+                                {
+                                    f.apply_cloak_mode(mode);
+                                }
+                            }
+                        }
+                        if show_modal {
+                            let title = format!(
+                                "Secret · {} ({})",
+                                if view.provider_name.is_empty() {
+                                    view.provider_id.as_str()
+                                } else {
+                                    view.provider_name.as_str()
+                                },
+                                view.secret_kind
+                            );
+                            let body = format_provider_secret_modal(&view);
+                            self.provider_secrets.insert(id, view);
+                            self.mode = Mode::SecretReveal {
+                                title,
+                                secret: body,
+                                single_value: false,
+                            };
+                            self.status =
+                                "Secret decrypted — shown in detail & modal (v to hide; others keep)"
+                                    .into();
+                        } else {
+                            self.provider_secrets.insert(id, view);
+                            // Keep status quiet on background prefill / post-save refresh.
+                            if !matches!(self.mode, Mode::ProviderForm(_)) {
+                                self.status = "Secret cache refreshed".into();
+                            }
+                        }
                     }
                     Err(e) => {
-                        self.error = Some(e);
-                        self.status = "Failed to decrypt secret".into();
+                        // Silent refresh failures should not clobber an open form.
+                        if show_modal {
+                            self.error = Some(e);
+                            self.status = "Failed to decrypt secret".into();
+                        } else {
+                            self.status = format!("Secret refresh failed: {e}");
+                        }
                     }
                 }
             }

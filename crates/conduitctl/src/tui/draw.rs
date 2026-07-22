@@ -1736,6 +1736,18 @@ fn provider_secret_detail_lines(
         if let Some(ua) = o.using_api {
             push(&mut out, "using_api", ua.to_string());
         }
+        // Always show cloak_mode for Claude OAuth (API defaults omitted → auto).
+        if super::forms::ProviderForm::is_claude_oauth_kind(&p.kind)
+            || o.provider_type.eq_ignore_ascii_case("claude")
+        {
+            let cloak = o
+                .cloak_mode
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("auto");
+            push(&mut out, "cloak_mode", cloak.to_string());
+        }
         push_secret(&mut out, "access_token", &o.access_token);
         push_secret(&mut out, "refresh_token", &o.refresh_token);
         if let Some(id_tok) = &o.id_token {
