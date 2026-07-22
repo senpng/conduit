@@ -479,7 +479,7 @@ fn draw_overview_month_spark(frame: &mut Frame, chart_area: Rect, mix_area: Rect
     let period = super::forms::current_period();
     let model_mix = month_model_token_mix(app, &period);
 
-    draw_month_token_chart(frame, chart_area, app, &period);
+    draw_month_token_chart(frame, chart_area, app, &period, &model_mix);
     if model_mix.is_empty() {
         // Keep a right panel so the split still mirrors the row above.
         let block = overview_right_block(theme, format!("Models  {period}  ·  no traffic"));
@@ -489,7 +489,13 @@ fn draw_overview_month_spark(frame: &mut Frame, chart_area: Rect, mix_area: Rect
     }
 }
 
-fn draw_month_token_chart(frame: &mut Frame, area: Rect, app: &App, period: &str) {
+fn draw_month_token_chart(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    period: &str,
+    model_mix: &[(String, u64)],
+) {
     let theme = &app.theme;
     let block = panel_block(
         theme,
@@ -620,8 +626,9 @@ fn draw_month_token_chart(frame: &mut Frame, area: Rect, app: &App, period: &str
     let label_w = 2usize;
     let col_w = chart_w.saturating_sub(label_w + 1).max(1);
     let toks: Vec<f64> = days.iter().map(|d| d.total_tokens as f64).collect();
-    let model_mix = month_model_token_mix(app, period);
-    let stacks = month_day_model_stacks(app, period, &days, &model_mix, theme);
+    // Model mix is computed once by the caller and shared with the right-hand
+    // Models panel — avoid rebuilding the HashMap + sort a second time per frame.
+    let stacks = month_day_model_stacks(app, period, &days, model_mix, theme);
 
     draw_day_bar_panel(
         frame,
@@ -701,9 +708,8 @@ fn draw_month_model_mix(
     // leading space + gaps around name/bar/pct/tok
     let gaps = 4usize;
     let flex = w.saturating_sub(pct_w + tok_w + gaps).max(10);
-    // ~40% name, rest bar — no max clamp so wide panes use full width.
-    let name_w = (flex * 40 / 100).clamp(8, flex.saturating_sub(6));
-    let bar_w = flex.saturating_sub(name_w);
+    // ~40% name, rest bar — degrades safely on narrow panes (no clamp panic).
+    let (name_w, bar_w) = split_name_bar(flex, 40, 8, 6);
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(n);
     for (i, (name, tok)) in mix.iter().take(n).enumerate() {
@@ -743,6 +749,21 @@ fn format_model_pct(pct: f64) -> String {
     } else {
         "0%".into()
     }
+}
+
+/// Split `flex` columns between a name column (~`name_pct`%) and a bar column.
+///
+/// `min_name` / `min_bar` are the preferred minimums. On wide panes this is the
+/// plain `(flex * pct / 100).clamp(min_name, flex - min_bar)` recipe. On narrow
+/// panes where `flex < min_name + min_bar` there is no room for both minimums:
+/// the name is pinned to `min_name` and the bar takes whatever remains (possibly
+/// less than `min_bar`). Crucially the clamp upper bound is floored to `min_name`
+/// so `min > max` can never happen — a raw `clamp` panics there (窄终端崩溃).
+fn split_name_bar(flex: usize, name_pct: usize, min_name: usize, min_bar: usize) -> (usize, usize) {
+    let upper = flex.saturating_sub(min_bar).max(min_name);
+    let name_w = (flex * name_pct / 100).clamp(min_name, upper);
+    let bar_w = flex.saturating_sub(name_w);
+    (name_w, bar_w)
 }
 
 /// Aggregate model token totals for `YYYY-MM` from `by_day_model`.
@@ -1177,8 +1198,7 @@ fn draw_overview_top_models(frame: &mut Frame, area: Rect, app: &App) {
     // leading space + 3 gaps (name|bar, bar|pct, pct|tok)
     let gaps = 4usize;
     let flex = w.saturating_sub(pct_w + tok_w + gaps).max(10);
-    let name_w = (flex * 40 / 100).clamp(8, flex.saturating_sub(6));
-    let bar_w = flex.saturating_sub(name_w);
+    let (name_w, bar_w) = split_name_bar(flex, 40, 8, 6);
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(n);
     for (i, (name, tok)) in rows.iter().take(n).enumerate() {
@@ -1279,9 +1299,8 @@ fn draw_overview_provider_health(frame: &mut Frame, area: Rect, app: &App) {
     let fixed = kind_w + pct_w + ttfb_w + tok_w + tps_w + gaps;
     let flex = width.saturating_sub(fixed).max(16);
     // Give name room for "codex (user@email.com)"; leftover grows the success bar.
-    // Never force a min bar wider than remaining flex (avoids overflow on narrow panes).
-    let name_w = (flex * 45 / 100).clamp(12, flex.saturating_sub(8));
-    let bar_w = flex.saturating_sub(name_w);
+    // Never force a min bar wider than remaining flex (avoids overflow / clamp panic on narrow panes).
+    let (name_w, bar_w) = split_name_bar(flex, 45, 12, 8);
 
     let show_header = inner.height >= 3 && width >= 48;
     let body_h = if show_header {
@@ -2287,22 +2306,10 @@ fn contribution_graph_lines(
 }
 
 fn heat_level_from_intensity(intensity: f64) -> u8 {
-    let r = if intensity.is_finite() {
-        intensity.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    if r <= 0.0 {
-        0
-    } else if r < 0.25 {
-        1
-    } else if r < 0.50 {
-        2
-    } else if r < 0.75 {
-        3
-    } else {
-        4
-    }
+    // Same 0..=4 tokscale bands as `widgets::heat_level`; intensity is already
+    // normalized to 0..=1, so peak is 1.0. Delegated so the thresholds live in
+    // one place and can't drift between the heatmap and its legend.
+    heat_level(intensity, 1.0)
 }
 
 fn find_cell<'a>(
@@ -4643,5 +4650,45 @@ mod stack_color_tests {
         let segs = [(Color::Blue, 75.0), (Color::Green, 25.0)];
         assert_eq!(stack_color_at(2.9, 4.0, &segs, Color::Red), Color::Blue);
         assert_eq!(stack_color_at(3.5, 4.0, &segs, Color::Red), Color::Green);
+    }
+}
+
+#[cfg(test)]
+mod split_name_bar_tests {
+    use super::split_name_bar;
+
+    #[test]
+    fn wide_pane_matches_percentage_recipe() {
+        // On a wide pane the split is the plain clamp(min_name, flex - min_bar).
+        // flex=100, 40% → name 40, bar 60.
+        assert_eq!(split_name_bar(100, 40, 8, 6), (40, 60));
+        // flex=50, 45% → name 22, bar 28.
+        assert_eq!(split_name_bar(50, 45, 12, 8), (22, 28));
+    }
+
+    #[test]
+    fn narrow_pane_does_not_panic_and_pins_min_name() {
+        // These are the exact widths that made the old `.clamp(min, flex-k)`
+        // panic (min > max). name pins to min_name; bar takes what's left.
+        // month/top-models sites: min_name=8, min_bar=6.
+        for flex in 10..=13 {
+            let (name, bar) = split_name_bar(flex, 40, 8, 6);
+            assert_eq!(name, 8, "flex={flex}");
+            assert_eq!(bar, flex - 8, "flex={flex}");
+        }
+        // provider-health site: min_name=12, min_bar=8.
+        for flex in 16..=19 {
+            let (name, bar) = split_name_bar(flex, 45, 12, 8);
+            assert_eq!(name, 12, "flex={flex}");
+            assert_eq!(bar, flex - 12, "flex={flex}");
+        }
+    }
+
+    #[test]
+    fn extreme_narrow_saturates_bar_to_zero() {
+        // flex below min_name: name still pinned, bar saturates to 0 (no underflow).
+        let (name, bar) = split_name_bar(5, 40, 8, 6);
+        assert_eq!(name, 8);
+        assert_eq!(bar, 0);
     }
 }

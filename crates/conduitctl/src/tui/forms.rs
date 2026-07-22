@@ -13,6 +13,11 @@ use super::input::InputField;
 /// OAuth is a separate add path on the Providers tab.
 pub const PROVIDER_KINDS: &[&str] = &["openai", "anthropic"];
 
+/// OAuth subscription kinds, in chooser / cycle order. Single source of truth
+/// for [`OauthFlow::kind`] / [`OauthFlow::cycle_kind`] / [`OauthFlow::start_new`]
+/// so the string list and its indices can't drift apart.
+pub const OAUTH_KINDS: &[&str] = &["claude", "codex", "grok"];
+
 /// Choices when pressing `a` on Providers.
 pub const PROVIDER_ADD_OPTIONS: &[&str] = &[
     "API key   — openai / anthropic (+ paste secret)",
@@ -938,7 +943,7 @@ impl OauthFlow {
     /// Start a new OAuth provider (from Providers → add).
     pub fn start_new(kind_idx: usize, name: &str) -> Self {
         let mut f = Self::new();
-        f.kind_idx = kind_idx.min(2);
+        f.kind_idx = kind_idx.min(OAUTH_KINDS.len() - 1);
         if !name.is_empty() {
             f.name = InputField::new(name);
         }
@@ -965,12 +970,12 @@ impl OauthFlow {
     }
 
     pub fn kind(&self) -> &'static str {
-        ["claude", "codex", "grok"][self.kind_idx.min(2)]
+        OAUTH_KINDS[self.kind_idx.min(OAUTH_KINDS.len() - 1)]
     }
 
     pub fn cycle_kind(&mut self) {
         // Kind is usually fixed by the add chooser; still allow cycle when re-authing.
-        self.kind_idx = (self.kind_idx + 1) % 3;
+        self.kind_idx = (self.kind_idx + 1) % OAUTH_KINDS.len();
     }
 }
 
@@ -1058,48 +1063,22 @@ impl PricingOverrideForm {
         if provider_kind.is_empty() || model_id.is_empty() {
             return Err("provider_kind and model_id are required".into());
         }
-        let input_per_mtok: f64 = self.fields[2]
-            .value
-            .trim()
-            .parse()
-            .map_err(|_| "invalid input_per_mtok".to_string())?;
-        let output_per_mtok: f64 = self.fields[3]
-            .value
-            .trim()
-            .parse()
-            .map_err(|_| "invalid output_per_mtok".to_string())?;
-        if !input_per_mtok.is_finite()
-            || !output_per_mtok.is_finite()
-            || input_per_mtok < 0.0
-            || output_per_mtok < 0.0
-        {
-            return Err("prices must be finite and non-negative".into());
-        }
+        let input_per_mtok = parse_nonneg_finite(&self.fields[2].value, "input_per_mtok")?;
+        let output_per_mtok = parse_nonneg_finite(&self.fields[3].value, "output_per_mtok")?;
         if input_per_mtok == 0.0 && output_per_mtok == 0.0 {
             return Err("at least one of input/output must be positive".into());
         }
-        let parse_opt = |s: &str| -> Result<Option<f64>, String> {
-            let t = s.trim();
-            if t.is_empty() {
-                return Ok(None);
-            }
-            let v: f64 = t.parse().map_err(|_| format!("invalid number: {t}"))?;
-            if !v.is_finite() || v < 0.0 {
-                return Err(format!("invalid number: {t}"));
-            }
-            Ok(Some(v))
-        };
         Ok(crate::dto::UpsertPricingOverrideBody {
             provider_kind: provider_kind.to_string(),
             model_id: model_id.to_string(),
             input_per_mtok,
             output_per_mtok,
-            cache_read_per_mtok: parse_opt(&self.fields[4].value)?,
-            cache_write_per_mtok: parse_opt(&self.fields[5].value)?,
+            cache_read_per_mtok: parse_opt_nonneg_finite(&self.fields[4].value)?,
+            cache_write_per_mtok: parse_opt_nonneg_finite(&self.fields[5].value)?,
             reasoning_per_mtok: self
                 .fields
                 .get(6)
-                .map(|f| parse_opt(&f.value))
+                .map(|f| parse_opt_nonneg_finite(&f.value))
                 .transpose()?
                 .flatten(),
             effective_from: None,
@@ -1107,10 +1086,46 @@ impl PricingOverrideForm {
     }
 }
 
+/// Parse a required non-negative finite f64 field (shared by pricing form).
+fn parse_nonneg_finite(s: &str, name: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid {name}"))?;
+    if !v.is_finite() || v < 0.0 {
+        return Err(format!("{name} must be finite and non-negative"));
+    }
+    Ok(v)
+}
+
+/// Optional variant: empty → `None`, otherwise a non-negative finite f64.
+fn parse_opt_nonneg_finite(s: &str) -> Result<Option<f64>, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let v: f64 = t.parse().map_err(|_| format!("invalid number: {t}"))?;
+    if !v.is_finite() || v < 0.0 {
+        return Err(format!("invalid number: {t}"));
+    }
+    Ok(Some(v))
+}
+
 fn format_rate(v: f64) -> String {
+    if v == 0.0 {
+        return "0".to_string();
+    }
     // Keep enough precision for sub-cent MTok rates without noisy trailing zeros.
-    let s = format!("{v:.6}");
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
+    // Sub-micro rates would round to 0 at 6 decimals, silently zeroing a tiny
+    // rate when its override row is edited — widen precision for those.
+    let decimals = if v.abs() < 1e-6 { 12 } else { 6 };
+    let s = format!("{v:.decimals$}");
+    let t = s.trim_end_matches('0').trim_end_matches('.').to_string();
+    if t.is_empty() {
+        "0".to_string()
+    } else {
+        t
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1132,23 +1147,18 @@ pub fn current_period() -> String {
 }
 
 pub fn shift_period(period: &str, delta: i32) -> String {
-    let parts: Vec<_> = period.split('-').collect();
-    if parts.len() != 2 {
+    // Reuse the strict YYYY-MM parser so a malformed month can't drive the
+    // arithmetic into a pathological range (the old `while` normalization could
+    // loop enormously on a giant month value). Fall back to the current month.
+    let Some((y, m)) = super::widgets::parse_year_month(period) else {
         return current_period();
-    }
-    let y: i32 = parts[0].parse().unwrap_or(Local::now().year());
-    let m: u32 = parts[1].parse().unwrap_or(Local::now().month());
-    let mut month = m as i32 + delta;
-    let mut year = y;
-    while month < 1 {
-        month += 12;
-        year -= 1;
-    }
-    while month > 12 {
-        month -= 12;
-        year += 1;
-    }
-    format!("{:04}-{:02}", year, month)
+    };
+    // Absolute month index, shifted by delta, split back out via euclidean
+    // div/rem — no loop, no overflow (i64 dwarfs any valid year).
+    let idx = (y as i64) * 12 + (m as i64 - 1) + delta as i64;
+    let year = idx.div_euclid(12);
+    let month = idx.rem_euclid(12) + 1;
+    format!("{year:04}-{month:02}")
 }
 
 #[cfg(test)]
@@ -1430,5 +1440,25 @@ mod tests {
     fn shift_period_wraps_year() {
         assert_eq!(shift_period("2026-01", -1), "2025-12");
         assert_eq!(shift_period("2025-12", 1), "2026-01");
+    }
+
+    #[test]
+    fn shift_period_multi_month_and_malformed() {
+        assert_eq!(shift_period("2026-03", -5), "2025-10");
+        assert_eq!(shift_period("2026-11", 3), "2027-02");
+        // Malformed / out-of-range month falls back to the current month
+        // instead of looping the old `while` normalization.
+        assert_eq!(shift_period("2026-13", 1), current_period());
+        assert_eq!(shift_period("garbage", 1), current_period());
+    }
+
+    #[test]
+    fn format_rate_keeps_sub_micro_precision() {
+        // 6-decimal formatting would render this as "0"; keep it visible so
+        // editing an override never silently zeroes a tiny rate.
+        assert_eq!(format_rate(0.0000005), "0.0000005");
+        assert_eq!(format_rate(0.0), "0");
+        assert_eq!(format_rate(1.0), "1");
+        assert_eq!(format_rate(3.5), "3.5");
     }
 }

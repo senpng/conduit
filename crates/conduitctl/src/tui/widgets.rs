@@ -145,6 +145,10 @@ pub fn parse_year_month(period: &str) -> Option<(i32, u32)> {
 }
 
 pub fn days_in_month(year: i32, month: u32) -> u32 {
+    debug_assert!(
+        (1..=12).contains(&month),
+        "days_in_month: month {month} out of range"
+    );
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -278,7 +282,9 @@ fn parse_ymd(s: &str) -> Option<(i32, u32, u32)> {
     let y: i32 = p.next()?.parse().ok()?;
     let m: u32 = p.next()?.parse().ok()?;
     let d: u32 = p.next()?.parse().ok()?;
-    if (1..=12).contains(&m) && (1..=31).contains(&d) {
+    // Validate the day against the actual month length (rejects 02-31 etc.) so
+    // downstream weekday / rata-die math never runs on an impossible date.
+    if (1..=12).contains(&m) && (1..=days_in_month(y, m)).contains(&d) {
         Some((y, m, d))
     } else {
         None
@@ -322,9 +328,13 @@ fn rd_to_date(mut z: i64) -> Option<(i32, u32, u32)> {
 
 /// Weekday index for heatmap rows: **Sunday = 0** … Saturday = 6 (GitHub layout).
 pub fn weekday_sun0(year: i32, month: u32, day: u32) -> u32 {
+    debug_assert!(
+        (1..=12).contains(&month),
+        "weekday_sun0: month {month} out of range"
+    );
     // Sakamoto's methods — no chrono dependency needed here.
     let mut y = year;
-    let m = month;
+    let m = month.clamp(1, 12);
     let d = day;
     static T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
     if m < 3 {
@@ -391,6 +401,9 @@ pub fn spinner(frame: u64) -> &'static str {
 }
 
 pub fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
+    // Guard the `(100 - percent)/2` math against underflow on out-of-range input.
+    let percent_x = percent_x.min(100);
+    let percent_y = percent_y.min(100);
     let popup = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -439,20 +452,14 @@ fn keybind_chip_width(key: &str, label: &str) -> usize {
     1 + display_width(key) + 1 + 1 + display_width(label)
 }
 
-/// Footer keybind strip: fit as many chips as `max_width` allows, then
-/// `… +N` for the rest (no wrap, no multi-line). Order is left-to-right so
-/// put high-priority binds first (`? help`, `q quit`, …).
-///
-/// When everything fits, behaves like a plain join with `  ·  ` separators.
-pub fn keybind_line(theme: &Theme, pairs: &[(&str, &str)], max_width: usize) -> Line<'static> {
+/// How many leading chips fit in `max_width`, reserving room for an `… +N`
+/// overflow marker when some are dropped. Shared by [`keybind_line`] and its
+/// test helper so the fit math lives in one place.
+fn keybind_fit(pairs: &[(&str, &str)], max_width: usize) -> usize {
     if pairs.is_empty() || max_width == 0 {
-        return Line::from("");
+        return 0;
     }
-
-    const SEP: &str = "  ·  ";
-    const SEP_W: usize = 4; // display width of SEP
-
-    // How many leading chips fit, reserving room for an overflow marker when needed.
+    const SEP_W: usize = 4; // display width of "  ·  "
     let mut fit = pairs.len();
     while fit > 0 {
         let mut w = 0usize;
@@ -475,6 +482,21 @@ pub fn keybind_line(theme: &Theme, pairs: &[(&str, &str)], max_width: usize) -> 
         }
         fit -= 1;
     }
+    fit
+}
+
+/// Footer keybind strip: fit as many chips as `max_width` allows, then
+/// `… +N` for the rest (no wrap, no multi-line). Order is left-to-right so
+/// put high-priority binds first (`? help`, `q quit`, …).
+///
+/// When everything fits, behaves like a plain join with `  ·  ` separators.
+pub fn keybind_line(theme: &Theme, pairs: &[(&str, &str)], max_width: usize) -> Line<'static> {
+    if pairs.is_empty() || max_width == 0 {
+        return Line::from("");
+    }
+
+    const SEP: &str = "  ·  ";
+    let fit = keybind_fit(pairs, max_width);
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (i, (key, label)) in pairs[..fit].iter().enumerate() {
@@ -498,32 +520,7 @@ pub fn keybind_line(theme: &Theme, pairs: &[(&str, &str)], max_width: usize) -> 
 /// How many chips `keybind_line` would show at `max_width` (test helper / diagnostics).
 #[cfg(test)]
 pub fn keybind_fit_count(pairs: &[(&str, &str)], max_width: usize) -> usize {
-    if pairs.is_empty() || max_width == 0 {
-        return 0;
-    }
-    const SEP_W: usize = 4;
-    let mut fit = pairs.len();
-    while fit > 0 {
-        let mut w = 0usize;
-        for (i, (k, l)) in pairs[..fit].iter().enumerate() {
-            if i > 0 {
-                w = w.saturating_add(SEP_W);
-            }
-            w = w.saturating_add(keybind_chip_width(k, l));
-        }
-        let hidden = pairs.len() - fit;
-        let total = if hidden > 0 {
-            let marker = format!("… +{hidden}");
-            w.saturating_add(SEP_W).saturating_add(display_width(&marker))
-        } else {
-            w
-        };
-        if total <= max_width || fit == 1 {
-            break;
-        }
-        fit -= 1;
-    }
-    fit
+    keybind_fit(pairs, max_width)
 }
 
 /// Display columns a string occupies in a terminal cell grid (CJK/emoji = 2,
@@ -643,31 +640,12 @@ fn format_local_time_with(raw: &str, fmt: &str) -> String {
 }
 
 fn parse_to_local(s: &str) -> Option<DateTime<Local>> {
-    // RFC3339 / ISO-8601 with offset or Z
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&Local));
-    }
-    // Trailing Z sometimes paired with space separator
-    let normalized = s.replace(' ', "T");
-    if let Ok(dt) = DateTime::parse_from_rfc3339(&normalized) {
-        return Some(dt.with_timezone(&Local));
-    }
-    // ISO without timezone → assume UTC (server storage convention)
-    const NAIVE_FMTS: &[&str] = &[
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-    ];
-    for f in NAIVE_FMTS {
-        if let Ok(naive) = NaiveDateTime::parse_from_str(s, f)
-            .or_else(|_| NaiveDateTime::parse_from_str(&normalized, f))
-        {
-            return Some(Utc.from_utc_datetime(&naive).with_timezone(&Local));
-        }
-    }
-    // Unix seconds (integer string) — used by some snapshot `captured_at` fields
+    // Pure-integer input is a unix timestamp — check first so numeric values
+    // skip the RFC3339 + four naive-format attempts below (this runs per list
+    // row per frame). A datetime string always contains '-', so it never parses
+    // as i64; moving this up is behavior-preserving.
     if let Ok(secs) = s.parse::<i64>() {
+        // Unix seconds (integer string) — used by some snapshot `captured_at` fields.
         if (1_000_000_000..4_000_000_000).contains(&secs) {
             return Utc
                 .timestamp_opt(secs, 0)
@@ -680,6 +658,40 @@ fn parse_to_local(s: &str) -> Option<DateTime<Local>> {
                 .timestamp_millis_opt(secs)
                 .single()
                 .map(|dt| dt.with_timezone(&Local));
+        }
+        return None;
+    }
+    // RFC3339 / ISO-8601 with offset or Z
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Local));
+    }
+    // Trailing Z sometimes paired with a space separator — normalize once, and
+    // only allocate when a space is actually present.
+    let normalized = if s.as_bytes().contains(&b' ') {
+        Some(s.replace(' ', "T"))
+    } else {
+        None
+    };
+    if let Some(n) = normalized.as_deref() {
+        if let Ok(dt) = DateTime::parse_from_rfc3339(n) {
+            return Some(dt.with_timezone(&Local));
+        }
+    }
+    // ISO without timezone → assume UTC (server storage convention)
+    const NAIVE_FMTS: &[&str] = &[
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+    ];
+    for f in NAIVE_FMTS {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, f) {
+            return Some(Utc.from_utc_datetime(&naive).with_timezone(&Local));
+        }
+        if let Some(n) = normalized.as_deref() {
+            if let Ok(naive) = NaiveDateTime::parse_from_str(n, f) {
+                return Some(Utc.from_utc_datetime(&naive).with_timezone(&Local));
+            }
         }
     }
     None
@@ -821,7 +833,7 @@ pub fn detail_kv(theme: &Theme, rows: &[(&str, String)]) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     for (k, v) in rows {
         out.push(Line::from(vec![
-            Span::styled(format!("  {k:<16}"), theme.muted()),
+            Span::styled(format!("  {}", pad_display(k, 16)), theme.muted()),
             Span::styled(v.clone(), Style::default().fg(theme.fg)),
         ]));
     }

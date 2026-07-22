@@ -1,5 +1,7 @@
 //! Spawn async console API calls and forward results as [`Msg`].
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::console_client::ConsoleClient;
@@ -10,6 +12,33 @@ use crate::dto::{
 
 use super::app::USAGE_PAGE_SIZE;
 use super::msg::{Msg, RefreshKind};
+
+/// Wall-clock of the last automatic upstream quota probe (unix millis), so
+/// rapid Providers refreshes / tab flips don't re-probe every upstream each
+/// time. Manual `u` (`spawn_quota_refresh`) always bypasses this.
+static LAST_AUTO_QUOTA_PROBE_MS: AtomicU64 = AtomicU64::new(0);
+const AUTO_QUOTA_PROBE_INTERVAL_MS: u64 = 60_000;
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// True at most once per [`AUTO_QUOTA_PROBE_INTERVAL_MS`]; records the probe time
+/// when it returns true. A benign race (two concurrent loads both passing) only
+/// costs one extra probe.
+fn should_auto_probe_quota() -> bool {
+    let now = now_unix_ms();
+    let last = LAST_AUTO_QUOTA_PROBE_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= AUTO_QUOTA_PROBE_INTERVAL_MS {
+        LAST_AUTO_QUOTA_PROBE_MS.store(now, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
 
 pub fn spawn_load_tab(client: ConsoleClient, tab_idx: usize, gen: u64, tx: UnboundedSender<Msg>) {
     match tab_idx {
@@ -44,20 +73,29 @@ fn empty_usage_page() -> UsageListResponse {
 
 pub fn spawn_overview(client: ConsoleClient, gen: u64, tx: UnboundedSender<Msg>) {
     tokio::spawn(async move {
-        let health = client.health().await.map_err(|e| e.to_string());
+        // Fetch all Overview inputs concurrently — the old sequential chain paid
+        // five round-trips end-to-end before the home screen filled in.
+        let ch = client.clone();
+        let cp = client.clone();
+        let cr = client.clone();
+        let ck = client.clone();
+        let cs = client;
+        let (health, providers, routes, keys, summary) = tokio::join!(
+            async move { ch.health().await.map_err(|e| e.to_string()) },
+            async move { cp.list_providers_typed().await.map_err(|e| e.to_string()) },
+            async move { cr.list_routes_typed().await.map_err(|e| e.to_string()) },
+            async move { ck.list_keys_typed().await.map_err(|e| e.to_string()) },
+            // Lifetime totals for Overview KPIs / rankings (separate from Usage month).
+            async move {
+                cs.usage_summary_typed(Some("all"))
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+        );
         let _ = tx.send(Msg::Health(health));
-        // Counts for metric strip
-        let providers = client.list_providers_typed().await.map_err(|e| e.to_string());
         let _ = tx.send(Msg::Providers { gen, result: providers });
-        let routes = client.list_routes_typed().await.map_err(|e| e.to_string());
         let _ = tx.send(Msg::Routes { gen, result: routes });
-        let keys = client.list_keys_typed().await.map_err(|e| e.to_string());
         let _ = tx.send(Msg::Keys { gen, result: keys });
-        // Lifetime totals for Overview KPIs / rankings (separate from Usage month).
-        let summary = client
-            .usage_summary_typed(Some("all"))
-            .await
-            .map_err(|e| e.to_string());
         let _ = tx.send(Msg::OverviewSummary {
             gen,
             result: summary,
@@ -71,15 +109,20 @@ pub fn spawn_providers(client: ConsoleClient, gen: u64, tx: UnboundedSender<Msg>
         let _ = tx.send(Msg::Providers { gen, result: r });
         // Render any already-cached remaining immediately, before the (slow) probe —
         // otherwise the REMAINING column stays blank until every OAuth provider is
-        // probed serially. Then probe upstream and refresh once more.
+        // probed serially.
         spawn_quota_state(client.clone(), tx.clone()).await;
-        if let Err(e) = client.refresh_all_quotas().await {
-            let _ = tx.send(Msg::Quota {
-                snapshots: Err(format!("refresh quotas: {e}")),
-                cooldowns: Err(String::new()),
-            });
+        // The live upstream probe is expensive (serial per OAuth provider) and
+        // hits rate-limited endpoints, so throttle the *automatic* one — rapid
+        // tab flips / `r` refreshes reuse the last snapshot. Manual `u` forces it.
+        if should_auto_probe_quota() {
+            if let Err(e) = client.refresh_all_quotas().await {
+                let _ = tx.send(Msg::Quota {
+                    snapshots: Err(format!("refresh quotas: {e}")),
+                    cooldowns: Err(String::new()),
+                });
+            }
+            spawn_quota_state(client, tx).await;
         }
-        spawn_quota_state(client, tx).await;
     });
 }
 
@@ -181,30 +224,40 @@ pub fn spawn_usage(
     tx: UnboundedSender<Msg>,
 ) {
     tokio::spawn(async move {
-        let summary = client
-            .usage_summary_typed(period.as_deref())
-            .await
-            .map_err(|e| e.to_string());
-        let recent = client
-            .list_usage_page(
-                limit,
-                offset,
-                period.as_deref(),
-                q.as_deref(),
-                sort.as_deref(),
-            )
-            .await
-            .map_err(|e| e.to_string());
+        // Summary, page, pricing and key names are independent — fetch them
+        // concurrently instead of four sequential round-trips.
+        let cs = client.clone();
+        let cr = client.clone();
+        let cp = client.clone();
+        let ck = client;
+        let (summary, recent, pricing, keys) = tokio::join!(
+            async {
+                cs.usage_summary_typed(period.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            async {
+                cr.list_usage_page(
+                    limit,
+                    offset,
+                    period.as_deref(),
+                    q.as_deref(),
+                    sort.as_deref(),
+                )
+                .await
+                .map_err(|e| e.to_string())
+            },
+            // Pricing rates used by usage detail pane (cache read/write unit prices).
+            async { cp.list_pricing_typed().await.map_err(|e| e.to_string()) },
+            // Key names for Usage → by key rollup labels.
+            async { ck.list_keys_typed().await.map_err(|e| e.to_string()) },
+        );
         let _ = tx.send(Msg::Usage {
             gen,
             summary: Some(summary),
             recent: Some(recent),
         });
-        // Pricing rates used by usage detail pane (cache read/write unit prices).
-        let pricing = client.list_pricing_typed().await.map_err(|e| e.to_string());
         let _ = tx.send(Msg::Pricing { gen, result: pricing });
-        // Key names for Usage → by key rollup labels.
-        let keys = client.list_keys_typed().await.map_err(|e| e.to_string());
         let _ = tx.send(Msg::Keys { gen, result: keys });
     });
 }
