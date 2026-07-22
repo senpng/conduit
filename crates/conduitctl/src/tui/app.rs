@@ -874,6 +874,7 @@ impl App {
                             .enumerate()
                             .filter(|(_, e)| {
                                 match_q(&e.downstream_key_id)
+                                    || match_q(&e.name)
                                     || self
                                         .keys
                                         .iter()
@@ -937,14 +938,15 @@ impl App {
                             .iter()
                             .enumerate()
                             .filter(|(_, p)| {
-                                let name = self
+                                let live_name = self
                                     .providers
                                     .iter()
                                     .find(|x| x.id == p.provider_id)
                                     .map(|x| x.name.as_str())
                                     .unwrap_or("");
                                 match_q(&p.provider_id)
-                                    || match_q(name)
+                                    || match_q(&p.name)
+                                    || match_q(live_name)
                                     || match_q(&p.provider_kind)
                                     || match_q(&format!("{:.0}%", p.success_rate * 100.0))
                             })

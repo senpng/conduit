@@ -289,6 +289,12 @@ pub struct UsageListResponse {
 pub struct UsageSummaryEntry {
     #[serde(default)]
     pub downstream_key_id: String,
+    /// Human label from `downstream_keys` (includes soft-deleted rows).
+    #[serde(default)]
+    pub name: String,
+    /// True when the key is soft-deleted or the row no longer exists.
+    #[serde(default)]
+    pub deleted: bool,
     #[serde(default)]
     pub request_count: u64,
     #[serde(default)]
@@ -369,6 +375,12 @@ pub struct UsageDayModelEntry {
 pub struct UsageProviderEntry {
     #[serde(default)]
     pub provider_id: String,
+    /// Human label from `providers` (includes soft-deleted rows).
+    #[serde(default)]
+    pub name: String,
+    /// True when the provider is soft-deleted or the row no longer exists.
+    #[serde(default)]
+    pub deleted: bool,
     #[serde(default)]
     pub provider_kind: String,
     #[serde(default)]
@@ -734,13 +746,24 @@ mod tests {
             "avg_ttfb_ms":42.5,
             "avg_duration_ms":100.0,
             "tokens_per_sec":61.5,
-            "entries":[],
+            "entries":[{
+                "downstream_key_id":"k1",
+                "name":"ci bot",
+                "deleted":true,
+                "request_count":3,
+                "total_usd":0.1,
+                "prompt_tokens":10,
+                "completion_tokens":20,
+                "total_tokens":30
+            }],
             "by_day":[],
             "by_model":[],
             "by_key_model":[],
             "by_day_model":[],
             "by_provider":[{
                 "provider_id":"p1",
+                "name":"My OpenAI",
+                "deleted":true,
                 "provider_kind":"openai",
                 "request_count":10,
                 "success_count":8,
@@ -757,8 +780,13 @@ mod tests {
         assert!((s.tokens_per_sec.unwrap() - 61.5).abs() < 1e-9);
         assert_eq!(s.by_provider.len(), 1);
         assert_eq!(s.by_provider[0].provider_id, "p1");
+        assert_eq!(s.by_provider[0].name, "My OpenAI");
+        assert!(s.by_provider[0].deleted);
         assert!((s.by_provider[0].success_rate - 0.8).abs() < 1e-9);
         assert!((s.by_provider[0].tokens_per_sec.unwrap() - 61.5).abs() < 1e-9);
+        assert_eq!(s.entries.len(), 1);
+        assert_eq!(s.entries[0].name, "ci bot");
+        assert!(s.entries[0].deleted);
     }
 
     #[test]

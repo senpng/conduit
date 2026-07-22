@@ -51,6 +51,21 @@ impl<'a> KeyRepo<'a> {
         Ok(row)
     }
 
+    /// Key by id including soft-deleted rows (usage history labels).
+    #[instrument(skip(self))]
+    pub async fn get_any(&self, id: &str) -> Result<Option<DownstreamKeyRow>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, name, key_hash, model_whitelist, monthly_budget_usd, rate_limit_rpm, enabled, created_at, updated_at, deleted_at
+             FROM downstream_keys WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(self.pool)
+        .await
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?
+        .map(map_key_row);
+        Ok(row)
+    }
+
     /// Look up an enabled, non-deleted key by its BLAKE3 hash for authentication.
     #[instrument(skip(self))]
     pub async fn get_by_hash(&self, hash: &str) -> Result<Option<DownstreamKeyRow>, StoreError> {
@@ -249,6 +264,11 @@ mod tests {
         assert!(repo.get("k3").await.unwrap().is_none());
         assert!(repo.get_by_hash("ghi789").await.unwrap().is_none());
         assert!(repo.list().await.unwrap().is_empty());
+
+        // Soft-deleted rows remain readable for usage history labels.
+        let any = repo.get_any("k3").await.unwrap().unwrap();
+        assert_eq!(any.name, "Test Key");
+        assert!(any.deleted_at.is_some());
 
         let raw: Option<(String,)> =
             sqlx::query_as("SELECT id FROM downstream_keys WHERE id = 'k3'")

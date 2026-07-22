@@ -49,6 +49,21 @@ impl<'a> ProviderRepo<'a> {
         Ok(row)
     }
 
+    /// Provider by id including soft-deleted rows (usage history labels).
+    #[instrument(skip(self))]
+    pub async fn get_any(&self, id: &str) -> Result<Option<ProviderRow>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, name, kind, base_url, upstream_key_ref, created_at, updated_at, deleted_at
+             FROM providers WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(self.pool)
+        .await
+        .map_err(|e| StoreError::Sqlx(e.to_string()))?
+        .map(map_provider_row);
+        Ok(row)
+    }
+
     /// Active providers only.
     #[instrument(skip(self))]
     pub async fn list(&self) -> Result<Vec<ProviderRow>, StoreError> {
@@ -163,6 +178,11 @@ mod tests {
         repo.delete("p1").await.unwrap();
         assert!(repo.get("p1").await.unwrap().is_none());
         assert!(repo.list().await.unwrap().is_empty());
+
+        // Soft-deleted rows remain readable for usage history labels.
+        let any = repo.get_any("p1").await.unwrap().unwrap();
+        assert_eq!(any.name, "Test Provider");
+        assert!(any.deleted_at.is_some());
 
         // Row still exists in DB (soft delete).
         let raw: Option<(String,)> =

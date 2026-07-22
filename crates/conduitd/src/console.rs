@@ -1188,6 +1188,46 @@ pub async fn usage_summary(
         Err(e) => return internal(e).into_response(),
     };
 
+    // Resolve human names for usage labels, including soft-deleted rows so
+    // historical rollups keep readable names after operator delete.
+    let key_repo = KeyRepo::new(&state.pool);
+    let mut key_meta: std::collections::HashMap<String, (String, bool)> =
+        std::collections::HashMap::new();
+    for e in &entries {
+        let id = e.downstream_key_id.as_str();
+        if id.is_empty() || key_meta.contains_key(id) {
+            continue;
+        }
+        match key_repo.get_any(id).await {
+            Ok(Some(row)) => {
+                key_meta.insert(id.to_string(), (row.name, row.deleted_at.is_some()));
+            }
+            Ok(None) => {
+                key_meta.insert(id.to_string(), (String::new(), true));
+            }
+            Err(e) => return internal(e).into_response(),
+        }
+    }
+
+    let provider_repo = ProviderRepo::new(&state.pool);
+    let mut provider_meta: std::collections::HashMap<String, (String, bool)> =
+        std::collections::HashMap::new();
+    for p in &by_provider {
+        let id = p.provider_id.as_str();
+        if id.is_empty() || id == "(unknown)" || provider_meta.contains_key(id) {
+            continue;
+        }
+        match provider_repo.get_any(id).await {
+            Ok(Some(row)) => {
+                provider_meta.insert(id.to_string(), (row.name, row.deleted_at.is_some()));
+            }
+            Ok(None) => {
+                provider_meta.insert(id.to_string(), (String::new(), true));
+            }
+            Err(e) => return internal(e).into_response(),
+        }
+    }
+
     // Top-level totals: when a key filter is set, sum only that key's entry so
     // cards match the scoped day/model charts.
     let scoped_entries: Vec<_> = match key_id {
@@ -1222,14 +1262,22 @@ pub async fn usage_summary(
             // MUST stay 0; a non-zero value signals a reconciliation gap.
             "ledger_dropped_records": crate::usage_wire::dropped_records(),
             "key_id": key_id,
-            "entries": entries.iter().map(|e| json!({
-                "downstream_key_id": e.downstream_key_id,
-                "request_count": e.request_count,
-                "total_usd": e.total_usd,
-                "prompt_tokens": e.prompt_tokens,
-                "completion_tokens": e.completion_tokens,
-                "total_tokens": e.total_tokens,
-            })).collect::<Vec<_>>(),
+            "entries": entries.iter().map(|e| {
+                let (name, deleted) = key_meta
+                    .get(&e.downstream_key_id)
+                    .cloned()
+                    .unwrap_or_else(|| (String::new(), !e.downstream_key_id.is_empty()));
+                json!({
+                    "downstream_key_id": e.downstream_key_id,
+                    "name": name,
+                    "deleted": deleted,
+                    "request_count": e.request_count,
+                    "total_usd": e.total_usd,
+                    "prompt_tokens": e.prompt_tokens,
+                    "completion_tokens": e.completion_tokens,
+                    "total_tokens": e.total_tokens,
+                })
+            }).collect::<Vec<_>>(),
             "by_day": by_day.iter().map(|d| json!({
                 "day": d.day,
                 "request_count": d.request_count,
@@ -1266,18 +1314,29 @@ pub async fn usage_summary(
                 "total_usd": m.total_usd,
                 "total_tokens": m.total_tokens,
             })).collect::<Vec<_>>(),
-            "by_provider": by_provider.iter().map(|p| json!({
-                "provider_id": p.provider_id,
-                "provider_kind": p.provider_kind,
-                "request_count": p.request_count,
-                "success_count": p.success_count,
-                "success_rate": p.success_rate,
-                "avg_ttfb_ms": p.avg_ttfb_ms,
-                "avg_duration_ms": p.avg_duration_ms,
-                "tokens_per_sec": p.tokens_per_sec,
-                "total_usd": p.total_usd,
-                "total_tokens": p.total_tokens,
-            })).collect::<Vec<_>>(),
+            "by_provider": by_provider.iter().map(|p| {
+                let (name, deleted) = provider_meta
+                    .get(&p.provider_id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let gone = !p.provider_id.is_empty() && p.provider_id != "(unknown)";
+                        (String::new(), gone)
+                    });
+                json!({
+                    "provider_id": p.provider_id,
+                    "name": name,
+                    "deleted": deleted,
+                    "provider_kind": p.provider_kind,
+                    "request_count": p.request_count,
+                    "success_count": p.success_count,
+                    "success_rate": p.success_rate,
+                    "avg_ttfb_ms": p.avg_ttfb_ms,
+                    "avg_duration_ms": p.avg_duration_ms,
+                    "tokens_per_sec": p.tokens_per_sec,
+                    "total_usd": p.total_usd,
+                    "total_tokens": p.total_tokens,
+                })
+            }).collect::<Vec<_>>(),
         })),
     )
         .into_response()

@@ -1310,7 +1310,12 @@ fn draw_overview_provider_health(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     for p in providers.iter().take(n) {
-        let name = resolve_provider_name(&app.providers, &p.provider_id);
+        let name = resolve_provider_name(
+            &app.providers,
+            &p.provider_id,
+            &p.name,
+            p.deleted,
+        );
         let kind = if p.provider_kind.is_empty() {
             "—"
         } else {
@@ -1343,31 +1348,33 @@ fn draw_overview_provider_health(frame: &mut Frame, area: Rect, app: &App) {
         let bar = ratio_bar(rate, bar_w);
         let pct = format!("{:>3.0}%", rate * 100.0);
 
-        lines.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                pad_display(&truncate(&name, name_w), name_w),
-                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(pad_display(&truncate(kind, kind_w), kind_w), theme.subtle()),
-            Span::raw(" "),
-            Span::styled(bar, rate_style),
-            Span::raw(" "),
-            Span::styled(pad_display(&pct, pct_w), rate_style),
-            Span::raw(" "),
-            Span::styled(pad_display(&truncate(&ttfb, ttfb_w), ttfb_w), theme.muted()),
-            Span::raw(" "),
-            Span::styled(
-                pad_display(&truncate(&tok, tok_w), tok_w),
-                theme.warning(),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                pad_display(&truncate(&tps, tps_w), tps_w),
-                Style::default().fg(theme.chart[0]),
-            ),
-        ]));
+        let mut name_line = vec![Span::raw(" ")];
+        name_line.extend(name_spans(theme, &name, false, Some(name_w)));
+        name_line.push(Span::raw(" "));
+        name_line.push(Span::styled(
+            pad_display(&truncate(kind, kind_w), kind_w),
+            theme.subtle(),
+        ));
+        name_line.push(Span::raw(" "));
+        name_line.push(Span::styled(bar, rate_style));
+        name_line.push(Span::raw(" "));
+        name_line.push(Span::styled(pad_display(&pct, pct_w), rate_style));
+        name_line.push(Span::raw(" "));
+        name_line.push(Span::styled(
+            pad_display(&truncate(&ttfb, ttfb_w), ttfb_w),
+            theme.muted(),
+        ));
+        name_line.push(Span::raw(" "));
+        name_line.push(Span::styled(
+            pad_display(&truncate(&tok, tok_w), tok_w),
+            theme.warning(),
+        ));
+        name_line.push(Span::raw(" "));
+        name_line.push(Span::styled(
+            pad_display(&truncate(&tps, tps_w), tps_w),
+            theme.muted(),
+        ));
+        lines.push(Line::from(name_line));
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -1403,6 +1410,17 @@ fn draw_master_detail_providers(frame: &mut Frame, area: Rect, app: &App) {
     let (list_area, detail_area) = split_master_detail(area);
     let sel = app.selected[Tab::Providers.index()].min(filtered.len() - 1);
 
+    // Fixed columns for kind / remaining / short id; NAME takes the rest so
+    // OAuth labels like `codex (user@email.com)` are not hard-capped at 20.
+    let kind_w = 14usize;
+    let rem_w = 18usize;
+    let id_w = 12usize;
+    let col_spacing = 3usize; // 4 columns → 3 gaps of column_spacing(1)
+    let border = 2usize; // panel left+right
+    let name_w = (list_area.width as usize)
+        .saturating_sub(border + kind_w + rem_w + id_w + col_spacing)
+        .max(16);
+
     let header = Row::new(vec!["NAME", "KIND", "REMAINING", "ID"]).style(theme.header_cell());
     let rows: Vec<Row> = filtered
         .iter()
@@ -1411,10 +1429,10 @@ fn draw_master_detail_providers(frame: &mut Frame, area: Rect, app: &App) {
             let p = &app.providers[data_i];
             let remaining = provider_remaining_cell(app, p);
             let row = Row::new(vec![
-                truncate(&p.name, 20),
-                truncate(&p.kind, 12),
-                truncate(&remaining, 18),
-                truncate(&p.id, 10),
+                truncate(&p.name, name_w),
+                truncate(&p.kind, kind_w),
+                truncate(&remaining, rem_w),
+                truncate(&p.id, id_w),
             ]);
             if view_i == sel {
                 row.style(theme.selection())
@@ -1427,10 +1445,10 @@ fn draw_master_detail_providers(frame: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(32),
-            Constraint::Percentage(20),
-            Constraint::Percentage(28),
-            Constraint::Percentage(20),
+            Constraint::Min(name_w as u16),
+            Constraint::Length(kind_w as u16),
+            Constraint::Length(rem_w as u16),
+            Constraint::Length(id_w as u16),
         ],
     )
     .header(header)
@@ -2611,8 +2629,8 @@ fn draw_usage_by_key(
 ) {
     let theme = &app.theme;
     let filtered = app.filtered_indices();
-    // (display_name, key_id, cost, tokens, reqs, prompt, completion)
-    let mut items: Vec<(String, String, f64, u64, u64, u64, u64)> = app
+    // (ResolvedName, key_id, cost, tokens, reqs, prompt, completion)
+    let mut items: Vec<(ResolvedName, String, f64, u64, u64, u64, u64)> = app
         .usage_summary
         .as_ref()
         .map(|s| {
@@ -2621,7 +2639,7 @@ fn draw_usage_by_key(
                 .filter_map(|&i| {
                     s.entries.get(i).map(|e| {
                         let id = e.downstream_key_id.clone();
-                        let name = resolve_key_name(&app.keys, &id);
+                        let name = resolve_key_name(&app.keys, &id, &e.name, e.deleted);
                         (
                             name,
                             id,
@@ -2652,7 +2670,7 @@ fn draw_usage_by_key(
         super::app::UsageSort::Tokens => items.sort_by(|a, b| b.3.cmp(&a.3)),
         super::app::UsageSort::Date => {
             // Keys have no timestamp; fall back to name.
-            items.sort_by(|a, b| a.0.cmp(&b.0))
+            items.sort_by(|a, b| a.0.text.cmp(&b.0.text))
         }
     }
     let sel = sel.min(items.len().saturating_sub(1));
@@ -2665,7 +2683,7 @@ fn draw_usage_by_key(
         .max(1e-9);
     let label_w = (list_area.width as usize)
         .saturating_sub(36)
-        .clamp(10, 36);
+        .max(12);
     let bar_w = (list_area.width as usize)
         .saturating_sub(label_w + 28)
         .clamp(6, 20);
@@ -2691,28 +2709,21 @@ fn draw_usage_by_key(
             } else {
                 *tok as f64 / max_tok
             };
-            Line::from(vec![
-                Span::styled(
-                    format!("{mark}{}", pad_display(name, label_w)),
-                    if i == sel {
-                        theme.accent_bold()
-                    } else {
-                        Style::default().fg(theme.fg)
-                    },
-                ),
-                Span::styled(
-                    ratio_bar(ratio, bar_w),
-                    Style::default().fg(theme.chart_color(i)),
-                ),
-                Span::styled(
-                    format!(" {:>6}", format_tokens(*tok)),
-                    theme.warning(),
-                ),
-                Span::styled(
-                    format!("  {}  {}r", format_usd(*cost), req),
-                    theme.muted(),
-                ),
-            ])
+            let mut spans = vec![Span::styled(mark, name_base_style(theme, i == sel))];
+            spans.extend(name_spans(theme, name, i == sel, Some(label_w)));
+            spans.push(Span::styled(
+                ratio_bar(ratio, bar_w),
+                Style::default().fg(theme.chart_color(i)),
+            ));
+            spans.push(Span::styled(
+                format!(" {:>6}", format_tokens(*tok)),
+                theme.warning(),
+            ));
+            spans.push(Span::styled(
+                format!("  {}  {}r", format_usd(*cost), req),
+                theme.muted(),
+            ));
+            Line::from(spans)
         })
         .collect();
     frame.render_widget(block, list_area);
@@ -2730,7 +2741,7 @@ fn draw_usage_by_key(
         );
         let cost_share = (cost / period_total) * 100.0;
         let tok_share = tok as f64 / period_tokens as f64 * 100.0;
-        let heading = name.clone();
+        let heading = name.text.clone();
         let models = models_for_key(app, id);
         draw_usage_rollup_detail(
             frame,
@@ -2739,7 +2750,7 @@ fn draw_usage_by_key(
             "Key detail",
             &heading,
             &[
-                ("name", name.clone()),
+                ("name", name.text.clone()),
                 (
                     "key id",
                     if id.is_empty() {
@@ -2809,38 +2820,139 @@ struct ModelBreakRow {
     total_usd: f64,
 }
 
-/// Map downstream key id → human name from the Keys list.
-fn resolve_key_name(keys: &[crate::dto::KeyView], id: &str) -> String {
+/// Resolved display label for a usage rollup entity (provider / key).
+#[derive(Clone, Debug)]
+struct ResolvedName {
+    /// Human-readable text (never empty).
+    text: String,
+    /// Soft-deleted (or hard-missing) — render with strikethrough.
+    deleted: bool,
+}
+
+/// Map downstream key id → human name.
+///
+/// Prefers the name/deleted flag from usage summary (includes soft-deleted
+/// rows). Falls back to the live Keys list, then a truncated id.
+fn resolve_key_name(
+    keys: &[crate::dto::KeyView],
+    id: &str,
+    summary_name: &str,
+    summary_deleted: bool,
+) -> ResolvedName {
     if id.is_empty() {
-        return "(anonymous)".into();
+        return ResolvedName {
+            text: "(anonymous)".into(),
+            deleted: false,
+        };
+    }
+    if !summary_name.is_empty() {
+        return ResolvedName {
+            text: summary_name.to_string(),
+            deleted: summary_deleted,
+        };
     }
     if let Some(k) = keys.iter().find(|k| k.id == id) {
-        if k.name.is_empty() {
+        let text = if k.name.is_empty() {
             id.to_string()
         } else {
             k.name.clone()
-        }
-    } else {
-        // Key may have been revoked; still show a readable label.
-        format!("(deleted) {}", truncate(id, 12))
+        };
+        return ResolvedName {
+            text,
+            deleted: false,
+        };
+    }
+    // Soft-deleted with empty name, or hard-missing row.
+    ResolvedName {
+        text: if summary_deleted {
+            truncate(id, 12)
+        } else {
+            format!("(deleted) {}", truncate(id, 12))
+        },
+        deleted: true,
     }
 }
 
-/// Map provider id → human name from the Providers list.
-fn resolve_provider_name(providers: &[crate::dto::ProviderView], id: &str) -> String {
-    if id.is_empty() {
-        return "(unknown)".into();
+/// Map provider id → human name.
+///
+/// Prefers the name/deleted flag from usage summary (includes soft-deleted
+/// rows). Falls back to the live Providers list, then a truncated id.
+fn resolve_provider_name(
+    providers: &[crate::dto::ProviderView],
+    id: &str,
+    summary_name: &str,
+    summary_deleted: bool,
+) -> ResolvedName {
+    if id.is_empty() || id == "(unknown)" {
+        return ResolvedName {
+            text: "(unknown)".into(),
+            deleted: false,
+        };
+    }
+    if !summary_name.is_empty() {
+        return ResolvedName {
+            text: summary_name.to_string(),
+            deleted: summary_deleted,
+        };
     }
     if let Some(p) = providers.iter().find(|p| p.id == id) {
-        if p.name.is_empty() {
+        let text = if p.name.is_empty() {
             id.to_string()
         } else {
             p.name.clone()
-        }
-    } else {
-        // Soft-deleted / removed provider — keep a short id tail for correlation.
-        format!("(gone) {}", truncate(id, 12))
+        };
+        return ResolvedName {
+            text,
+            deleted: false,
+        };
     }
+    // Soft-deleted with empty name, or hard-missing row.
+    ResolvedName {
+        text: if summary_deleted {
+            truncate(id, 12)
+        } else {
+            format!("(gone) {}", truncate(id, 12))
+        },
+        deleted: true,
+    }
+}
+
+/// Base style for a usage name label (no strikethrough — that is text-only).
+fn name_base_style(theme: &Theme, selected: bool) -> Style {
+    if selected {
+        theme.accent_bold()
+    } else {
+        Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+    }
+}
+
+/// Render a name so strikethrough covers **glyphs only**, never trailing pad.
+///
+/// When `width` is set, the text is truncated and right-padded to that many
+/// display columns; padding is a separate unstyled-modifier span so terminals
+/// do not draw a strike through empty cells.
+fn name_spans(theme: &Theme, name: &ResolvedName, selected: bool, width: Option<usize>) -> Vec<Span<'static>> {
+    let style = name_base_style(theme, selected);
+    let text_style = if name.deleted {
+        style.add_modifier(Modifier::CROSSED_OUT)
+    } else {
+        style
+    };
+    let text = match width {
+        Some(w) => truncate(&name.text, w),
+        None => name.text.clone(),
+    };
+    let mut spans = vec![Span::styled(text.clone(), text_style)];
+    if let Some(w) = width {
+        let pad = w.saturating_sub(display_width(&text));
+        if pad > 0 {
+            spans.push(Span::styled(
+                " ".repeat(pad),
+                style, // same color/bold, no CROSSED_OUT
+            ));
+        }
+    }
+    spans
 }
 
 /// Provider pane: health (success / TTFB) **plus** token volume.
@@ -2853,8 +2965,18 @@ fn draw_usage_by_provider(
 ) {
     let theme = &app.theme;
     let filtered = app.filtered_indices();
-    // (name, id, kind, reqs, success_rate, ttfb, cost, tokens, tokens_per_sec)
-    let mut rows_data: Vec<(String, String, String, u64, f64, Option<f64>, f64, u64, Option<f64>)> = app
+    // (ResolvedName, id, kind, reqs, success_rate, ttfb, cost, tokens, tokens_per_sec)
+    let mut rows_data: Vec<(
+        ResolvedName,
+        String,
+        String,
+        u64,
+        f64,
+        Option<f64>,
+        f64,
+        u64,
+        Option<f64>,
+    )> = app
         .usage_summary
         .as_ref()
         .map(|s| {
@@ -2863,7 +2985,12 @@ fn draw_usage_by_provider(
                 .filter_map(|&i| {
                     s.by_provider.get(i).map(|p| {
                         (
-                            resolve_provider_name(&app.providers, &p.provider_id),
+                            resolve_provider_name(
+                                &app.providers,
+                                &p.provider_id,
+                                &p.name,
+                                p.deleted,
+                            ),
                             p.provider_id.clone(),
                             p.provider_kind.clone(),
                             p.request_count,
@@ -2911,10 +3038,19 @@ fn draw_usage_by_provider(
     let sel = sel.min(rows_data.len().saturating_sub(1));
     let (list_area, detail_area, show_detail) = usage_master_detail(area);
 
-    // name · kind · tokens · reqs · success · ttfb · tok/s
+    // Fixed metric columns; NAME takes remaining width so OAuth labels like
+    // `claude (user@outlook.com)` are not hard-capped (was clamp max 28).
+    let kind_w = 12usize;
+    let tok_w = 8usize;
+    let req_w = 6usize;
+    let success_w = 8usize;
+    let ttfb_w = 8usize;
+    let tps_w = 8usize;
+    let col_spacing = 6usize; // 7 columns → 6 gaps
+    let border = 2usize;
     let name_w = (list_area.width as usize)
-        .saturating_sub(12 + 8 + 6 + 8 + 8 + 8 + 7)
-        .clamp(10, 28);
+        .saturating_sub(border + kind_w + tok_w + req_w + success_w + ttfb_w + tps_w + col_spacing)
+        .max(12);
 
     let rows: Vec<Row> = rows_data
         .iter()
@@ -2928,9 +3064,15 @@ fn draw_usage_by_provider(
                 Some(v) if *v >= 1000.0 => format_tokens(v.round() as u64),
                 Some(v) => format!("{v:.1}"),
             };
+            let name_cell = Cell::from(Line::from(name_spans(
+                theme,
+                name,
+                i == sel,
+                Some(name_w),
+            )));
             let row = Row::new(vec![
-                Cell::from(truncate(name, name_w)),
-                Cell::from(truncate(kind, 12)),
+                name_cell,
+                Cell::from(truncate(kind, kind_w)),
                 Cell::from(format_tokens(*tok)),
                 Cell::from(req.to_string()),
                 Cell::from(format!("{:.0}%", rate * 100.0)),
@@ -2948,12 +3090,12 @@ fn draw_usage_by_provider(
         rows,
         [
             Constraint::Min(name_w as u16),
-            Constraint::Length(12),
-            Constraint::Length(8),
-            Constraint::Length(6),
-            Constraint::Length(8),
-            Constraint::Length(8),
-            Constraint::Length(8),
+            Constraint::Length(kind_w as u16),
+            Constraint::Length(tok_w as u16),
+            Constraint::Length(req_w as u16),
+            Constraint::Length(success_w as u16),
+            Constraint::Length(ttfb_w as u16),
+            Constraint::Length(tps_w as u16),
         ],
     )
     .header(
@@ -2985,9 +3127,9 @@ fn draw_usage_by_provider(
                 detail_area,
                 theme,
                 "Provider detail",
-                name,
+                &name.text,
                 &[
-                    ("name", name.clone()),
+                    ("name", name.text.clone()),
                     ("id", id.clone()),
                     ("kind", kind.clone()),
                     ("tokens", format_tokens(*tok)),
