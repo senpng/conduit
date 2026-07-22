@@ -1410,11 +1410,11 @@ fn draw_master_detail_providers(frame: &mut Frame, area: Rect, app: &App) {
     let (list_area, detail_area) = split_master_detail(area);
     let sel = app.selected[Tab::Providers.index()].min(filtered.len() - 1);
 
-    // Fixed columns for kind / remaining / short id; NAME takes the rest so
-    // OAuth labels like `codex (user@email.com)` are not hard-capped at 20.
+    // Fixed columns for kind / remaining / full ULID; NAME takes the rest so
+    // OAuth labels like `codex (user@email.com)` are not hard-capped.
     let kind_w = 14usize;
     let rem_w = 18usize;
-    let id_w = 12usize;
+    let id_w = 26usize; // ULID length — same as Keys list
     let col_spacing = 3usize; // 4 columns → 3 gaps of column_spacing(1)
     let border = 2usize; // panel left+right
     let name_w = (list_area.width as usize)
@@ -1788,6 +1788,19 @@ fn draw_master_detail_routes(frame: &mut Frame, area: Rect, app: &App) {
     let (list_area, detail_area) = split_master_detail(area);
     let sel = app.selected[Tab::Routes.index()].min(filtered.len() - 1);
 
+    // en + STRAT fixed; ALIAS/TARGETS split the rest (2:3) so long model
+    // aliases and `pool:…→…` summaries use available width instead of the old
+    // hard caps (22 / 40) that truncated even when the pane was wide.
+    let en_w = 2usize;
+    let strat_w = 11usize; // longest strategy label: `round_robin`
+    let col_spacing = 3usize; // 4 columns → 3 gaps
+    let border = 2usize;
+    let flex = (list_area.width as usize)
+        .saturating_sub(border + en_w + strat_w + col_spacing)
+        .max(20);
+    let alias_w = (flex * 2 / 5).max(16);
+    let targets_w = flex.saturating_sub(alias_w).max(20);
+
     let rows: Vec<Row> = filtered
         .iter()
         .enumerate()
@@ -1798,9 +1811,9 @@ fn draw_master_detail_routes(frame: &mut Frame, area: Rect, app: &App) {
                 super::forms::summarize_route_targets(&r.targets_json, &app.providers);
             let row = Row::new(vec![
                 en.into(),
-                truncate(&r.match_alias, 22),
-                truncate(&r.strategy, 11),
-                truncate(&summary, 40),
+                truncate(&r.match_alias, alias_w),
+                truncate(&r.strategy, strat_w),
+                truncate(&summary, targets_w),
             ]);
             if view_i == sel {
                 row.style(theme.selection())
@@ -1813,15 +1826,10 @@ fn draw_master_detail_routes(frame: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(2),
-            // STRAT: exactly wide enough for the longest value (`round_robin`),
-            // so `fixed` rows stop leaving a gap before TARGETS.
-            //
-            // ALIAS / TARGETS split the remaining width by weight — TARGETS gets
-            // the larger share since `pool:…×N→…` summaries are the longest.
-            Constraint::Fill(2), // ALIAS
-            Constraint::Length(11), // STRAT
-            Constraint::Fill(3), // TARGETS
+            Constraint::Length(en_w as u16),
+            Constraint::Length(alias_w as u16),
+            Constraint::Length(strat_w as u16),
+            Constraint::Min(targets_w as u16),
         ],
     )
     .column_spacing(1)
