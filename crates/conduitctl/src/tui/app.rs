@@ -1210,7 +1210,13 @@ impl App {
                             format!("Override draft from {pk} / {mid} — tweak rates & save");
                     }
                 }
+                // Form is always for the operator layer. Switch pane *and*
+                // rebuild the filtered-index cache before the next Browse
+                // frame (Esc / save) — otherwise the cache still holds merged
+                // table indices and draw panics on `pricing_overrides[i]`.
                 self.pricing_pane = PricingPane::Overrides;
+                self.selected[Tab::Pricing.index()] = 0;
+                self.refresh_filtered();
                 self.mode = Mode::PricingOverrideForm(form);
             }
             _ => {
@@ -1691,6 +1697,9 @@ impl App {
                         reasoning_per_mtok: body.reasoning_per_mtok,
                         effective_from: String::new(),
                     }];
+                    // Pane + backing list both changed; refresh before the next
+                    // draw frame (network response may arrive later).
+                    self.refresh_filtered();
                     net::spawn_upsert_pricing_override(
                         self.client.clone(),
                         body,
@@ -2546,6 +2555,61 @@ mod filter_cache_tests {
         });
         assert_eq!(app.list_len(), 3);
         assert_eq!(app.filtered_indices(), &[0, 1, 2]);
+    }
+
+    /// Regression: pressing `a` on the merged Pricing table used to flip
+    /// `pricing_pane` to Overrides without rebuilding the filtered-index
+    /// cache. Esc/save then drew Overrides with merged indices → OOB panic.
+    #[test]
+    fn pricing_add_override_refreshes_filter_cache() {
+        use crate::dto::PricingView;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new("http://localhost:0", tx);
+        app.tab = Tab::Pricing;
+        app.pricing_pane = PricingPane::Merged;
+        app.pricing = vec![
+            PricingView {
+                provider_kind: "openai".into(),
+                model_id: "gpt-4o".into(),
+                input_per_mtok: 2.5,
+                output_per_mtok: 10.0,
+                cache_read_per_mtok: None,
+                cache_write_per_mtok: None,
+                reasoning_per_mtok: None,
+                effective_from: String::new(),
+            },
+            PricingView {
+                provider_kind: "anthropic".into(),
+                model_id: "claude-sonnet".into(),
+                input_per_mtok: 3.0,
+                output_per_mtok: 15.0,
+                cache_read_per_mtok: None,
+                cache_write_per_mtok: None,
+                reasoning_per_mtok: None,
+                effective_from: String::new(),
+            },
+        ];
+        app.pricing_overrides = vec![];
+        app.refresh_filtered();
+        assert_eq!(app.filtered_indices(), &[0, 1], "merged cache");
+        app.selected[Tab::Pricing.index()] = 1;
+
+        app.handle_action(Action::Add);
+
+        assert!(
+            matches!(app.mode, Mode::PricingOverrideForm(_)),
+            "add opens override form"
+        );
+        assert_eq!(app.pricing_pane, PricingPane::Overrides);
+        // Cache must track the (empty) overrides list, not leftover merged
+        // indices — otherwise Browse after Esc indexes past overrides.len().
+        assert!(
+            app.filtered_indices().is_empty(),
+            "overrides filter cache must be empty, got {:?}",
+            app.filtered_indices()
+        );
+        assert_eq!(app.selected[Tab::Pricing.index()], 0);
     }
 }
 

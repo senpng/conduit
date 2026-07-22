@@ -3711,6 +3711,17 @@ fn draw_pricing(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let (list_area, detail_area) = split_master_detail(area);
+    // Guard against a stale filter cache (e.g. pane switched without
+    // refresh_filtered): drop indices that no longer point into rows_src.
+    let filtered: Vec<usize> = filtered
+        .iter()
+        .copied()
+        .filter(|&i| i < rows_src.len())
+        .collect();
+    if filtered.is_empty() {
+        empty_state(frame, area, theme, &title, "no pricing rows");
+        return;
+    }
     let sel = app.selected[Tab::Pricing.index()].min(filtered.len() - 1);
 
     // Dynamic model column — same idea as Usage (don't hard-cap to 28 chars).
