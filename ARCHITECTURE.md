@@ -57,7 +57,7 @@ client ──► L1 Transport      (axum, tower middleware stack)
 
 **L3 Router is a pure function**: `route(alias, table, attempt_no) → Decision` (plus optional skip set / pool cursors). Fully unit-testable.
 
-**Affinity** is **session-scoped** (`session_id` + alias → `provider_id`), not downstream API key. Session id comes from headers (`X-Session-ID`, …) or body/metadata; no session → no pin.
+**Affinity** is **session-scoped** (`session_id` + alias → `provider_id`), not downstream API key. Session id prefers Claude Code identity (`metadata.user_id` `_session_` / JSON `session_id`, then `X-Claude-Code-Session-Id`), then generic headers (`X-Session-ID`, …) and body fields; no session → no pin.
 
 **Pool targets** (`pool_kind` / `pool_id`) schedule members with `pool_strategy`:
 - `round_robin` (default) — stable cursor across requests

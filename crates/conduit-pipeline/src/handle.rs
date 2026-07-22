@@ -865,14 +865,14 @@ impl PipelineHandle {
 
 /// Resolve session id from headers and request metadata (for affinity).
 ///
+/// Passes headers and body metadata **together** so Claude `metadata.user_id`
+/// can outrank generic session headers (CLIProxyAPI affinity parity).
+///
 /// Public for integration tests of the live header → pin path.
 pub fn resolve_session_id(
     headers: &[(String, String)],
     request: &CanonicalChatRequest,
 ) -> Option<String> {
-    if let Some(s) = extract_session_id(headers, None) {
-        return Some(s);
-    }
     // Fold RequestMeta into a JSON object for the shared extractor.
     let mut map = serde_json::Map::new();
     if let Some(ref user) = request.meta.user {
@@ -883,10 +883,12 @@ pub fn resolve_session_id(
     for (k, v) in &request.meta.extra {
         map.insert(k.clone(), v.clone());
     }
-    if map.is_empty() {
-        return None;
-    }
-    extract_session_id(&[], Some(&serde_json::Value::Object(map)))
+    let body = if map.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(map))
+    };
+    extract_session_id(headers, body.as_ref())
 }
 
 impl PipelineHandle {
