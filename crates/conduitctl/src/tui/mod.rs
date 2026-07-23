@@ -7,6 +7,7 @@ mod draw;
 mod event;
 mod forms;
 mod input;
+mod logs;
 mod msg;
 mod net;
 mod theme;

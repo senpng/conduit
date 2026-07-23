@@ -11,9 +11,10 @@ use thiserror::Error;
 
 use crate::dto::{
     CooldownListResponse, CreateKeyBody, CreateProviderBody, CreateRouteBody, HealthResponse,
-    KeyCreateResponse, KeySecretView, KeyView, OAuthSessionView, PricingView, ProviderSecretView,
-    ProviderView, QuotaListResponse, RouteView, SetSecretBody, UpdateKeyBody, UpdateProviderBody,
-    UpsertPricingOverrideBody, UsageListResponse, UsageSummaryView,
+    KeyCreateResponse, KeySecretView, KeyView, LogsMeta, LogsPage, OAuthSessionView,
+    PricingView, ProviderSecretView, ProviderView, QuotaListResponse, RouteView, SetSecretBody,
+    UpdateKeyBody, UpdateProviderBody, UpsertPricingOverrideBody, UsageListResponse,
+    UsageSummaryView,
 };
 
 /// Errors from console HTTP / SSE transport.
@@ -411,6 +412,137 @@ impl ConsoleClient {
             self.base
         );
         self.post_empty_json(&url).await
+    }
+
+    // ── Logs ────────────────────────────────────────────────────────────────
+
+    /// File-log metadata (enabled, dir, available dates).
+    pub async fn logs_meta(&self) -> Result<LogsMeta, ConsoleError> {
+        let url = format!("{}/console/logs/meta", self.base);
+        self.get_json(&url).await
+    }
+
+    /// Page historical log lines for a local calendar date.
+    pub async fn list_logs(
+        &self,
+        date: Option<&str>,
+        limit: usize,
+        cursor: Option<&str>,
+        level: Option<&str>,
+        q: Option<&str>,
+        direction: Option<&str>,
+    ) -> Result<LogsPage, ConsoleError> {
+        let mut url = format!("{}/console/logs?limit={limit}", self.base);
+        if let Some(d) = date.filter(|s| !s.is_empty()) {
+            url.push_str(&format!("&date={}", urlencoding_path(d)));
+        }
+        if let Some(c) = cursor.filter(|s| !s.is_empty()) {
+            url.push_str(&format!("&cursor={}", urlencoding_path(c)));
+        }
+        if let Some(lv) = level.filter(|s| !s.is_empty()) {
+            url.push_str(&format!("&level={}", urlencoding_path(lv)));
+        }
+        if let Some(query) = q.filter(|s| !s.is_empty()) {
+            url.push_str(&format!("&q={}", urlencoding_path(query)));
+        }
+        if let Some(dir) = direction.filter(|s| !s.is_empty()) {
+            url.push_str(&format!("&direction={}", urlencoding_path(dir)));
+        }
+        self.get_json(&url).await
+    }
+
+    /// Live SSE follow of today's log file.
+    ///
+    /// Invokes `on_event` for each SSE event name + data payload until the
+    /// stream ends, the server closes, or `cancel` is set.
+    pub async fn stream_logs<F>(
+        &self,
+        level: Option<&str>,
+        q: Option<&str>,
+        backfill: usize,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        mut on_event: F,
+    ) -> Result<(), ConsoleError>
+    where
+        F: FnMut(&str, &str) + Send,
+    {
+        use std::sync::atomic::Ordering;
+
+        let mut url = format!(
+            "{}/console/logs/stream?backfill={backfill}",
+            self.base
+        );
+        if let Some(lv) = level.filter(|s| !s.is_empty()) {
+            url.push_str(&format!("&level={}", urlencoding_path(lv)));
+        }
+        if let Some(query) = q.filter(|s| !s.is_empty()) {
+            url.push_str(&format!("&q={}", urlencoding_path(query)));
+        }
+
+        // Long-lived stream: use a very large request timeout (SSE may run hours).
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60 * 60 * 6))
+            .build()
+            .unwrap_or_else(|_| self.http.clone());
+
+        let resp = http.get(&url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ConsoleError::Http {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let mut stream = resp.bytes_stream();
+        use futures_util::StreamExt;
+
+        let mut buf = String::new();
+        let mut event_name = String::from("message");
+        let mut data_lines: Vec<String> = Vec::new();
+
+        while !cancel.load(Ordering::Relaxed) {
+            let item = tokio::select! {
+                biased;
+                _ = async {
+                    while !cancel.load(Ordering::Relaxed) {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                } => break,
+                item = stream.next() => item,
+            };
+            let Some(item) = item else { break };
+            let bytes = item.map_err(ConsoleError::Transport)?;
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+
+            while let Some(nl) = buf.find('\n') {
+                let mut line = buf[..nl].to_string();
+                buf.drain(..=nl);
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+                if line.is_empty() {
+                    if !data_lines.is_empty() {
+                        let data = data_lines.join("\n");
+                        on_event(&event_name, &data);
+                        data_lines.clear();
+                    }
+                    event_name = String::from("message");
+                    continue;
+                }
+                if line.starts_with(':') {
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("event:") {
+                    event_name = rest.trim().to_string();
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    data_lines.push(rest.trim_start().to_string());
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn post_empty_unit(&self, url: &str) -> Result<(), ConsoleError> {

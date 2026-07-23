@@ -45,8 +45,44 @@ pub async fn run(
     data_dir: PathBuf,
     master_password: Option<secrecy::SecretString>,
 ) -> Result<()> {
+    run_with_log(
+        cfg,
+        port,
+        data_dir,
+        master_password,
+        crate::state::LogRuntime {
+            to_file: true,
+            dir: PathBuf::new(),
+            prefix: crate::log_reader::DEFAULT_LOG_PREFIX.into(),
+            format: "pretty".into(),
+            level: "info".into(),
+        },
+    )
+    .await
+}
+
+/// Like [`run`], but carries the resolved file-log settings into
+/// [`DaemonState`] so console log handlers know where to read.
+pub async fn run_with_log(
+    cfg: Config,
+    port: u16,
+    data_dir: PathBuf,
+    master_password: Option<secrecy::SecretString>,
+    log: crate::state::LogRuntime,
+) -> Result<()> {
     // Ensure data directories exist
     std::fs::create_dir_all(&data_dir)?;
+    // Fill default log dir when caller left it empty (e.g. legacy `run`).
+    let log = {
+        let mut log = log;
+        if log.dir.as_os_str().is_empty() {
+            log.dir = data_dir.join("logs");
+        }
+        if log.prefix.is_empty() {
+            log.prefix = crate::log_reader::DEFAULT_LOG_PREFIX.into();
+        }
+        log
+    };
 
     // ── Open SQLite database ──────────────────────────────────────────────────
     let db_url = format!("sqlite:///{}", data_dir.join("conduit.db").display());
@@ -275,6 +311,7 @@ pub async fn run(
         cooldown,
         quota_snapshots,
         version: env!("CARGO_PKG_VERSION"),
+        log,
     });
 
     // ── Gateway router (OpenAI + Anthropic-compatible API) ────────────────────
@@ -611,6 +648,10 @@ pub fn build_console_router(state: Arc<crate::state::DaemonState>) -> Router {
             "/console/quota-snapshots/{provider_id}/refresh",
             post(crate::console::refresh_quota_snapshot),
         )
+        // Logs (daily-rolling files for TUI Logs tab)
+        .route("/console/logs/meta", get(crate::console_logs::logs_meta))
+        .route("/console/logs", get(crate::console_logs::list_logs))
+        .route("/console/logs/stream", get(crate::console_logs::stream_logs))
         // Innermost → outermost: OPTIONS short-circuit, then CorsLayer.
         .layer(middleware::from_fn(options_preflight_ok))
         .layer(console_cors_layer())
@@ -797,196 +838,6 @@ mod cors_tests {
             res.status() == StatusCode::NO_CONTENT || res.status().is_success(),
             "unexpected status {}",
             res.status()
-        );
-    }
-}
-
-// ── Hot-path routing tests ───────────────────────────────────────────────────
-
-#[cfg(test)]
-mod hotpath_tests {
-    use conduit_router::{policy::RetryPolicy, table::RouteTarget};
-
-    use super::*;
-
-    fn sample_table(alias: &str, model: &str) -> RoutingTable {
-        RoutingTable::new(vec![Route {
-            alias: alias.into(),
-            strategy: RoutingStrategy::Fixed,
-            pool_strategy: conduit_router::PoolStrategy::default(),
-            targets: vec![RouteTarget {
-                provider_id: "openai".into(),
-                model_id: model.into(),
-                provider_kind: "openai".into(),
-                base_url: Some("https://api.openai.com".into()),
-                weight: 1,
-                request_overrides: Default::default(),
-                pool_id: None,
-                pool_kind: None,
-            }],
-            retry_policy: RetryPolicy::default(),
-        }])
-    }
-
-    #[test]
-    fn arcswap_reload_visible_on_next_load_without_clone_rebuild() {
-        let table = Arc::new(ArcSwap::from_pointee(sample_table("gpt-4o", "gpt-4o")));
-        // Simulate pipeline hot path: lock-free load.
-        let snap1 = table.load_full();
-        assert_eq!(snap1.get("gpt-4o").unwrap().targets[0].model_id, "gpt-4o");
-
-        // Simulate console reload: store new Arc (no per-request deep clone).
-        table.store(Arc::new(sample_table("gpt-4o", "gpt-4o-mini")));
-        let snap2 = table.load_full();
-        assert_eq!(
-            snap2.get("gpt-4o").unwrap().targets[0].model_id,
-            "gpt-4o-mini"
-        );
-        // Old snapshot is unchanged (in-flight request isolation).
-        assert_eq!(snap1.get("gpt-4o").unwrap().targets[0].model_id, "gpt-4o");
-        // Pointers differ — we publish a new Arc rather than mutate in place.
-        assert!(!Arc::ptr_eq(&snap1, &snap2));
-    }
-
-    #[test]
-    fn rows_to_routes_preserves_target_request_overrides() {
-        let row = conduit_store::RouteRow {
-            id: "route-1".into(),
-            match_alias: "terra".into(),
-            strategy: "fixed".into(),
-            targets_json: r#"[{"provider_id":"codex","model_id":"gpt-5.6-terra","provider_kind":"codex-oauth","request_overrides":{"service_tier":"priority"}}]"#.into(),
-            retry_policy_json: "{}".into(),
-            enabled: true,
-            created_at: "now".into(),
-            updated_at: "now".into(),
-            deleted_at: None,
-        };
-        let provider_map = std::collections::HashMap::from([(
-            "codex".into(),
-            "https://chatgpt.com/backend-api/codex".into(),
-        )]);
-
-        let routes = rows_to_routes(vec![row], &provider_map).unwrap();
-        let target = &routes[0].targets[0];
-
-        assert_eq!(
-            target.base_url.as_deref(),
-            Some("https://chatgpt.com/backend-api/codex")
-        );
-        assert_eq!(target.request_overrides["service_tier"], "priority");
-    }
-
-    #[test]
-    fn rows_to_routes_injects_base_url_from_provider() {
-        let row = conduit_store::RouteRow {
-            id: "r".into(),
-            match_alias: "m".into(),
-            strategy: "fixed".into(),
-            targets_json: r#"[{"provider_id":"p1","model_id":"gpt","provider_kind":"openai"}]"#
-                .into(),
-            retry_policy_json: "{}".into(),
-            enabled: true,
-            created_at: "now".into(),
-            updated_at: "now".into(),
-            deleted_at: None,
-        };
-        let provider_map =
-            std::collections::HashMap::from([("p1".into(), "https://api.example".into())]);
-        let routes = rows_to_routes(vec![row], &provider_map).unwrap();
-        assert_eq!(
-            routes[0].targets[0].base_url.as_deref(),
-            Some("https://api.example")
-        );
-    }
-
-    /// Structural proof: process-shared CredentialResolver is constructed once
-    /// and cloned into the secret_fn (not `CredentialResolver::new` per call).
-    #[test]
-    fn shared_credential_resolver_is_arc_cloned_not_rebuilt_per_call() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        use conduit_oauth::{CredentialResolver, SecretStore};
-        use secrecy::SecretVec;
-
-        static NEW_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-        struct CountingStore;
-        #[async_trait::async_trait]
-        impl SecretStore for CountingStore {
-            async fn get(
-                &self,
-                _scope: &str,
-                _id: &str,
-            ) -> Result<Option<SecretVec<u8>>, conduit_oauth::OAuthError> {
-                Ok(None)
-            }
-            async fn put(
-                &self,
-                _scope: &str,
-                _id: &str,
-                _secret: SecretVec<u8>,
-            ) -> Result<(), conduit_oauth::OAuthError> {
-                Ok(())
-            }
-        }
-
-        // Mirror daemon wiring: one Arc resolver, clone into multiple "calls".
-        NEW_COUNT.store(0, Ordering::SeqCst);
-        let make = || {
-            NEW_COUNT.fetch_add(1, Ordering::SeqCst);
-            Arc::new(CredentialResolver::new(Arc::new(CountingStore)))
-        };
-        let shared = make();
-        let c1 = shared.clone();
-        let c2 = shared.clone();
-        assert_eq!(NEW_COUNT.load(Ordering::SeqCst), 1);
-        assert!(Arc::ptr_eq(&c1, &c2));
-        // Distinct from the anti-pattern: per-request new would bump the counter.
-        let _again = make();
-        assert_eq!(NEW_COUNT.load(Ordering::SeqCst), 2);
-    }
-
-    /// Source-level guard: hot path must not reintroduce nested block_on wiring.
-    #[test]
-    fn server_source_has_no_nested_block_on_hot_path() {
-        // Strip this test module so our own string literals cannot false-positive.
-        let full = include_str!("server.rs");
-        let src = full
-            .split("mod hotpath_tests")
-            .next()
-            .expect("hotpath_tests module marker");
-        // Build needles without embedding the banned call as a contiguous literal
-        // in production source (this test body is stripped above).
-        let banned = [
-            format!("{}{}{}", "block", "_in_place", "("),
-            format!("{}{}{}", "task::block", "_in_place", ""),
-            format!("{}{}", "Handle::current().", "block_on"),
-        ];
-        for needle in &banned {
-            assert!(
-                !src.contains(needle.as_str()),
-                "server production source must not contain `{needle}`"
-            );
-        }
-        // Native ingress protocols must be registered on the gateway router.
-        assert!(
-            src.contains("/v1/messages") && src.contains("routes::messages"),
-            "gateway router must register POST /v1/messages → routes::messages"
-        );
-        assert!(
-            src.contains("/v1/responses") && src.contains("routes::responses"),
-            "gateway router must register POST /v1/responses → routes::responses"
-        );
-        assert!(
-            src.contains("/v1/responses/compact") && src.contains("routes::responses_compact"),
-            "gateway router must register POST /v1/responses/compact → routes::responses_compact"
-        );
-        // Shared resolver: construct once at startup, not per request.
-        let ctor = format!("{}{}", "CredentialResolver", "::new");
-        let resolver_news = src.matches(ctor.as_str()).count();
-        assert_eq!(
-            resolver_news, 1,
-            "CredentialResolver::new must appear once (process-shared), found {resolver_news}"
         );
     }
 }

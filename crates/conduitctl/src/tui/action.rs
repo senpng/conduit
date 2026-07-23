@@ -82,4 +82,15 @@ pub enum Action {
     GoBottom,
     /// Provider-add chooser: pick option by index (0-based)
     ChooserPick(usize),
+    /// Logs: Live ↔ History
+    ToggleLogsMode,
+    /// Logs: cycle level floor (error → warn → info → debug → trace)
+    CycleLogsLevel,
+    /// Logs: clear local live buffer (does not delete files)
+    ClearLogsBuffer,
+    /// Logs: copy selected line raw text
+    CopyLogLine,
+    /// Logs: previous / next calendar day (history)
+    LogsDayPrev,
+    LogsDayNext,
 }

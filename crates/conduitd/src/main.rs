@@ -156,7 +156,16 @@ async fn run_async(
 
     // Keep the appender guard alive for the whole process; dropping it
     // would flush and stop the background writer, losing buffered logs.
-    let _log_guard = init_tracing(&log_format, &log_level, log_to_file, log_dir);
+    let _log_guard = init_tracing(&log_format, &log_level, log_to_file, log_dir.clone());
+    // init_tracing may fall back to stdout if the dir cannot be created/opened;
+    // only advertise file logging when the guard is present.
+    let log_runtime = conduitd::state::LogRuntime {
+        to_file: _log_guard.is_some(),
+        dir: log_dir,
+        prefix: conduitd::log_reader::DEFAULT_LOG_PREFIX.into(),
+        format: log_format,
+        level: log_level,
+    };
 
     info!(version = env!("CARGO_PKG_VERSION"), "conduitd starting");
     if let Some(note) = load_note {
@@ -169,7 +178,7 @@ async fn run_async(
         .or_else(|| cfg.master_password.clone())
         .map(secrecy::SecretString::new);
 
-    server::run(cfg, port, data_dir, master_password).await
+    server::run_with_log(cfg, port, data_dir, master_password, log_runtime).await
 }
 
 /// Fork the process into the background (Unix daemonize).

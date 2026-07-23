@@ -68,6 +68,24 @@ pub struct DaemonState {
 
     /// Daemon version string.
     pub version: &'static str,
+
+    /// Resolved logging surface for console log API / TUI Logs tab.
+    pub log: LogRuntime,
+}
+
+/// File-log settings resolved at daemon start (CLI > config > defaults).
+#[derive(Debug, Clone)]
+pub struct LogRuntime {
+    /// Whether the process is writing daily-rolling files (vs stdout only).
+    pub to_file: bool,
+    /// Directory used when `to_file` is true (or the configured path even if open failed).
+    pub dir: PathBuf,
+    /// File name prefix (`conduitd.log`).
+    pub prefix: String,
+    /// `pretty` or `json`.
+    pub format: String,
+    /// EnvFilter-style level string as configured.
+    pub level: String,
 }
 
 /// Build a pricing map from all rows currently in the pricing repo.

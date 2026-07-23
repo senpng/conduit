@@ -760,6 +760,101 @@ pub fn spawn_oauth_refresh(client: ConsoleClient, provider_id: String, tx: Unbou
     });
 }
 
+// ── Logs ────────────────────────────────────────────────────────────────────
+
+pub fn spawn_logs_meta(client: ConsoleClient, gen: u64, tx: UnboundedSender<Msg>) {
+    tokio::spawn(async move {
+        let result = client.logs_meta().await.map_err(|e| e.to_string());
+        let _ = tx.send(Msg::LogsMeta { gen, result });
+    });
+}
+
+pub fn spawn_logs_page(
+    client: ConsoleClient,
+    gen: u64,
+    date: Option<String>,
+    limit: usize,
+    cursor: Option<String>,
+    level: Option<String>,
+    q: Option<String>,
+    tx: UnboundedSender<Msg>,
+) {
+    tokio::spawn(async move {
+        let result = client
+            .list_logs(
+                date.as_deref(),
+                limit,
+                cursor.as_deref(),
+                level.as_deref(),
+                q.as_deref(),
+                Some("backward"),
+            )
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(Msg::LogsPage { gen, result });
+    });
+}
+
+pub fn spawn_logs_stream(
+    client: ConsoleClient,
+    gen: u64,
+    level: Option<String>,
+    q: Option<String>,
+    backfill: usize,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    tx: UnboundedSender<Msg>,
+) {
+    tokio::spawn(async move {
+        let on_event = {
+            let tx = tx.clone();
+            move |event: &str, data: &str| {
+                match event {
+                    "line" => match serde_json::from_str::<crate::dto::LogLineView>(data) {
+                        Ok(line) => {
+                            let _ = tx.send(Msg::LogsStreamLine { gen, line });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Msg::LogsStreamEvent {
+                                gen,
+                                kind: "error".into(),
+                                message: format!("bad line event: {e}"),
+                            });
+                        }
+                    },
+                    other => {
+                        let _ = tx.send(Msg::LogsStreamEvent {
+                            gen,
+                            kind: other.to_string(),
+                            message: data.to_string(),
+                        });
+                    }
+                }
+            }
+        };
+        let result = client
+            .stream_logs(
+                level.as_deref(),
+                q.as_deref(),
+                backfill,
+                cancel,
+                on_event,
+            )
+            .await;
+        if let Err(e) = result {
+            let _ = tx.send(Msg::LogsStreamEvent {
+                gen,
+                kind: "error".into(),
+                message: e.to_string(),
+            });
+        }
+        let _ = tx.send(Msg::LogsStreamEvent {
+            gen,
+            kind: "ended".into(),
+            message: String::new(),
+        });
+    });
+}
+
 pub fn open_browser(url: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {

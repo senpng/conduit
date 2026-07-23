@@ -637,6 +637,60 @@ pub struct CooldownListResponse {
     pub entries: Vec<CooldownView>,
 }
 
+// ── Logs (console daily-rolling file surface) ───────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct LogsMeta {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub dir: String,
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub format: String,
+    #[serde(default)]
+    pub level_filter: String,
+    #[serde(default)]
+    pub available_dates: Vec<String>,
+    #[serde(default)]
+    pub today: String,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+pub struct LogLineView {
+    #[serde(default)]
+    pub ts: Option<String>,
+    #[serde(default)]
+    pub level: Option<String>,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub raw: String,
+    #[serde(default)]
+    pub offset: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+pub struct LogsPage {
+    #[serde(default)]
+    pub date: String,
+    #[serde(default)]
+    pub lines: Vec<LogLineView>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub prev_cursor: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub source: String,
+}
+
 // ── Generic JSON helpers ────────────────────────────────────────────────────
 
 /// Loose envelope when we only need pretty-print / passthrough.
@@ -821,5 +875,41 @@ mod tests {
         };
         let s = serde_json::to_string(&t).unwrap();
         assert!(!s.contains("request_overrides"), "{s}");
+    }
+
+    #[test]
+    fn logs_meta_and_page_deserialize() {
+        let meta_raw = r#"{
+            "enabled":true,
+            "dir":"/tmp/logs",
+            "prefix":"conduitd.log",
+            "format":"pretty",
+            "level_filter":"info",
+            "available_dates":["2026-07-24"],
+            "today":"2026-07-24"
+        }"#;
+        let m: LogsMeta = serde_json::from_str(meta_raw).unwrap();
+        assert!(m.enabled);
+        assert_eq!(m.today, "2026-07-24");
+        assert_eq!(m.available_dates, vec!["2026-07-24".to_string()]);
+
+        let page_raw = r#"{
+            "date":"2026-07-24",
+            "lines":[{
+                "ts":"2026-07-24T00:00:00Z",
+                "level":"INFO",
+                "target":"conduitd",
+                "message":"hi",
+                "raw":"2026-07-24T00:00:00Z  INFO conduitd: hi",
+                "offset":0
+            }],
+            "next_cursor":"o0",
+            "truncated":false,
+            "source":"file"
+        }"#;
+        let p: LogsPage = serde_json::from_str(page_raw).unwrap();
+        assert_eq!(p.lines.len(), 1);
+        assert!(p.lines[0].raw.contains("hi"));
+        assert_eq!(p.next_cursor.as_deref(), Some("o0"));
     }
 }

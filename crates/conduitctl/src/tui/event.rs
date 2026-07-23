@@ -89,46 +89,53 @@ fn map_filter(key: KeyEvent) -> Option<Action> {
 }
 
 fn map_browse(tab: Tab, key: KeyEvent) -> Option<Action> {
+    // Shared chrome (all tabs including Logs).
     match key.code {
-        KeyCode::Char('q') => Some(Action::Quit),
-        KeyCode::Char('?') => Some(Action::Help),
-        KeyCode::Tab => Some(Action::NextTab),
-        KeyCode::BackTab => Some(Action::PrevTab),
-        KeyCode::Char('1') => Some(Action::Tab(0)),
-        KeyCode::Char('2') => Some(Action::Tab(1)),
-        KeyCode::Char('3') => Some(Action::Tab(2)),
-        KeyCode::Char('4') => Some(Action::Tab(3)),
-        KeyCode::Char('5') => Some(Action::Tab(4)),
-        KeyCode::Char('6') => Some(Action::Tab(5)),
-        // Ctrl+j / Ctrl+k — scroll Usage request detail (must beat plain j/k below).
+        KeyCode::Char('q') => return Some(Action::Quit),
+        KeyCode::Char('?') => return Some(Action::Help),
+        KeyCode::Tab => return Some(Action::NextTab),
+        KeyCode::BackTab => return Some(Action::PrevTab),
+        KeyCode::Char('1') => return Some(Action::Tab(0)),
+        KeyCode::Char('2') => return Some(Action::Tab(1)),
+        KeyCode::Char('3') => return Some(Action::Tab(2)),
+        KeyCode::Char('4') => return Some(Action::Tab(3)),
+        KeyCode::Char('5') => return Some(Action::Tab(4)),
+        KeyCode::Char('6') => return Some(Action::Tab(5)),
+        KeyCode::Char('7') => return Some(Action::Tab(6)),
         KeyCode::Char('j')
             if tab == Tab::Usage && key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
-            Some(Action::ScrollDetailDown)
+            return Some(Action::ScrollDetailDown);
         }
         KeyCode::Char('k')
             if tab == Tab::Usage && key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
-            Some(Action::ScrollDetailUp)
+            return Some(Action::ScrollDetailUp);
         }
-        KeyCode::Up | KeyCode::Char('k') => Some(Action::Up),
-        KeyCode::Down | KeyCode::Char('j') => Some(Action::Down),
-        KeyCode::PageUp => Some(Action::PageUp),
-        KeyCode::PageDown => Some(Action::PageDown),
-        KeyCode::Home | KeyCode::Char('g') => Some(Action::GoTop),
-        KeyCode::End | KeyCode::Char('G') => Some(Action::GoBottom),
-        KeyCode::Char('/') => Some(Action::StartFilter),
-        KeyCode::Char('r') => Some(Action::Refresh),
-        // Shift-T — cycle auto/dark/light (plain `t` is Usage detail).
-        KeyCode::Char('T') => Some(Action::ToggleTheme),
+        KeyCode::Up | KeyCode::Char('k') => return Some(Action::Up),
+        KeyCode::Down | KeyCode::Char('j') => return Some(Action::Down),
+        KeyCode::PageUp => return Some(Action::PageUp),
+        KeyCode::PageDown => return Some(Action::PageDown),
+        KeyCode::Home | KeyCode::Char('g') => return Some(Action::GoTop),
+        KeyCode::End | KeyCode::Char('G') => return Some(Action::GoBottom),
+        KeyCode::Char('/') => return Some(Action::StartFilter),
+        KeyCode::Char('r') => return Some(Action::Refresh),
+        KeyCode::Char('T') => return Some(Action::ToggleTheme),
+        _ => {}
+    }
+
+    // Feature keys are tab-local so Logs never inherits CRUD / period semantics.
+    if tab == Tab::Logs {
+        return map_logs(key);
+    }
+
+    match key.code {
         KeyCode::Char('a') => Some(Action::Add),
-        // Usage / Pricing / Keys have right-hand detail panes — no Enter modal.
         KeyCode::Char('e') if tab != Tab::Usage => Some(Action::Edit),
         KeyCode::Enter if !matches!(tab, Tab::Usage | Tab::Pricing | Tab::Keys) => {
             Some(Action::Edit)
         }
         KeyCode::Char('d') => Some(Action::Delete),
-        // Keys: reveal raw token in a modal (copy from there).
         KeyCode::Char('v') if tab == Tab::Keys => Some(Action::ViewSecret),
         KeyCode::Char('[') if tab == Tab::Usage => Some(Action::PeriodPrev),
         KeyCode::Char(']') if tab == Tab::Usage => Some(Action::PeriodNext),
@@ -137,17 +144,27 @@ fn map_browse(tab: Tab, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('o') if tab == Tab::Pricing => Some(Action::TogglePricingView),
         KeyCode::Char('s') if tab == Tab::Providers => Some(Action::SetSecret),
         KeyCode::Char('v') if tab == Tab::Providers => Some(Action::ViewSecret),
-        // y / Y — copy decrypted secret while it is loaded in detail
         KeyCode::Char('y') if tab == Tab::Providers => Some(Action::CopySecretFull),
         KeyCode::Char('Y') if tab == Tab::Providers => Some(Action::CopySecretPrimary),
-        KeyCode::Char('o') if tab == Tab::Providers => Some(Action::OpenBrowser), // re-auth OAuth
+        KeyCode::Char('o') if tab == Tab::Providers => Some(Action::OpenBrowser),
         KeyCode::Char('x') if tab == Tab::Providers => Some(Action::OauthRefresh),
         KeyCode::Char('u') if tab == Tab::Providers => Some(Action::RefreshQuota),
         KeyCode::Char('c') if tab == Tab::Usage => Some(Action::CycleUsageSort),
-        // Overview heatmap says “press t”; Usage cycles detail panes (incl. by day).
         KeyCode::Char('t') if matches!(tab, Tab::Overview | Tab::Usage) => {
             Some(Action::CycleUsageDetail)
         }
+        _ => None,
+    }
+}
+
+fn map_logs(key: KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Char('f') => Some(Action::ToggleLogsMode),
+        KeyCode::Char('l') => Some(Action::CycleLogsLevel),
+        KeyCode::Char('c') => Some(Action::ClearLogsBuffer),
+        KeyCode::Char('y') => Some(Action::CopyLogLine),
+        KeyCode::Char('[') => Some(Action::LogsDayPrev),
+        KeyCode::Char(']') => Some(Action::LogsDayNext),
         _ => None,
     }
 }
@@ -390,10 +407,42 @@ mod tests {
             map_key(&Mode::Browse, Tab::Overview, key(KeyCode::Char('3'))),
             Some(Action::Tab(2))
         );
-        // Only 6 tabs — 7 no longer maps to OAuth
         assert_eq!(
             map_key(&Mode::Browse, Tab::Overview, key(KeyCode::Char('6'))),
             Some(Action::Tab(5))
+        );
+        // Tab 7 = Logs
+        assert_eq!(
+            map_key(&Mode::Browse, Tab::Overview, key(KeyCode::Char('7'))),
+            Some(Action::Tab(6))
+        );
+    }
+
+    #[test]
+    fn logs_keybinds() {
+        assert_eq!(
+            map_key(&Mode::Browse, Tab::Logs, key(KeyCode::Char('f'))),
+            Some(Action::ToggleLogsMode)
+        );
+        assert_eq!(
+            map_key(&Mode::Browse, Tab::Logs, key(KeyCode::Char('l'))),
+            Some(Action::CycleLogsLevel)
+        );
+        assert_eq!(
+            map_key(&Mode::Browse, Tab::Logs, key(KeyCode::Char('c'))),
+            Some(Action::ClearLogsBuffer)
+        );
+        assert_eq!(
+            map_key(&Mode::Browse, Tab::Logs, key(KeyCode::Char('y'))),
+            Some(Action::CopyLogLine)
+        );
+        assert_eq!(
+            map_key(&Mode::Browse, Tab::Logs, key(KeyCode::Char('['))),
+            Some(Action::LogsDayPrev)
+        );
+        assert_eq!(
+            map_key(&Mode::Browse, Tab::Logs, key(KeyCode::Char(']'))),
+            Some(Action::LogsDayNext)
         );
     }
 

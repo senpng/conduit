@@ -33,16 +33,18 @@ pub enum Tab {
     Keys = 3,
     Usage = 4,
     Pricing = 5,
+    Logs = 6,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 6] = [
+    pub const ALL: [Tab; 7] = [
         Tab::Overview,
         Tab::Providers,
         Tab::Routes,
         Tab::Keys,
         Tab::Usage,
         Tab::Pricing,
+        Tab::Logs,
     ];
 
     pub fn title(self) -> &'static str {
@@ -53,6 +55,7 @@ impl Tab {
             Tab::Keys => "Keys",
             Tab::Usage => "Usage",
             Tab::Pricing => "Pricing",
+            Tab::Logs => "Logs",
         }
     }
 
@@ -64,11 +67,12 @@ impl Tab {
             Tab::Keys => "Keys",
             Tab::Usage => "Usage",
             Tab::Pricing => "Price",
+            Tab::Logs => "Log",
         }
     }
 
     pub fn from_index(i: usize) -> Tab {
-        Self::ALL[i.min(5)]
+        Self::ALL[i.min(Self::ALL.len() - 1)]
     }
 
     pub fn index(self) -> usize {
@@ -223,8 +227,11 @@ pub struct App {
     pub help_scroll: u16,
     pub help_scroll_max: u16,
 
+    /// Logs tab state machine (mode/level/stream isolated from other tabs).
+    pub logs: super::logs::LogsState,
+
     /// Selection index into the **filtered** view for each tab.
-    pub selected: [usize; 6],
+    pub selected: [usize; 7],
 
     /// Cached result of [`Self::compute_filtered`] for the current tab/filter.
     /// Kept in sync via [`Self::refresh_filtered`] so `draw` never recomputes.
@@ -284,7 +291,8 @@ impl App {
             usage_detail_scroll_max: 0,
             help_scroll: 0,
             help_scroll_max: 0,
-            selected: [0; 6],
+            logs: super::logs::LogsState::default(),
+            selected: [0; 7],
             filtered: Vec::new(),
             data_gen: 0,
             tx,
@@ -303,6 +311,9 @@ impl App {
                 // Always reload pricing + period usage together.
                 net::spawn_pricing(self.client.clone(), gen, self.tx.clone());
             }
+            Tab::Logs => {
+                self.logs.start_load(self.client.clone(), gen, &self.filter, self.tx.clone());
+            }
             other => net::spawn_load_tab(self.client.clone(), other.index(), gen, self.tx.clone()),
         }
     }
@@ -319,7 +330,10 @@ impl App {
 
     pub fn handle_action(&mut self, action: Action) {
         match action {
-            Action::Quit => self.should_quit = true,
+            Action::Quit => {
+                self.logs.on_leave();
+                self.should_quit = true;
+            }
             Action::Tick => self.on_tick(),
             Action::Help => {
                 if matches!(self.mode, Mode::Browse) {
@@ -330,9 +344,13 @@ impl App {
             }
             Action::Cancel | Action::ConfirmNo => self.close_overlay(),
             Action::ConfirmYes => self.confirm_yes(),
-            Action::NextTab => self.switch_tab(Tab::from_index((self.tab.index() + 1) % 6)),
+            Action::NextTab => {
+                let n = Tab::ALL.len();
+                self.switch_tab(Tab::from_index((self.tab.index() + 1) % n));
+            }
             Action::PrevTab => {
-                self.switch_tab(Tab::from_index((self.tab.index() + 5) % 6));
+                let n = Tab::ALL.len();
+                self.switch_tab(Tab::from_index((self.tab.index() + n - 1) % n));
             }
             Action::Tab(i) => self.switch_tab(Tab::from_index(i)),
             Action::Up => {
@@ -381,6 +399,8 @@ impl App {
             Action::GoTop => {
                 if matches!(self.mode, Mode::Help) {
                     self.help_scroll = 0;
+                } else if self.tab == Tab::Logs {
+                    self.dispatch_logs(&Action::GoTop);
                 } else if self.tab == Tab::Usage && self.usage_detail == UsageDetail::Recent {
                     if self.usage_offset > 0 {
                         self.usage_offset = 0;
@@ -401,6 +421,8 @@ impl App {
             Action::GoBottom => {
                 if matches!(self.mode, Mode::Help) {
                     self.help_scroll = self.help_scroll_max;
+                } else if self.tab == Tab::Logs {
+                    self.dispatch_logs(&Action::GoBottom);
                 } else if self.tab == Tab::Usage && self.usage_detail == UsageDetail::Recent {
                     let last_off = self.usage_last_offset();
                     if self.usage_offset < last_off {
@@ -428,7 +450,12 @@ impl App {
                 if matches!(self.mode, Mode::Browse)
                     && matches!(
                         self.tab,
-                        Tab::Providers | Tab::Routes | Tab::Keys | Tab::Pricing | Tab::Usage
+                        Tab::Providers
+                            | Tab::Routes
+                            | Tab::Keys
+                            | Tab::Pricing
+                            | Tab::Usage
+                            | Tab::Logs
                     )
                 {
                     self.mode = Mode::Filter;
@@ -707,6 +734,16 @@ impl App {
                     }
                 }
             }
+            Action::ToggleLogsMode
+            | Action::CycleLogsLevel
+            | Action::ClearLogsBuffer
+            | Action::CopyLogLine
+            | Action::LogsDayPrev
+            | Action::LogsDayNext => {
+                if self.tab == Tab::Logs && matches!(self.mode, Mode::Browse | Mode::Filter) {
+                    self.dispatch_logs(&action);
+                }
+            }
         }
     }
 
@@ -785,6 +822,10 @@ impl App {
         if !matches!(self.mode, Mode::Browse | Mode::Filter) {
             return;
         }
+        // Leaving Logs always stops the live SSE worker.
+        if self.tab == Tab::Logs && tab != Tab::Logs {
+            self.logs.on_leave();
+        }
         self.mode = Mode::Browse;
         self.filter.clear();
         self.usage_applied_filter.clear();
@@ -794,6 +835,27 @@ impl App {
         // once its data arrives.
         self.refresh_filtered();
         self.request_refresh();
+    }
+
+    fn dispatch_logs(&mut self, action: &Action) {
+        use super::logs::LogsEffect;
+        match self.logs.handle(action) {
+            LogsEffect::None => {
+                self.selected[Tab::Logs.index()] = self.logs.selected;
+            }
+            LogsEffect::Status(s) => {
+                self.status = s;
+                self.selected[Tab::Logs.index()] = self.logs.selected;
+                self.refresh_filtered();
+            }
+            LogsEffect::Reload => {
+                if matches!(action, Action::CycleLogsLevel) {
+                    self.status = format!("Logs level ≥ {}", self.logs.level.as_str());
+                }
+                self.selected[Tab::Logs.index()] = 0;
+                self.request_refresh();
+            }
+        }
     }
 
     pub fn list_len(&self) -> usize {
@@ -971,6 +1033,9 @@ impl App {
                     .map(|(i, _)| i)
                     .collect()
             }
+            // Logs: filter is applied server-side (and again on live stream);
+            // the ring is already scoped.
+            Tab::Logs => (0..self.logs.len()).collect(),
         }
     }
 
@@ -1002,12 +1067,16 @@ impl App {
         if n == 0 {
             return;
         }
+        if self.tab == Tab::Logs {
+            self.logs.move_sel(delta);
+            self.selected[Tab::Logs.index()] = self.logs.selected;
+            return;
+        }
         let idx = self.tab.index();
         // Clamp at first/last — no circular wrap (j on last stays put).
         let next = (self.selected[idx] as i32 + delta).clamp(0, (n as i32) - 1) as usize;
         if self.selected[idx] != next {
             self.selected[idx] = next;
-            // New row → start detail at the top.
             if self.tab == Tab::Usage {
                 self.usage_detail_scroll = 0;
             }
@@ -1033,6 +1102,11 @@ impl App {
                 } else {
                     self.usage_applied_filter = self.filter.clone();
                 }
+            } else if self.tab == Tab::Logs {
+                self.logs.lines.clear();
+                self.logs.selected = 0;
+                self.selected[Tab::Logs.index()] = 0;
+                self.request_refresh();
             }
             return;
         }
@@ -1119,6 +1193,9 @@ impl App {
                     ]);
                 }
             },
+            Tab::Logs => {
+                v.extend(self.logs.context_keybinds());
+            }
         }
         v
     }
@@ -2034,6 +2111,34 @@ impl App {
                     }
                 }
             }
+            Msg::LogsMeta { .. }
+            | Msg::LogsPage { .. }
+            | Msg::LogsStreamLine { .. }
+            | Msg::LogsStreamEvent { .. } => {
+                // Stale check for page/meta uses data_gen; stream lines use logs.stream_gen.
+                if let Msg::LogsMeta { gen, .. } | Msg::LogsPage { gen, .. } = &msg {
+                    if self.is_stale(*gen) {
+                        return;
+                    }
+                }
+                if matches!(msg, Msg::LogsPage { .. }) {
+                    self.loading = false;
+                }
+                if let Some(eff) = self.logs.apply_msg(&msg) {
+                    use super::logs::LogsEffect;
+                    match eff {
+                        LogsEffect::None => {}
+                        LogsEffect::Status(s) => self.status = s,
+                        LogsEffect::Reload => self.request_refresh(),
+                    }
+                }
+                self.selected[Tab::Logs.index()] = self.logs.selected;
+                self.clamp_sel(Tab::Logs);
+                if matches!(msg, Msg::LogsPage { .. } | Msg::LogsStreamLine { .. }) {
+                    self.loading = false;
+                    self.refresh_filtered();
+                }
+            }
             Msg::OverviewSummary { gen, result } => {
                 if self.is_stale(gen) {
                     return;
@@ -2290,6 +2395,7 @@ impl App {
             Tab::Keys => self.keys.len(),
             Tab::Usage => self.list_len(),
             Tab::Pricing => self.list_len(),
+            Tab::Logs => self.logs.len(),
             Tab::Overview => 0,
         };
         let i = tab.index();
@@ -2320,6 +2426,9 @@ impl App {
             RefreshKind::Oauth => {
                 // OAuth is not a tab; refresh provider list after login.
                 net::spawn_providers(self.client.clone(), gen, self.tx.clone());
+            }
+            RefreshKind::Logs => {
+                self.request_refresh();
             }
             RefreshKind::All => {
                 net::spawn_overview(self.client.clone(), gen, self.tx.clone());
@@ -2511,6 +2620,79 @@ mod filter_cache_tests {
         assert_eq!(app.list_len(), 3);
         assert_eq!(app.filtered_indices(), &[0, 1, 2]);
     }
+
+    #[test]
+    fn logs_tab_exists_and_cycles() {
+        assert_eq!(Tab::ALL.len(), 7);
+        assert_eq!(Tab::from_index(6), Tab::Logs);
+        assert_eq!(Tab::Logs.title(), "Logs");
+        assert_eq!(Tab::Logs.short(), "Log");
+        assert_eq!(Tab::Logs.index(), 6);
+    }
+
+    #[test]
+    fn logs_page_msg_fills_ring() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new("http://localhost:0", tx);
+        app.tab = Tab::Logs;
+        app.apply_msg(Msg::LogsPage {
+            gen: 0,
+            result: Ok(crate::dto::LogsPage {
+                date: "2026-07-24".into(),
+                lines: vec![crate::dto::LogLineView {
+                    level: Some("INFO".into()),
+                    raw: "hello-from-history".into(),
+                    ..Default::default()
+                }],
+                next_cursor: None,
+                prev_cursor: None,
+                truncated: false,
+                source: "file".into(),
+            }),
+        });
+        assert_eq!(app.logs.len(), 1);
+        assert!(app.logs.selected_line().unwrap().raw.contains("hello-from-history"));
+        assert_eq!(app.logs.date, "2026-07-24");
+    }
+
+    #[test]
+    fn logs_disabled_meta_sets_message() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new("http://localhost:0", tx);
+        app.tab = Tab::Logs;
+        app.apply_msg(Msg::LogsMeta {
+            gen: 0,
+            result: Ok(crate::dto::LogsMeta {
+                enabled: false,
+                message: Some("file logging is disabled".into()),
+                today: "2026-07-24".into(),
+                ..Default::default()
+            }),
+        });
+        assert!(
+            app.logs
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("disabled")
+        );
+    }
+
+    #[test]
+    fn logs_quit_stops_stream() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new("http://localhost:0", tx);
+        app.tab = Tab::Logs;
+        // Structural wiring: quit/leave must stop the live stream.
+        let src = include_str!("app.rs");
+        assert!(
+            src.contains("self.logs.on_leave()"),
+            "quit/leave must stop stream"
+        );
+        app.handle_action(Action::Quit);
+        assert!(app.should_quit);
+    }
+
 
     /// Regression: pressing `a` on the merged Pricing table used to flip
     /// `pricing_pane` to Overrides without rebuilding the filtered-index

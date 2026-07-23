@@ -1,9 +1,9 @@
 //! Messages from async network tasks back to the UI thread.
 
 use crate::dto::{
-    CooldownView, HealthResponse, KeyCreateResponse, KeySecretView, KeyView, OAuthSessionView,
-    PricingView, ProviderSecretView, ProviderView, QuotaSnapshotView, RouteView, UsageListResponse,
-    UsageSummaryView,
+    CooldownView, HealthResponse, KeyCreateResponse, KeySecretView, KeyView, LogLineView, LogsMeta,
+    LogsPage, OAuthSessionView, PricingView, ProviderSecretView, ProviderView, QuotaSnapshotView,
+    RouteView, UsageListResponse, UsageSummaryView,
 };
 
 #[derive(Debug)]
@@ -71,6 +71,27 @@ pub enum Msg {
     },
     /// Decrypted downstream key raw token for the reveal modal.
     KeySecret(Result<KeySecretView, String>),
+    /// Logs meta (enabled / dates).
+    LogsMeta {
+        gen: u64,
+        result: Result<LogsMeta, String>,
+    },
+    /// History page of log lines.
+    LogsPage {
+        gen: u64,
+        result: Result<LogsPage, String>,
+    },
+    /// One live SSE line (or control event via status).
+    LogsStreamLine {
+        gen: u64,
+        line: LogLineView,
+    },
+    /// Live stream meta / rotate / error / ended.
+    LogsStreamEvent {
+        gen: u64,
+        kind: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,5 +106,6 @@ pub enum RefreshKind {
     Pricing,
     PricingOverrides,
     Oauth,
+    Logs,
     All,
 }

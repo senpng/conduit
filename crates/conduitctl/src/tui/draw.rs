@@ -252,6 +252,7 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
         Tab::Keys => draw_master_detail_keys(frame, area, app),
         Tab::Usage => draw_usage(frame, area, app),
         Tab::Pricing => draw_pricing(frame, area, app),
+        Tab::Logs => super::logs::draw(frame, area, &app.logs, &app.theme, app.loading),
     }
 }
 
@@ -4031,7 +4032,7 @@ fn draw_provider_add_chooser(
 fn draw_help(frame: &mut Frame, theme: &Theme, scroll: u16) -> (u16, u16) {
     let body = "\
 Global
-  1-6 / Tab     Switch tab          j/k ↑↓     Move
+  1-7 / Tab     Switch tab          j/k ↑↓     Move
   PgUp/PgDn     Page                g / G      Top / bottom
   /             Filter lists        r          Refresh
   T             Theme auto/dark/light (also CONDUIT_THEME=…)
@@ -4079,6 +4080,18 @@ Pricing
   o             Toggle merged ↔ overrides pane
   Merged:       R reload · s sync LiteLLM  (read-only list)
   Overrides:    a add · e edit · d delete  (writes pricing.json)
+
+Logs
+  f             Toggle live ↔ history
+  l             Cycle level floor (error/warn/info/debug/trace)
+  [ ]           Previous / next day (history)
+  /             Substring filter (server-side)
+  j/k           Scroll (up leaves sticky follow in live)
+  G             Jump bottom + restore follow
+  g             Jump top (pauses follow)
+  y             Copy selected raw line
+  c             Clear live buffer (not the file)
+  r             Reload / reconnect stream
 
 OAuth flow (from Providers → add / re-auth)
   Enter start · o open URL · c cancel pending · Esc close
