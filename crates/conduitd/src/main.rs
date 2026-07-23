@@ -53,6 +53,7 @@ pub struct Args {
     pub log_level: Option<String>,
 
     /// Write logs to a daily-rolling file instead of stdout.
+    /// Files rotate at **local** midnight (`conduitd.log.YYYY-MM-DD`).
     /// Disable with --log-to-file=false to keep logging to stdout
     /// (e.g. under systemd/journald). Overrides `[log] to_file` in
     /// conduit.toml. Defaults to true.
@@ -194,11 +195,14 @@ fn daemonize(pid_file: &std::path::Path, data_dir: &std::path::Path) -> Result<(
 
 /// Initialize the global tracing subscriber.
 ///
-/// When `to_file` is set, logs are written to a daily-rolling file under
-/// `log_dir` via a non-blocking background writer; the returned
-/// [`WorkerGuard`] must be held for the lifetime of the process. When
-/// unset (or if the log directory cannot be created), logs go to stdout
-/// and `None` is returned.
+/// When `to_file` is set, logs are written to a **local-timezone** daily-
+/// rolling file under `log_dir` (`conduitd.log.YYYY-MM-DD`) via a
+/// non-blocking background writer; the returned [`WorkerGuard`] must be
+/// held for the lifetime of the process. When unset (or if the log
+/// directory cannot be created), logs go to stdout and `None` is returned.
+///
+/// Line timestamps remain UTC (`…Z`) from `tracing-subscriber`; only the
+/// **file name / rotation boundary** follows the host local calendar.
 fn init_tracing(
     format: &str,
     level: &str,
@@ -225,7 +229,25 @@ fn init_tracing(
             return None;
         }
 
-        let appender = tracing_appender::rolling::daily(&log_dir, "conduitd.log");
+        let appender = match conduitd::log_rolling::LocalDailyRollingFile::new(
+            &log_dir,
+            "conduitd.log",
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                let subscriber = fmt().with_env_filter(make_filter());
+                match format {
+                    "json" => subscriber.json().init(),
+                    _ => subscriber.init(),
+                }
+                tracing::warn!(
+                    dir = %log_dir.display(),
+                    error = %e,
+                    "failed to open local daily log file, logging to stdout instead"
+                );
+                return None;
+            }
+        };
         let (writer, guard) = tracing_appender::non_blocking(appender);
         let subscriber = fmt().with_env_filter(make_filter()).with_writer(writer);
         // File output has no terminal, so disable ANSI colors.

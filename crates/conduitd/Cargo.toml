@@ -30,7 +30,7 @@ tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
 clap = { version = "4", features = ["derive", "env"] }
 ulid = "1"
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde", "clock"] }
 futures = "0.3"
 secrecy = { version = "0.8", features = ["serde"] }
 toml = "0.8"

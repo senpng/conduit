@@ -256,7 +256,7 @@ console_port = 4001
 [log]
 level = "info"       # log filter, e.g. "debug,sqlx::query=off"
 format = "pretty"    # "pretty" or "json"
-to_file = true       # write to a daily-rolling file, or false for stdout
+to_file = true       # local-midnight daily file (conduitd.log.YYYY-MM-DD), or false for stdout
 dir = "~/.conduit/logs"   # defaults to <data-dir>/logs
 ```
 
@@ -276,7 +276,7 @@ The upstream proxy for OAuth and token requests is resolved from several sources
 | `CONDUIT_MASTER_PASSWORD` | `conduitd` | _(empty)_ | Master password for secret encryption; also settable via `master_password` in `conduit.toml` |
 | `CONDUIT_LOG` | `conduitd` | `info` | Log filter, for example `debug,sqlx::query=off`; also `[log] level` in `conduit.toml` |
 | `CONDUIT_LOG_FORMAT` | `conduitd` | `pretty` | `pretty` or `json`; also `[log] format` in `conduit.toml` |
-| `CONDUIT_LOG_TO_FILE` | `conduitd` | `true` | Write logs to a daily-rolling file; set `false` to log to stdout (e.g. under systemd/journald); also `[log] to_file` in `conduit.toml` |
+| `CONDUIT_LOG_TO_FILE` | `conduitd` | `true` | Write logs to a daily-rolling file (local midnight, `conduitd.log.YYYY-MM-DD`); set `false` to log to stdout (e.g. under systemd/journald); also `[log] to_file` in `conduit.toml` |
 | `CONDUIT_LOG_DIR` | `conduitd` | `<data-dir>/logs` | Directory for log files when file logging is enabled; also `[log] dir` in `conduit.toml` |
 | `CONDUIT_PROXY_URL` | `conduitd` | _(unset)_ | Upstream HTTP/SOCKS proxy; also settable via `proxy_url` in `conduit.toml` (see the precedence note above) |
 | `CONDUIT_CONSOLE_ADDR` | `conduitctl` | `http://127.0.0.1:4001` | Console API base URL |

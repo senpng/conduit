@@ -81,7 +81,7 @@ key has an env override):
 |---------|-----------|-------|
 | Level filter | `level` / `CONDUIT_LOG` | e.g. `info`, `debug,sqlx::query=off` |
 | Format | `format` / `CONDUIT_LOG_FORMAT` | `pretty` or `json` |
-| File sink | `to_file` / `CONDUIT_LOG_TO_FILE` | daily-rolling file vs stdout |
+| File sink | `to_file` / `CONDUIT_LOG_TO_FILE` | daily-rolling file vs stdout; rotation uses the **host local timezone** (`conduitd.log.YYYY-MM-DD`) |
 | Log dir | `dir` / `CONDUIT_LOG_DIR` | defaults to `<data-dir>/logs` |
 
 A single **`request_id`** is threaded end-to-end (ingress → router → codec →

@@ -41,7 +41,8 @@ pub struct LogConfig {
     pub format: Option<String>,
 
     /// Whether to write logs to a daily-rolling file (`true`) or stdout
-    /// (`false`). Overridden by `CONDUIT_LOG_TO_FILE`.
+    /// (`false`). Rotation is at **local** midnight. Overridden by
+    /// `CONDUIT_LOG_TO_FILE`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_file: Option<bool>,
 
