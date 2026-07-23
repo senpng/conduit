@@ -439,6 +439,66 @@ struct CallbackQuery {
     error_description: Option<String>,
 }
 
+/// CSRF check for OAuth authorization-code callbacks.
+///
+/// `expected` is the state minted when the login session started. Callers must
+/// supply every state value that the IdP may return:
+/// - normal query `?state=`
+/// - Claude's `code#state` embedding (parsed from the `code` param)
+///
+/// Succeeds when `expected` is empty (no CSRF material — should not happen for
+/// PKCE flows we start) or when **any** provided candidate equals `expected`.
+/// Missing or non-matching candidates are hard failures — never continue to
+/// token exchange.
+fn oauth_callback_state_ok(
+    expected: Option<&str>,
+    state_candidates: &[&str],
+) -> Result<(), &'static str> {
+    let expected = match expected.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    let mut saw_any = false;
+    for raw in state_candidates {
+        let got = raw.trim();
+        if got.is_empty() {
+            continue;
+        }
+        saw_any = true;
+        if got == expected {
+            return Ok(());
+        }
+    }
+    if saw_any {
+        Err("oauth state mismatch")
+    } else {
+        Err("missing oauth state")
+    }
+}
+
+/// Collect state candidates from the query string and, for Claude, from
+/// `code#state` embedding. Order does not matter for [`oauth_callback_state_ok`].
+fn oauth_state_candidates(
+    kind: OAuthProviderKind,
+    query_state: Option<&str>,
+    code: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(s) = query_state.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push(s.to_string());
+    }
+    if kind == OAuthProviderKind::Claude {
+        let (_, embedded) = ClaudeOAuth::parse_code_and_state(code);
+        if let Some(s) = embedded.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            // Avoid duplicate work when query state already matches the embed.
+            if !out.iter().any(|c| c == &s) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
 async fn handle_callback(
     state: Arc<DaemonState>,
     session_id: String,
@@ -473,16 +533,23 @@ async fn handle_callback(
         None => return Html(error_page("session not found")).into_response(),
     };
 
-    // CSRF: prefer session state; Claude may embed state in code#state
-    if let (Some(expected), Some(got)) = (&session.state, &q.state) {
-        if expected != got {
-            // Claude sometimes only puts state in code fragment — allow mismatch if empty query state handled
-            warn!(
-                expected = %expected,
-                got = %got,
-                "oauth state mismatch (continuing if code embeds state)"
-            );
-        }
+    // CSRF: require session state to match query `state` and/or Claude `code#state`.
+    let candidates = oauth_state_candidates(kind, q.state.as_deref(), &code);
+    let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    if let Err(msg) = oauth_callback_state_ok(session.state.as_deref(), &candidate_refs) {
+        warn!(
+            session = %session_id,
+            kind = %kind,
+            expected = session.state.as_deref().unwrap_or(""),
+            candidates = ?candidates,
+            "{msg}"
+        );
+        let _ = state.oauth.sessions.update(&session_id, |s| {
+            s.status = SessionStatus::Error;
+            s.error = Some(msg.into());
+        });
+        stop_callback(&state, &session_id);
+        return Html(error_page(msg)).into_response();
     }
 
     let pkce = match session.pkce {
@@ -787,4 +854,89 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod state_csrf_tests {
+    use super::*;
+
+    #[test]
+    fn state_ok_when_query_matches() {
+        assert!(oauth_callback_state_ok(Some("abc"), &["abc"]).is_ok());
+    }
+
+    #[test]
+    fn state_rejects_mismatch() {
+        let err = oauth_callback_state_ok(Some("abc"), &["xyz"]).unwrap_err();
+        assert_eq!(err, "oauth state mismatch");
+    }
+
+    #[test]
+    fn state_rejects_missing_when_expected() {
+        let err = oauth_callback_state_ok(Some("abc"), &[]).unwrap_err();
+        assert_eq!(err, "missing oauth state");
+        let err = oauth_callback_state_ok(Some("abc"), &["", "  "]).unwrap_err();
+        assert_eq!(err, "missing oauth state");
+    }
+
+    #[test]
+    fn state_ok_when_one_of_candidates_matches() {
+        // Query state wrong, Claude embed correct — must still pass.
+        assert!(oauth_callback_state_ok(Some("good"), &["bad", "good"]).is_ok());
+    }
+
+    #[test]
+    fn state_skipped_when_session_has_no_expected() {
+        assert!(oauth_callback_state_ok(None, &[]).is_ok());
+        assert!(oauth_callback_state_ok(Some(""), &[]).is_ok());
+    }
+
+    #[test]
+    fn claude_candidates_include_code_hash_state() {
+        let c = oauth_state_candidates(
+            OAuthProviderKind::Claude,
+            None,
+            "authcode#sessionstate",
+        );
+        assert_eq!(c, vec!["sessionstate".to_string()]);
+    }
+
+    #[test]
+    fn claude_candidates_merge_query_and_embed() {
+        let c = oauth_state_candidates(
+            OAuthProviderKind::Claude,
+            Some("from-query"),
+            "code#from-embed",
+        );
+        assert_eq!(c, vec!["from-query".to_string(), "from-embed".to_string()]);
+    }
+
+    #[test]
+    fn codex_candidates_only_query_state() {
+        let c = oauth_state_candidates(
+            OAuthProviderKind::Codex,
+            Some("st"),
+            "code#should-not-parse",
+        );
+        assert_eq!(c, vec!["st".to_string()]);
+    }
+
+    #[test]
+    fn mismatch_no_longer_continues_to_exchange_path() {
+        // Structural guard: production handle_callback must hard-fail on mismatch
+        // (error page + stop), not merely warn. Keep this string out of success paths.
+        let src = include_str!("oauth.rs");
+        let prod = src
+            .split("mod state_csrf_tests")
+            .next()
+            .expect("test module marker");
+        assert!(
+            !prod.contains("continuing if code embeds state"),
+            "must not continue exchange after state mismatch"
+        );
+        assert!(
+            prod.contains("oauth_callback_state_ok"),
+            "callback must call oauth_callback_state_ok"
+        );
+    }
 }

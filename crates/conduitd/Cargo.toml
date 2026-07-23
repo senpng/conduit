@@ -36,6 +36,7 @@ secrecy = { version = "0.8", features = ["serde"] }
 toml = "0.8"
 blake3 = "1"
 hex = "0.4"
+rand = "0.8"
 arc-swap = "1"
 async-stream = "0.3"
 async-trait = "0.1"

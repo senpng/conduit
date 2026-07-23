@@ -40,6 +40,17 @@ fn validate_rpm(rpm: Option<i64>) -> Result<(), &'static str> {
     }
 }
 
+/// Mint a new downstream bearer token: `sk_` + 64 hex chars (32 CSPRNG bytes).
+///
+/// Entropy comes from the OS via [`rand::rngs::OsRng`]. BLAKE3 is used only later
+/// to store `key_hash` in SQLite — never as a substitute for the random source.
+fn generate_downstream_raw_key() -> String {
+    use rand::RngCore;
+    let mut buf = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    format!("sk_{}", hex::encode(buf))
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Providers
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -500,22 +511,8 @@ pub async fn create_key(
         return err(StatusCode::BAD_REQUEST, e).into_response();
     }
 
-    // Generate a cryptographically random key: "sk_" + 32-byte random hex
-    let rand_bytes = {
-        let mut buf = [0u8; 32];
-        // Use blake3's keyed hash on a random ULID as entropy source
-        let ulid_bytes = Ulid::new().to_string();
-        let ts_bytes = Utc::now()
-            .timestamp_nanos_opt()
-            .unwrap_or_default()
-            .to_le_bytes();
-        let mut combined = ulid_bytes.into_bytes();
-        combined.extend_from_slice(&ts_bytes);
-        let hash = blake3::hash(&combined);
-        buf.copy_from_slice(hash.as_bytes());
-        buf
-    };
-    let raw_key = format!("sk_{}", hex::encode(rand_bytes));
+    // CSPRNG: sk_ + 32 OS-random bytes as hex (see generate_downstream_raw_key).
+    let raw_key = generate_downstream_raw_key();
     let key_hash = hex::encode(blake3::hash(raw_key.as_bytes()).as_bytes());
 
     let id = Ulid::new().to_string();
@@ -1487,7 +1484,7 @@ pub async fn sync_pricing(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_rpm;
+    use super::{generate_downstream_raw_key, validate_rpm};
 
     #[test]
     fn rpm_validation_rejects_zero_and_negative() {
@@ -1497,5 +1494,42 @@ mod tests {
         assert!(validate_rpm(Some(600)).is_ok());
         // Absent limit is fine — no rate limiting.
         assert!(validate_rpm(None).is_ok());
+    }
+
+    #[test]
+    fn downstream_raw_key_shape_and_uniqueness() {
+        let a = generate_downstream_raw_key();
+        let b = generate_downstream_raw_key();
+        // sk_ + 64 hex chars from 32 random bytes
+        assert!(a.starts_with("sk_"), "{a}");
+        assert_eq!(a.len(), 3 + 64, "{a}");
+        assert!(
+            a[3..].chars().all(|c| c.is_ascii_hexdigit()),
+            "suffix must be hex: {a}"
+        );
+        assert_ne!(a, b, "OsRng keys must differ across calls");
+    }
+
+    #[test]
+    fn create_key_source_uses_osrng_not_ulid_hash_entropy() {
+        // Strip this test module so string literals here cannot false-positive.
+        let full = include_str!("console.rs");
+        let prod = full
+            .split("mod tests")
+            .next()
+            .expect("tests module marker");
+        assert!(
+            prod.contains("generate_downstream_raw_key"),
+            "create_key path must mint keys via generate_downstream_raw_key"
+        );
+        assert!(
+            prod.contains("OsRng"),
+            "key minting must use OsRng"
+        );
+        // Old anti-pattern: ULID/timestamp fed into blake3 as the token body.
+        assert!(
+            !prod.contains("Use blake3's keyed hash on a random ULID"),
+            "must not reintroduce ULID+blake3 as key entropy"
+        );
     }
 }

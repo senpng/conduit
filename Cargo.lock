@@ -876,6 +876,7 @@ dependencies = [
  "futures",
  "hex",
  "parking_lot",
+ "rand 0.8.7",
  "reqwest",
  "secrecy",
  "serde",
