@@ -124,33 +124,6 @@ impl WireCodec for OpenAICodec {
             _ => "stop",
         };
 
-        let mut usage = json!({
-            "prompt_tokens": resp.usage.prompt_tokens,
-            "completion_tokens": resp.usage.completion_tokens,
-            "total_tokens": resp.usage.total_tokens,
-        });
-        if resp.usage.cache_read_tokens > 0 || resp.usage.cache_write_tokens > 0 {
-            let mut details = serde_json::Map::new();
-            if resp.usage.cache_read_tokens > 0 {
-                details.insert(
-                    "cached_tokens".into(),
-                    json!(resp.usage.cache_read_tokens),
-                );
-            }
-            if resp.usage.cache_write_tokens > 0 {
-                details.insert(
-                    "cache_write_tokens".into(),
-                    json!(resp.usage.cache_write_tokens),
-                );
-            }
-            usage["prompt_tokens_details"] = Value::Object(details);
-        }
-        if resp.usage.reasoning_tokens > 0 {
-            usage["completion_tokens_details"] = json!({
-                "reasoning_tokens": resp.usage.reasoning_tokens,
-            });
-        }
-
         json!({
             "id": resp.id,
             "object": "chat.completion",
@@ -161,7 +134,7 @@ impl WireCodec for OpenAICodec {
                 "message": message,
                 "finish_reason": fr_str,
             }],
-            "usage": usage,
+            "usage": decode_response::encode_chat_usage(&resp.usage),
         })
     }
 

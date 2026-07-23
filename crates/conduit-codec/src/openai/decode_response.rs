@@ -142,7 +142,12 @@ pub fn decode_response(
 
     let usage = decode_usage(&body["usage"]);
 
-    let created_at = chrono::Utc::now();
+    // Prefer the upstream unix `created` so re-encode stays a faithful proxy.
+    let created_at = body
+        .get("created")
+        .and_then(|v| v.as_i64())
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .unwrap_or_else(chrono::Utc::now);
 
     Ok((
         CanonicalChatResponse {
@@ -206,6 +211,41 @@ pub(crate) fn decode_usage(usage: &Value) -> Usage {
         cache_read_tokens,
         cache_write_tokens,
     }
+}
+
+/// Encode IR [`Usage`] as OpenAI Chat Completions `usage` (`CompletionUsage`).
+///
+/// Matches non-stream `encode_response` and stream `include_usage` final frames:
+/// details objects are emitted only when the corresponding counts are non-zero
+/// (official Chat samples; unlike Responses which always includes nested objects).
+pub(crate) fn encode_chat_usage(usage: &Usage) -> Value {
+    let mut out = serde_json::json!({
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    });
+    if usage.cache_read_tokens > 0 || usage.cache_write_tokens > 0 {
+        let mut details = serde_json::Map::new();
+        if usage.cache_read_tokens > 0 {
+            details.insert(
+                "cached_tokens".into(),
+                serde_json::json!(usage.cache_read_tokens),
+            );
+        }
+        if usage.cache_write_tokens > 0 {
+            details.insert(
+                "cache_write_tokens".into(),
+                serde_json::json!(usage.cache_write_tokens),
+            );
+        }
+        out["prompt_tokens_details"] = Value::Object(details);
+    }
+    if usage.reasoning_tokens > 0 {
+        out["completion_tokens_details"] = serde_json::json!({
+            "reasoning_tokens": usage.reasoning_tokens,
+        });
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -414,5 +454,49 @@ mod tests {
             wire["choices"][0]["message"]["reasoning_content"],
             "think"
         );
+    }
+
+    #[test]
+    fn created_timestamp_preserved_from_body() {
+        let body = json!({
+            "id": "chatcmpl-ts",
+            "object": "chat.completion",
+            "created": 1_700_000_000,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        let resp = decode_response(body, "gpt-4o").unwrap().0;
+        assert_eq!(resp.created_at.timestamp(), 1_700_000_000);
+    }
+
+    #[test]
+    fn encode_chat_usage_matches_non_stream_shape() {
+        let usage = Usage {
+            prompt_tokens: 50,
+            completion_tokens: 10,
+            total_tokens: 60,
+            reasoning_tokens: 3,
+            cache_read_tokens: 20,
+            cache_write_tokens: 5,
+        };
+        let wire = encode_chat_usage(&usage);
+        assert_eq!(wire["prompt_tokens"], 50);
+        assert_eq!(wire["prompt_tokens_details"]["cached_tokens"], 20);
+        assert_eq!(wire["prompt_tokens_details"]["cache_write_tokens"], 5);
+        assert_eq!(wire["completion_tokens_details"]["reasoning_tokens"], 3);
+
+        let zero = encode_chat_usage(&Usage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            ..Default::default()
+        });
+        assert!(zero.get("prompt_tokens_details").is_none());
+        assert!(zero.get("completion_tokens_details").is_none());
     }
 }

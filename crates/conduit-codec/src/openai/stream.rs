@@ -4,7 +4,7 @@ use conduit_ir::{
 };
 use serde_json::Value;
 
-use super::decode_response::{decode_finish_reason, decode_usage};
+use super::decode_response::{decode_finish_reason, decode_usage, encode_chat_usage};
 
 /// Decode a single OpenAI SSE `data:` line into zero or more canonical chunks.
 ///
@@ -471,12 +471,7 @@ fn encode_chunk_inner(
                 "finish_reason": fr_str
             });
             if let Some(u) = usage {
-                v["usage"] = serde_json::json!({
-                    "prompt_tokens": u.prompt_tokens,
-                    "completion_tokens": u.completion_tokens,
-                    "total_tokens": u.total_tokens,
-                });
-                let _ = choice;
+                v["usage"] = encode_chat_usage(u);
             }
             v["choices"] = serde_json::json!([choice]);
             Some(format!("data: {}\n\n", v))
@@ -487,13 +482,11 @@ fn encode_chunk_inner(
             finish_reason: None,
             ..
         } => {
+            // Official stream_options.include_usage final frame: empty choices +
+            // full CompletionUsage (same shape as non-stream).
             let mut v = base.clone();
             v["choices"] = serde_json::json!([]);
-            v["usage"] = serde_json::json!({
-                "prompt_tokens": u.prompt_tokens,
-                "completion_tokens": u.completion_tokens,
-                "total_tokens": u.total_tokens,
-            });
+            v["usage"] = encode_chat_usage(u);
             Some(format!("data: {}\n\n", v))
         }
 
@@ -501,14 +494,15 @@ fn encode_chunk_inner(
     }
 }
 
-fn finish_reason_to_str(fr: &FinishReason) -> &'static str {
+fn finish_reason_to_str(fr: &FinishReason) -> String {
     match fr {
-        FinishReason::Stop => "stop",
-        FinishReason::Length => "length",
-        FinishReason::ToolCalls => "tool_calls",
-        FinishReason::ContentFilter => "content_filter",
-        FinishReason::Other(_) => "stop",
-        _ => "stop",
+        FinishReason::Stop => "stop".into(),
+        FinishReason::Length => "length".into(),
+        FinishReason::ToolCalls => "tool_calls".into(),
+        FinishReason::ContentFilter => "content_filter".into(),
+        // Preserve provider-specific reasons (parity with non-stream encode_response).
+        FinishReason::Other(s) => s.clone(),
+        _ => "stop".into(),
     }
 }
 
@@ -733,5 +727,108 @@ mod tests {
             chunks.last().and_then(|c| c.finish_reason.clone()),
             Some(FinishReason::ToolCalls)
         );
+    }
+
+    #[test]
+    fn stream_usage_only_frame_includes_details() {
+        // Official stream_options.include_usage final chunk: empty choices + full usage.
+        let usage = Usage {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            total_tokens: 120,
+            reasoning_tokens: 8,
+            cache_read_tokens: 60,
+            cache_write_tokens: 15,
+        };
+        let sse = encode_chunk_with_model(
+            &CanonicalChunk {
+                usage: Some(usage),
+                ..Default::default()
+            },
+            "chatcmpl_u",
+            "gpt-4o",
+        )
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(sse.trim_start_matches("data: ").trim()).unwrap();
+        assert_eq!(v["choices"], serde_json::json!([]));
+        assert_eq!(v["usage"]["prompt_tokens"], 100);
+        assert_eq!(v["usage"]["completion_tokens"], 20);
+        assert_eq!(v["usage"]["total_tokens"], 120);
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 60);
+        assert_eq!(
+            v["usage"]["prompt_tokens_details"]["cache_write_tokens"],
+            15
+        );
+        assert_eq!(
+            v["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            8
+        );
+    }
+
+    #[test]
+    fn stream_finish_with_usage_includes_details() {
+        let sse = encode_chunk_with_model(
+            &CanonicalChunk::finish(
+                FinishReason::Stop,
+                Some(Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                    reasoning_tokens: 2,
+                    cache_read_tokens: 4,
+                    cache_write_tokens: 0,
+                }),
+            ),
+            "chatcmpl_f",
+            "o3",
+        )
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(sse.trim_start_matches("data: ").trim()).unwrap();
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
+        assert!(v["usage"]["prompt_tokens_details"]
+            .get("cache_write_tokens")
+            .is_none());
+        assert_eq!(
+            v["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            2
+        );
+    }
+
+    #[test]
+    fn stream_finish_preserves_other_reason() {
+        let sse = encode_chunk_with_model(
+            &CanonicalChunk::finish(FinishReason::Other("network_error".into()), None),
+            "chatcmpl_o",
+            "m",
+        )
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(sse.trim_start_matches("data: ").trim()).unwrap();
+        assert_eq!(v["choices"][0]["finish_reason"], "network_error");
+    }
+
+    #[test]
+    fn stream_usage_omits_details_when_zero() {
+        let sse = encode_chunk_with_model(
+            &CanonicalChunk {
+                usage: Some(Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "chatcmpl_z",
+            "m",
+        )
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(sse.trim_start_matches("data: ").trim()).unwrap();
+        assert!(v["usage"].get("prompt_tokens_details").is_none());
+        assert!(v["usage"].get("completion_tokens_details").is_none());
     }
 }
