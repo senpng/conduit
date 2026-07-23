@@ -1286,24 +1286,7 @@ impl App {
         match self.tab {
             Tab::Providers => {
                 if let Some(p) = self.providers.get(idx) {
-                    let cloak = self
-                        .provider_secrets
-                        .get(&p.id)
-                        .and_then(|s| s.oauth.as_ref())
-                        .and_then(|o| o.cloak_mode.as_deref());
-                    // Prefetch OAuth secret so cloak_mode is real, not default `auto`.
-                    // Silent (no modal) — form field updates when the reply lands.
-                    if cloak.is_none()
-                        && super::forms::ProviderForm::is_claude_oauth_kind(&p.kind)
-                    {
-                        net::spawn_provider_secret(
-                            self.client.clone(),
-                            p.id.clone(),
-                            false,
-                            self.tx.clone(),
-                        );
-                    }
-                    self.mode = Mode::ProviderForm(ProviderForm::edit(p, cloak));
+                    self.mode = Mode::ProviderForm(ProviderForm::edit(p));
                 }
             }
             Tab::Routes => {
@@ -1567,14 +1550,12 @@ impl App {
                 ProviderFormKind::Edit { id } => match f.to_update_body() {
                     Ok(body) => {
                         let id = id.clone();
-                        let oauth = f.to_oauth_settings_body();
                         self.status = "Updating provider…".into();
                         self.mode = Mode::Browse;
                         net::spawn_update_provider(
                             self.client.clone(),
                             id,
                             body,
-                            oauth,
                             self.tx.clone(),
                         );
                     }
@@ -1992,24 +1973,6 @@ impl App {
                 match result {
                     Ok(view) => {
                         let id = view.provider_id.clone();
-                        // If the edit form is open for this Claude provider, patch
-                        // cloak_mode from the freshly decrypted credential so the
-                        // field is not stuck on the default `auto`.
-                        if let Mode::ProviderForm(f) = &mut self.mode {
-                            if matches!(
-                                &f.kind,
-                                super::forms::ProviderFormKind::Edit { id: edit_id }
-                                    if *edit_id == id
-                            ) {
-                                if let Some(mode) = view
-                                    .oauth
-                                    .as_ref()
-                                    .and_then(|o| o.cloak_mode.as_deref())
-                                {
-                                    f.apply_cloak_mode(mode);
-                                }
-                            }
-                        }
                         if show_modal {
                             let title = format!(
                                 "Secret · {} ({})",
@@ -2446,14 +2409,6 @@ fn format_provider_secret_modal(view: &crate::dto::ProviderSecretView) -> String
         if let Some(ua) = o.using_api {
             push(&mut lines, "using_api", &ua.to_string());
         }
-        // Always surface cloak_mode for Claude OAuth (default auto).
-        let cloak = o
-            .cloak_mode
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("auto");
-        push(&mut lines, "cloak_mode", cloak);
         lines.push(String::new());
         push(&mut lines, "access_token", &o.access_token);
         push(&mut lines, "refresh_token", &o.refresh_token);

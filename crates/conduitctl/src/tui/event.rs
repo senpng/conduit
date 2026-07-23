@@ -454,7 +454,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         };
-        let mut f = ProviderForm::edit(&p, None);
+        let mut f = ProviderForm::edit(&p);
         f.focus = 1; // base_url — last field for non-Claude
         assert_eq!(f.fields.len(), 2);
         assert_eq!(

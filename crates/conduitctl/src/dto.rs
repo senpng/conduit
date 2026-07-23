@@ -541,26 +541,8 @@ pub struct ProviderOauthSecretView {
     pub token_endpoint: Option<String>,
     pub proxy_url: Option<String>,
     pub using_api: Option<bool>,
-    /// Claude OAuth: `auto` | `always` | `never` (default `auto` when omitted).
-    #[serde(default)]
-    pub cloak_mode: Option<String>,
     #[serde(default)]
     pub extra: serde_json::Map<String, Value>,
-}
-
-/// Body for `PATCH /console/providers/{id}/oauth-settings`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct UpdateOAuthSettingsBody {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cloak_mode: Option<String>,
-}
-
-impl UpdateOAuthSettingsBody {
-    pub fn cloak_mode(mode: impl Into<String>) -> Self {
-        Self {
-            cloak_mode: Some(mode.into()),
-        }
-    }
 }
 
 // ── Upstream quota / cooldown (OAuth remaining) ─────────────────────────────

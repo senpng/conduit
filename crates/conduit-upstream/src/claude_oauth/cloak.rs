@@ -5,7 +5,9 @@ use sha2::{Digest, Sha256};
 
 use super::{
     prompts::{self, AGENT_IDENTIFIER, SANITIZED_SYSTEM_REMINDER},
-    session::{cached_user_id, generate_fake_user_id, is_valid_user_id},
+    session::{
+        cached_user_id, generate_fake_user_id, should_preserve_user_id,
+    },
 };
 
 const FINGERPRINT_SALT: &str = "59cf53e54c78";
@@ -172,12 +174,14 @@ pub fn apply_oauth_system_cloak(
 }
 
 pub fn inject_fake_user_id(mut body: Value, api_key: &str, use_cache: bool) -> Value {
-    let existing = body
-        .pointer("/metadata/user_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if !existing.is_empty() && is_valid_user_id(existing) {
-        return body;
+    // Preserve client Claude Code identity when present:
+    // - classic `user_…_account_…_session_…`
+    // - JSON-string `{"device_id","account_uuid","session_id"}` (new Claude Code)
+    // - rare object form of the same fields
+    if let Some(existing) = body.pointer("/metadata/user_id") {
+        if should_preserve_user_id(existing) {
+            return body;
+        }
     }
     let user_id = if use_cache {
         cached_user_id(api_key)
@@ -222,5 +226,57 @@ mod tests {
         let user_content = out["messages"][0]["content"].as_str().unwrap();
         assert!(user_content.contains("system-reminder"));
         assert!(user_content.contains("hi") || user_content.ends_with("hi"));
+    }
+
+    #[test]
+    fn inject_preserves_json_string_user_id() {
+        let client_uid = r#"{"device_id":"be82c3aee1e0c2d74535bacc85f9f559228f02dd8a17298cf522b71e6c375714","account_uuid":"","session_id":"e26d4046-0f88-4b09-bb5b-f863ab5fb24e"}"#;
+        let body = json!({
+            "metadata": {"user_id": client_uid},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out = inject_fake_user_id(body, "sk-ant-oat-test", true);
+        assert_eq!(
+            out["metadata"]["user_id"].as_str().unwrap(),
+            client_uid,
+            "JSON-string user_id must not be overwritten by fake classic id"
+        );
+    }
+
+    #[test]
+    fn inject_preserves_classic_user_id() {
+        let client_uid = "user_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_account_11111111-1111-1111-1111-111111111111_session_22222222-2222-2222-2222-222222222222";
+        let body = json!({
+            "metadata": {"user_id": client_uid}
+        });
+        let out = inject_fake_user_id(body, "sk-ant-oat-test", true);
+        assert_eq!(out["metadata"]["user_id"].as_str().unwrap(), client_uid);
+    }
+
+    #[test]
+    fn inject_preserves_object_user_id() {
+        let body = json!({
+            "metadata": {
+                "user_id": {
+                    "device_id": "d1",
+                    "account_uuid": "",
+                    "session_id": "obj-sess-1"
+                }
+            }
+        });
+        let out = inject_fake_user_id(body, "sk-ant-oat-test", true);
+        assert_eq!(out["metadata"]["user_id"]["session_id"], "obj-sess-1");
+        assert_eq!(out["metadata"]["user_id"]["device_id"], "d1");
+    }
+
+    #[test]
+    fn inject_replaces_invalid_user_id() {
+        let body = json!({
+            "metadata": {"user_id": "not-a-claude-id"}
+        });
+        let out = inject_fake_user_id(body, "sk-ant-oat-replace", true);
+        let uid = out["metadata"]["user_id"].as_str().unwrap();
+        assert!(uid.starts_with("user_"), "uid={uid}");
+        assert!(uid.contains("_session_"), "uid={uid}");
     }
 }

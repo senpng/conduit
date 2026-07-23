@@ -294,7 +294,6 @@ fn claude_oauth_opts(
     for (k, v) in &auth.extra_headers {
         let key = k.to_ascii_lowercase();
         match key.as_str() {
-            "x-conduit-cloak-mode" => opts.cloak_mode = v.clone(),
             "x-conduit-stabilize-device-profile" => {
                 opts.header_defaults.stabilize_device_profile =
                     v.eq_ignore_ascii_case("true") || v == "1";

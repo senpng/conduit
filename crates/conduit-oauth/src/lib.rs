@@ -27,8 +27,8 @@ pub mod session;
 pub mod quota_probe;
 
 pub use credential::{
-    normalize_cloak_mode, oauth_extra_headers, AuthMode, OAuthCredential, OAuthProviderKind,
-    ResolvedCredential, CLAUDE_OAUTH_BETAS,
+    oauth_extra_headers, AuthMode, OAuthCredential, OAuthProviderKind, ResolvedCredential,
+    CLAUDE_OAUTH_BETAS,
 };
 pub use error::OAuthError;
 pub use pkce::{generate_pkce, generate_state, PkceCodes};

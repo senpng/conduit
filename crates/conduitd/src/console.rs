@@ -182,110 +182,6 @@ pub struct SetSecretBody {
     pub api_key: String,
 }
 
-/// PATCH /console/providers/{id}/oauth-settings — non-secret OAuth credential options.
-///
-/// Currently supports Claude `cloak_mode` (`auto` | `always` | `never`).
-/// Additional fields may be added without breaking existing clients.
-#[derive(Debug, Deserialize)]
-pub struct UpdateOAuthSettingsBody {
-    /// Claude OAuth cloak mode. Omit to leave unchanged.
-    #[serde(default)]
-    pub cloak_mode: Option<String>,
-}
-
-/// PATCH /console/providers/{id}/oauth-settings
-pub async fn update_provider_oauth_settings(
-    State(state): State<Arc<DaemonState>>,
-    Path(id): Path<String>,
-    Json(body): Json<UpdateOAuthSettingsBody>,
-) -> impl IntoResponse {
-    use secrecy::ExposeSecret;
-
-    let repo = ProviderRepo::new(&state.pool);
-    let row = match repo.get(&id).await {
-        Ok(Some(r)) => r,
-        Ok(None) => return err(StatusCode::NOT_FOUND, "provider not found").into_response(),
-        Err(e) => return internal(e).into_response(),
-    };
-
-    let is_claude = matches!(
-        row.kind.to_ascii_lowercase().as_str(),
-        "claude-oauth" | "claude" | "anthropic-oauth"
-    );
-    if body.cloak_mode.is_some() && !is_claude {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "cloak_mode is only supported on claude-oauth providers",
-        )
-        .into_response();
-    }
-    if body.cloak_mode.is_none() {
-        return err(StatusCode::BAD_REQUEST, "no oauth settings fields provided").into_response();
-    }
-
-    let key_id = conduit_store::schema::secret_key_id_from_ref(&row.upstream_key_ref, &id);
-    let raw = match state.secret_backend.get("upstream_key", &key_id).await {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            return err(
-                StatusCode::NOT_FOUND,
-                format!("no secret stored for provider '{id}'"),
-            )
-            .into_response();
-        }
-        Err(e) => {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to decrypt secret: {e}"),
-            )
-            .into_response();
-        }
-    };
-
-    let mut cred = match conduit_oauth::OAuthCredential::try_parse_secret(raw.expose_secret()) {
-        Some(c) => c,
-        None => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                "provider secret is not an OAuth credential",
-            )
-            .into_response();
-        }
-    };
-
-    if let Some(ref mode) = body.cloak_mode {
-        if let Err(e) = cred.set_cloak_mode(mode) {
-            return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
-        }
-    }
-
-    let bytes = match cred.to_json_bytes() {
-        Ok(b) => b,
-        Err(e) => return internal(e).into_response(),
-    };
-    if let Err(e) = state
-        .secret_backend
-        .put("upstream_key", &key_id, secrecy::SecretVec::new(bytes))
-        .await
-    {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store credential: {e}"),
-        )
-        .into_response();
-    }
-
-    (
-        StatusCode::OK,
-        Json(json!({
-            "provider_id": id,
-            "provider_kind": row.kind,
-            "cloak_mode": cred.cloak_mode(),
-        })),
-    )
-        .into_response()
-}
-
 pub async fn set_provider_secret(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -379,7 +275,6 @@ pub async fn get_provider_secret(
                     "token_endpoint": cred.token_endpoint,
                     "proxy_url": cred.proxy_url,
                     "using_api": cred.using_api,
-                    "cloak_mode": cred.cloak_mode(),
                     "extra": cred.extra,
                 },
             })),

@@ -112,7 +112,7 @@ Conduit supports subscription-style OAuth for:
 
 | Kind | Flow | Callback / UX | Upstream |
 |------|------|---------------|----------|
-| `claude-oauth` | Auth code + PKCE (**Chrome_Auto TLS** on token + Messages) | `http://localhost:54545/callback` | Messages `?beta=true` + Chrome TLS + cloak (**configurable mode**)/cch/tool-remap/signature; refresh: 429 block + 3 retries |
+| `claude-oauth` | Auth code + PKCE (**Chrome_Auto TLS** on token + Messages) | `http://localhost:54545/callback` | Messages `?beta=true` + Chrome TLS + cloak (**auto**: non-`claude-cli` only)/cch/tool-remap/signature; refresh: 429 block + 3 retries |
 | `codex-oauth` | Auth code + PKCE | `http://localhost:1455/auth/callback` | ChatGPT Codex `/responses`; refresh: 3 retries |
 | `grok-oauth` | Device code (RFC 8628) | user_code + verification_uri | Chat defaults to **cli-chat-proxy**; set credential `using_api=true` for official `api.x.ai` |
 
@@ -138,7 +138,7 @@ Credentials (access + refresh + expiry + account metadata) are stored as JSON in
 
 Successful and error upstream responses also record `anthropic-ratelimit-*` / `x-ratelimit-*` / `retry-after`. TUI Providers tab shows a **REMAINING** column and detail meters (`u` re-probes).
 
-Console API: `POST /console/oauth/{kind}/start`, `GET /console/oauth/sessions/{id}`, `POST /console/oauth/sessions/{id}/cancel`, `POST /console/oauth/{provider_id}/refresh`, `GET /console/oauth/providers`, `GET/PUT /console/providers/{id}/oauth-settings`. CLI: `conduitctl oauth start <claude|codex|grok>`.
+Console API: `POST /console/oauth/{kind}/start`, `GET /console/oauth/sessions/{id}`, `POST /console/oauth/sessions/{id}/cancel`, `POST /console/oauth/{provider_id}/refresh`, `GET /console/oauth/providers`. CLI: `conduitctl oauth start <claude|codex|grok>`.
 
 ## Data Storage
 

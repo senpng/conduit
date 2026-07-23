@@ -134,9 +134,9 @@ pub fn prepare_oauth_body(
     // Optional: hoist mid-conversation system roles
     body = rebuild_mid_system_messages_to_top_level(body);
 
-    // Cloak (CLIProxyAPI applyCloaking)
+    // Cloak (auto: non-claude-cli clients only)
     let client_ua = opts.client_user_agent();
-    if should_cloak(&opts.cloak_mode, client_ua) {
+    if should_cloak(client_ua) {
         use super::device_profile::{profile_claude_version, resolve_device_profile};
         let profile =
             resolve_device_profile(access_token, &opts.client_headers, &opts.header_defaults);
@@ -234,14 +234,18 @@ mod tests {
     }
 
     #[test]
-    fn never_cloak_skips_billing() {
+    fn claude_cli_ua_skips_cloak_like_never() {
         let body = json!({
             "model": "claude-sonnet-4",
             "system": "custom",
             "messages": [{"role": "user", "content": "hi"}]
         });
+        // Auto cloak skips real Claude Code clients (UA prefix claude-cli).
         let opts = ClaudeOAuthRelayOptions {
-            cloak_mode: "never".into(),
+            client_headers: vec![(
+                "User-Agent".into(),
+                "claude-cli/2.1.63 (external, cli)".into(),
+            )],
             ..Default::default()
         };
         let prepared = prepare_oauth_body(body, "claude-sonnet-4", "sk-ant-oat-test", &opts);
@@ -333,6 +337,33 @@ mod tests {
             uid.starts_with("user_") && uid.contains("_account_") && uid.contains("_session_"),
             "uid={uid}"
         );
+        assert!(prepared.body["system"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("x-anthropic-billing-header:"));
+    }
+
+    #[test]
+    fn cloak_preserves_json_string_user_id() {
+        // New Claude Code form: metadata.user_id is a string whose content is JSON.
+        let client_uid = r#"{"device_id":"be82c3aee1e0c2d74535bacc85f9f559228f02dd8a17298cf522b71e6c375714","account_uuid":"","session_id":"e26d4046-0f88-4b09-bb5b-f863ab5fb24e"}"#;
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "system": "custom agent",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": client_uid}
+        });
+        let opts = ClaudeOAuthRelayOptions {
+            // Non-CLI UA → auto cloak runs, but must keep client JSON-string identity.
+            client_headers: vec![("User-Agent".into(), "curl/8.0".into())],
+            ..Default::default()
+        };
+        let prepared = prepare_oauth_body(body, "claude-sonnet-4", "sk-ant-oat-json-uid", &opts);
+        assert_eq!(
+            prepared.body["metadata"]["user_id"].as_str().unwrap(),
+            client_uid
+        );
+        // Cloak still applied (billing header).
         assert!(prepared.body["system"][0]["text"]
             .as_str()
             .unwrap()

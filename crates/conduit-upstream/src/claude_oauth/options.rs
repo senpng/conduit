@@ -1,12 +1,13 @@
-//! Cloak / header options (CLIProxyAPI ClaudeKey.Cloak + ClaudeHeaderDefaults).
+//! Cloak / header options for Claude OAuth relay.
+//!
+//! Cloak is fixed **auto**: apply system/user_id cloak unless the client
+//! User-Agent is real Claude Code (`claude-cli…`). No per-credential mode.
 
 use super::device_profile::{parse_entrypoint_from_ua, ClaudeHeaderDefaults};
 
 /// Full relay options — cloak + device profile + client request headers.
 #[derive(Debug, Clone)]
 pub struct ClaudeOAuthRelayOptions {
-    /// `auto` | `always` | `never` — default `auto`.
-    pub cloak_mode: String,
     /// Keep original system in system[] instead of moving to user (strict).
     pub strict_mode: bool,
     /// Zero-width-space obfuscation targets.
@@ -26,7 +27,6 @@ pub struct ClaudeOAuthRelayOptions {
 impl Default for ClaudeOAuthRelayOptions {
     fn default() -> Self {
         Self {
-            cloak_mode: "auto".into(),
             strict_mode: false,
             sensitive_words: Vec::new(),
             cache_user_id: true,
@@ -69,11 +69,7 @@ impl ClaudeOAuthRelayOptions {
     }
 }
 
-/// CLIProxyAPI `ShouldCloak`: always / never / auto (cloak unless UA is claude-cli).
-pub fn should_cloak(cloak_mode: &str, user_agent: &str) -> bool {
-    match cloak_mode.to_ascii_lowercase().as_str() {
-        "always" => true,
-        "never" => false,
-        _ => !user_agent.starts_with("claude-cli"),
-    }
+/// Auto cloak: cloak unless the client looks like real Claude Code.
+pub fn should_cloak(user_agent: &str) -> bool {
+    !user_agent.starts_with("claude-cli")
 }

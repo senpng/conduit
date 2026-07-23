@@ -25,13 +25,13 @@ pub fn extract_session_id(
     body: Option<&Value>,
 ) -> Option<String> {
     // 1. Claude Code identity from metadata.user_id (highest — CLIProxyAPI parity).
-    if let Some(uid) = body.and_then(|b| {
-        b.get("metadata")
-            .and_then(|m| string_field(m, "user_id"))
-    }) {
-        if let Some(sess) = claude_code_session_from_user_id(&uid) {
-            return Some(sess);
-        }
+    //    Accept string (classic / JSON-string) and object forms.
+    if let Some(sess) = body
+        .and_then(|b| b.get("metadata"))
+        .and_then(|m| m.get("user_id"))
+        .and_then(claude_code_session_from_user_id_value)
+    {
+        return Some(sess);
     }
 
     // 2. Claude Code session header (conversation-scoped, not generic sticky).
@@ -101,7 +101,26 @@ fn string_field(v: &Value, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Claude Code `user_id` session extraction.
+/// Claude Code `user_id` session extraction from a wire JSON value.
+///
+/// Supports:
+/// - classic string ending with `_session_{id}`
+/// - JSON-string: `"{\"device_id\":\"…\",\"session_id\":\"…\"}"`
+/// - object: `{"device_id":"…","session_id":"…"}` (gjson-style object→text parity)
+fn claude_code_session_from_user_id_value(user_id: &Value) -> Option<String> {
+    match user_id {
+        Value::String(s) => claude_code_session_from_user_id(s),
+        Value::Object(obj) => obj
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+/// Claude Code `user_id` session extraction from a string field.
 ///
 /// Supports:
 /// - string form ending with `_session_{id}` (last marker wins)
@@ -231,6 +250,24 @@ mod tests {
         assert_eq!(
             extract_session_id(&[], Some(&body)).as_deref(),
             Some("json-sess-1")
+        );
+    }
+
+    #[test]
+    fn object_user_id_session_id_field() {
+        // Rare: client sends metadata.user_id as a real JSON object (not stringified).
+        let body = json!({
+            "metadata": {
+                "user_id": {
+                    "device_id": "d1",
+                    "account_uuid": "",
+                    "session_id": "obj-sess-1"
+                }
+            }
+        });
+        assert_eq!(
+            extract_session_id(&[], Some(&body)).as_deref(),
+            Some("obj-sess-1")
         );
     }
 

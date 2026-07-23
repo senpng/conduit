@@ -225,7 +225,6 @@ impl CodexOAuth {
             token_endpoint: Some(self.token_url.clone()),
             proxy_url: None,
             using_api: None,
-            cloak_mode: None,
             extra: identity_to_extra(&identity),
         })
     }

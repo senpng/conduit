@@ -448,46 +448,14 @@ pub fn spawn_update_provider(
     client: ConsoleClient,
     id: String,
     body: UpdateProviderBody,
-    oauth: Option<crate::dto::UpdateOAuthSettingsBody>,
     tx: UnboundedSender<Msg>,
 ) {
     tokio::spawn(async move {
         match client.update_provider(&id, &body).await {
             Ok(_) => {
-                let mut message = format!("Provider {id} updated");
-                if let Some(ref oauth_body) = oauth {
-                    match client.update_provider_oauth_settings(&id, oauth_body).await {
-                        Ok(v) => {
-                            if let Some(mode) = v.get("cloak_mode").and_then(|x| x.as_str()) {
-                                message = format!("Provider {id} updated (cloak_mode={mode})");
-                            }
-                            // Refresh decrypted secret so detail shows new cloak_mode
-                            // without re-opening the secret modal.
-                            let r = client
-                                .get_provider_secret(&id)
-                                .await
-                                .map_err(|e| e.to_string());
-                            let _ = tx.send(Msg::ProviderSecret {
-                                result: r,
-                                show_modal: false,
-                            });
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Msg::Mutated {
-                                ok: false,
-                                message: format!(
-                                    "Provider {id} updated, but cloak_mode failed: {e}"
-                                ),
-                                refresh: RefreshKind::Providers,
-                                secret: None,
-                            });
-                            return;
-                        }
-                    }
-                }
                 let _ = tx.send(Msg::Mutated {
                     ok: true,
-                    message,
+                    message: format!("Provider {id} updated"),
                     refresh: RefreshKind::Providers,
                     secret: None,
                 });
@@ -503,6 +471,7 @@ pub fn spawn_update_provider(
         }
     });
 }
+
 
 pub fn spawn_set_secret(
     client: ConsoleClient,
