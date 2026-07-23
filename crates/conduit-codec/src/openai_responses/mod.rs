@@ -533,10 +533,23 @@ fn tool_item_json(id: &str, name: &str, arguments: &str, status: &str) -> Value 
     })
 }
 
+/// Encode IR [`Usage`] as OpenAI Responses `usage` (official SDK shape).
+///
+/// Stainless/OpenAI Python `ResponseUsage` requires both
+/// `input_tokens_details` and `output_tokens_details` objects (not optional).
+/// Omitting them makes strict clients fail with:
+/// `missing field input_tokens_details`.
 fn usage_json(usage: &Usage) -> Value {
     json!({
         "input_tokens": usage.prompt_tokens,
+        "input_tokens_details": {
+            "cached_tokens": usage.cache_read_tokens,
+            "cache_write_tokens": usage.cache_write_tokens,
+        },
         "output_tokens": usage.completion_tokens,
+        "output_tokens_details": {
+            "reasoning_tokens": usage.reasoning_tokens,
+        },
         "total_tokens": usage.total_tokens,
     })
 }
@@ -1272,11 +1285,7 @@ impl WireCodec for OpenAIResponsesCodec {
             "model": resp.model,
             "status": "completed",
             "output": output,
-            "usage": {
-                "input_tokens": resp.usage.prompt_tokens,
-                "output_tokens": resp.usage.completion_tokens,
-                "total_tokens": resp.usage.total_tokens,
-            }
+            "usage": usage_json(&resp.usage),
         })
     }
 
@@ -1325,11 +1334,7 @@ impl WireCodec for OpenAIResponsesCodec {
                     // This stateless compatibility path cannot reconstruct
                     // prior deltas, but it must never omit the field.
                     "output": [],
-                    "usage": chunk.usage.as_ref().map(|usage| json!({
-                        "input_tokens": usage.prompt_tokens,
-                        "output_tokens": usage.completion_tokens,
-                        "total_tokens": usage.total_tokens,
-                    })),
+                    "usage": chunk.usage.as_ref().map(usage_json),
                 }
             });
             return (Some(format!("data: {event}\n\n")), LossReport::default());
@@ -2303,6 +2308,15 @@ mod tests {
         assert!(terminal_frame.contains("response.completed"));
         assert!(terminal_frame.contains("\"total_tokens\":5"));
         assert!(terminal_frame.contains("\"output\":[]"));
+        // Strict Responses SDKs require these nested objects on usage.
+        assert!(
+            terminal_frame.contains("input_tokens_details"),
+            "missing input_tokens_details in: {terminal_frame}"
+        );
+        assert!(
+            terminal_frame.contains("output_tokens_details"),
+            "missing output_tokens_details in: {terminal_frame}"
+        );
     }
 
     #[test]
@@ -2394,6 +2408,78 @@ mod tests {
         assert_eq!(resp.id, "resp_1");
         assert_eq!(content_to_text(&resp.choices[0].content), "hi there");
         assert_eq!(resp.usage.total_tokens, 5);
+    }
+
+    #[test]
+    fn encode_response_usage_includes_required_details() {
+        let mut resp = CanonicalChatResponse {
+            id: "resp_u".into(),
+            request_id: "r".into(),
+            model: "gpt-5".into(),
+            choices: vec![CanonicalMessage::assistant("ok")],
+            finish_reason: FinishReason::Stop,
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 4,
+                total_tokens: 14,
+                reasoning_tokens: 2,
+                cache_read_tokens: 3,
+                cache_write_tokens: 1,
+            },
+            created_at: chrono::Utc::now(),
+        };
+        let wire = OpenAIResponsesCodec::encode_response(&resp);
+        let usage = &wire["usage"];
+        assert_eq!(usage["input_tokens"], 10);
+        assert_eq!(usage["output_tokens"], 4);
+        assert_eq!(usage["total_tokens"], 14);
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(usage["input_tokens_details"]["cache_write_tokens"], 1);
+        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 2);
+
+        // Even with zero details, nested objects must be present (required by SDK).
+        resp.usage = Usage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            ..Default::default()
+        };
+        let wire = OpenAIResponsesCodec::encode_response(&resp);
+        assert!(wire["usage"]["input_tokens_details"].is_object());
+        assert!(wire["usage"]["output_tokens_details"].is_object());
+        assert_eq!(wire["usage"]["input_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(
+            wire["usage"]["output_tokens_details"]["reasoning_tokens"],
+            0
+        );
+    }
+
+    #[test]
+    fn stateful_encoder_completed_usage_has_details() {
+        let mut enc = ResponsesStreamEncoder::new("resp_det", "gpt-test");
+        let _ = enc.start();
+        let _ = enc.push(&CanonicalChunk::text_delta("hi"));
+        let frames = enc.push(&CanonicalChunk::finish(
+            FinishReason::Stop,
+            Some(Usage {
+                prompt_tokens: 5,
+                completion_tokens: 2,
+                total_tokens: 7,
+                reasoning_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            }),
+        ));
+        let completed = frames
+            .iter()
+            .find(|f| f.contains("response.completed"))
+            .expect("completed event");
+        let data = completed.trim_start_matches("data: ").trim();
+        let v: Value = serde_json::from_str(data).unwrap();
+        let usage = &v["response"]["usage"];
+        assert!(usage["input_tokens_details"].is_object());
+        assert!(usage["output_tokens_details"].is_object());
+        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 1);
     }
 
     #[test]
