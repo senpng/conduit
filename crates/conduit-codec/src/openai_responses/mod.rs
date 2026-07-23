@@ -729,6 +729,26 @@ fn is_plausible_gpt_reasoning_signature(raw: &str) -> bool {
     ciphertext_len > 0 && ciphertext_len % 16 == 0
 }
 
+/// Official Responses request fields preserved via `meta.extra` for re-emit.
+/// Codex ChatGPT-account apply may still strip a subset of these.
+const RESPONSES_PASSTHROUGH_KEYS: &[&str] = &[
+    "background",
+    "conversation",
+    "max_tool_calls",
+    "include",
+    "truncation",
+    "context_management",
+    "prompt_cache_key",
+    "prompt_cache_options",
+    "prompt_cache_retention",
+    "safety_identifier",
+    "service_tier",
+    "parallel_tool_calls",
+    "text",
+    "store",
+    "stream_options",
+];
+
 /// Apply CLIProxyAPI-style ChatGPT-account Codex request constraints.
 ///
 /// Upstream rules observed on `chatgpt.com/backend-api/codex/responses`:
@@ -964,6 +984,36 @@ impl WireCodec for OpenAIResponsesCodec {
         if let Some(mt) = req.sampling.max_tokens {
             body["max_output_tokens"] = json!(mt);
         }
+        if let Some(user) = &req.meta.user {
+            if !user.is_empty() {
+                body["user"] = json!(user);
+            }
+        }
+        // P3: first-class Responses fields preserved via meta.extra.
+        // Codex account apply may still strip forbidden keys afterward.
+        for key in RESPONSES_PASSTHROUGH_KEYS {
+            if let Some(v) = req.meta.extra.get(*key) {
+                if !v.is_null() {
+                    // Default encode sets store=false; only override when client set it.
+                    if *key == "store" {
+                        body["store"] = v.clone();
+                        continue;
+                    }
+                    body[*key] = v.clone();
+                }
+            }
+        }
+        // previous_response_id / session keys also live in extra.
+        if let Some(v) = req.meta.extra.get("previous_response_id") {
+            if !v.is_null() {
+                body["previous_response_id"] = v.clone();
+            }
+        }
+        if let Some(v) = req.meta.extra.get("metadata") {
+            if !v.is_null() {
+                body["metadata"] = v.clone();
+            }
+        }
 
         (body, loss)
     }
@@ -1081,6 +1131,12 @@ impl WireCodec for OpenAIResponsesCodec {
                 }
                 if let Some(m) = body.get("metadata").filter(|v| !v.is_null()) {
                     meta.extra.insert("metadata".into(), m.clone());
+                }
+                // P3: official Responses first-class knobs.
+                for key in RESPONSES_PASSTHROUGH_KEYS {
+                    if let Some(v) = body.get(*key).filter(|v| !v.is_null()) {
+                        meta.extra.insert((*key).into(), v.clone());
+                    }
                 }
                 meta
             },
@@ -2530,5 +2586,57 @@ mod tests {
         assert_eq!(input[0]["type"], "function_call_output");
         assert_eq!(input[0]["call_id"], "c1");
         assert_eq!(input[1]["role"], "user");
+    }
+
+    #[test]
+    fn responses_p3_fields_round_trip_without_codex_strip() {
+        let body = json!({
+            "model": "gpt-5",
+            "input": "hi",
+            "background": true,
+            "conversation": "conv_abc",
+            "max_tool_calls": 3,
+            "prompt_cache_key": "pk",
+            "safety_identifier": "sid",
+            "store": true
+        });
+        let req = OpenAIResponsesCodec::decode_request(
+            body,
+            "gpt-5".into(),
+            false,
+            "rid".into(),
+            "kid".into(),
+        )
+        .unwrap();
+        assert_eq!(req.meta.extra.get("background"), Some(&json!(true)));
+        assert_eq!(
+            req.meta.extra.get("conversation"),
+            Some(&json!("conv_abc"))
+        );
+        assert_eq!(req.meta.extra.get("max_tool_calls"), Some(&json!(3)));
+        let (wire, _) = OpenAIResponsesCodec::encode_request(&req, false);
+        assert_eq!(wire["background"], true);
+        assert_eq!(wire["conversation"], "conv_abc");
+        assert_eq!(wire["max_tool_calls"], 3);
+        assert_eq!(wire["prompt_cache_key"], "pk");
+        assert_eq!(wire["safety_identifier"], "sid");
+        // Client store=true is re-emitted on generic encode.
+        assert_eq!(wire["store"], true);
+    }
+
+    #[test]
+    fn codex_account_still_forces_stream_and_store_false() {
+        let mut req = CanonicalChatRequest::new("gpt-5.6", vec![CanonicalMessage::user("hi")]);
+        req.meta.extra.insert("background".into(), json!(true));
+        req.meta.extra.insert("max_tool_calls".into(), json!(2));
+        req.sampling.temperature = Some(0.5);
+        let (wire, _) = OpenAIResponsesCodec::encode_request(&req, false);
+        let wire = apply_codex_chatgpt_account_body(wire);
+        assert_eq!(wire["stream"], true);
+        assert_eq!(wire["store"], false);
+        // Sampling stripped for Codex account.
+        assert!(wire.get("temperature").is_none());
+        // background may remain (not in Codex strip list) — that's fine.
+        assert_eq!(wire["background"], true);
     }
 }

@@ -48,12 +48,52 @@ pub fn decode_response(
     let msg = &choice["message"];
     let mut content: Vec<CanonicalContent> = Vec::new();
 
-    // Text content
-    if let Some(text) = msg["content"].as_str() {
-        if !text.is_empty() {
+    // Text content (string or multimodal array of text parts)
+    match &msg["content"] {
+        Value::String(text) if !text.is_empty() => {
             content.push(CanonicalContent::Text {
-                text: text.to_string(),
+                text: text.clone(),
             });
+        }
+        Value::Array(parts) => {
+            for part in parts {
+                if let Some(text) = part.as_str() {
+                    if !text.is_empty() {
+                        content.push(CanonicalContent::Text {
+                            text: text.to_string(),
+                        });
+                    }
+                    continue;
+                }
+                let ty = part.get("type").and_then(|t| t.as_str()).unwrap_or("text");
+                if matches!(ty, "text" | "output_text") {
+                    let text = part["text"].as_str().unwrap_or("").to_string();
+                    if !text.is_empty() {
+                        content.push(CanonicalContent::Text { text });
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Extension: reasoning_content (and common aliases) → Thinking.
+    // Official OpenAI Chat does not document this field, but compatible
+    // upstreams and multi-turn re-encode paths use it (CLIProxyAPI parity).
+    for key in [
+        "reasoning_content",
+        "reasoning",
+        "reasoning_text",
+        "thinking",
+    ] {
+        if let Some(rc) = msg.get(key).and_then(|v| v.as_str()) {
+            if !rc.is_empty() {
+                content.push(CanonicalContent::Thinking {
+                    thinking: rc.to_string(),
+                    signature: Some("gpt#conduit".into()),
+                });
+                break;
+            }
         }
     }
 
@@ -316,5 +356,63 @@ mod tests {
             decode_response(body, "gpt-4o"),
             Err(CodecError::MissingField { .. })
         ));
+    }
+
+    #[test]
+    fn non_stream_reasoning_content_becomes_thinking() {
+        let body = json!({
+            "id": "chatcmpl-r",
+            "model": "compat",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning_content": "step by step"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        });
+        let resp = decode_response(body, "compat").unwrap().0;
+        assert!(
+            resp.choices[0].content.iter().any(
+                |c| matches!(c, CanonicalContent::Text { text } if text == "answer")
+            )
+        );
+        assert!(resp.choices[0].content.iter().any(|c| matches!(
+            c,
+            CanonicalContent::Thinking { thinking, signature }
+                if thinking == "step by step"
+                    && signature.as_deref() == Some("gpt#conduit")
+        )));
+    }
+
+    #[test]
+    fn non_stream_reasoning_reencodes_via_openai_codec() {
+        use crate::openai::OpenAICodec;
+        use crate::WireCodec;
+
+        let body = json!({
+            "id": "chatcmpl-r2",
+            "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "ok",
+                    "reasoning_content": "think"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        let (resp, _) = OpenAICodec::decode_response(body, "m").unwrap();
+        let wire = OpenAICodec::encode_response(&resp);
+        assert_eq!(wire["choices"][0]["message"]["content"], "ok");
+        assert_eq!(
+            wire["choices"][0]["message"]["reasoning_content"],
+            "think"
+        );
     }
 }

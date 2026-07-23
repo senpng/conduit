@@ -2,6 +2,7 @@ use conduit_ir::canonical::{
     CanonicalChatRequest, CanonicalContent, CanonicalMessage, ResponseFormat, Role, ToolChoice,
     ToolDef,
 };
+// Role used by tests for multimodal user messages.
 use serde_json::{json, Value};
 
 /// Encode a canonical request into the OpenAI `/v1/chat/completions` wire format.
@@ -63,7 +64,14 @@ pub fn encode_request(req: &CanonicalChatRequest, stream: bool) -> Value {
         body["top_p"] = json!(p);
     }
     if let Some(mt) = s.max_tokens {
-        body["max_tokens"] = json!(mt);
+        // Official OpenAI: max_tokens is deprecated; o-series requires
+        // max_completion_tokens. Prefer modern field when client used it or
+        // prefer_max_completion_tokens is set.
+        if s.prefer_max_completion_tokens {
+            body["max_completion_tokens"] = json!(mt);
+        } else {
+            body["max_tokens"] = json!(mt);
+        }
     }
     if let Some(stop) = &s.stop {
         if !stop.is_empty() {
@@ -102,6 +110,41 @@ pub fn encode_request(req: &CanonicalChatRequest, stream: bool) -> Value {
             body["parallel_tool_calls"] = v.clone();
         }
     }
+    // Re-emit caller user id when present.
+    if let Some(user) = &req.meta.user {
+        if !user.is_empty() {
+            body["user"] = json!(user);
+        }
+    }
+    // P2: re-emit newer Chat knobs preserved in meta.extra.
+    for key in [
+        "store",
+        "prompt_cache_key",
+        "prompt_cache_options",
+        "prompt_cache_retention",
+        "prediction",
+        "modalities",
+        "audio",
+        "logprobs",
+        "top_logprobs",
+        "moderation",
+        "web_search_options",
+        "safety_identifier",
+    ] {
+        if let Some(v) = req.meta.extra.get(key) {
+            if !v.is_null() {
+                body[key] = v.clone();
+            }
+        }
+    }
+    // stream_options: only when streaming; client value wins over default.
+    if stream {
+        if let Some(v) = req.meta.extra.get("stream_options") {
+            body["stream_options"] = v.clone();
+        } else {
+            body["stream_options"] = json!({"include_usage": true});
+        }
+    }
 
     // Response format
     if let Some(rf) = &req.response_format {
@@ -110,22 +153,29 @@ pub fn encode_request(req: &CanonicalChatRequest, stream: bool) -> Value {
             ResponseFormat::JsonObject => {
                 body["response_format"] = json!({"type": "json_object"});
             }
-            ResponseFormat::JsonSchema { schema, strict } => {
+            ResponseFormat::JsonSchema {
+                name,
+                description,
+                schema,
+                strict,
+            } => {
+                let mut js = json!({
+                    "name": name.as_deref().filter(|s| !s.is_empty()).unwrap_or("response"),
+                    "schema": schema,
+                    "strict": strict.unwrap_or(false),
+                });
+                if let Some(desc) = description {
+                    if !desc.is_empty() {
+                        js["description"] = json!(desc);
+                    }
+                }
                 body["response_format"] = json!({
                     "type": "json_schema",
-                    "json_schema": {
-                        "name": "response",
-                        "schema": schema,
-                        "strict": strict.unwrap_or(false),
-                    }
+                    "json_schema": js,
                 });
             }
             _ => {}
         }
-    }
-
-    if stream {
-        body["stream_options"] = json!({"include_usage": true});
     }
 
     body
@@ -201,8 +251,10 @@ fn encode_assistant_message(msg: &CanonicalMessage) -> Option<Value> {
                     reasoning_parts.push(thinking.clone());
                 }
             }
-            CanonicalContent::ToolResult { .. } => {
-                // Tool results on assistant are unexpected; ignore.
+            CanonicalContent::ToolResult { .. }
+            | CanonicalContent::InputAudio { .. }
+            | CanonicalContent::File { .. } => {
+                // Unexpected on assistant; ignore.
             }
             _ => {}
         }
@@ -327,6 +379,36 @@ fn encode_content_parts(content: &[CanonicalContent]) -> Value {
                     "image_url": {"url": url, "detail": det},
                 }))
             }
+            CanonicalContent::InputAudio { data, format } => {
+                let mut audio = json!({"data": data});
+                if let Some(fmt) = format {
+                    audio["format"] = json!(fmt);
+                }
+                Some(json!({
+                    "type": "input_audio",
+                    "input_audio": audio,
+                }))
+            }
+            CanonicalContent::File {
+                file_id,
+                file_data,
+                filename,
+            } => {
+                let mut file = serde_json::Map::new();
+                if let Some(id) = file_id {
+                    file.insert("file_id".into(), json!(id));
+                }
+                if let Some(data) = file_data {
+                    file.insert("file_data".into(), json!(data));
+                }
+                if let Some(name) = filename {
+                    file.insert("filename".into(), json!(name));
+                }
+                Some(json!({
+                    "type": "file",
+                    "file": Value::Object(file),
+                }))
+            }
             CanonicalContent::Thinking { .. } => None,
             _ => None,
         })
@@ -403,9 +485,14 @@ pub fn encode_tool_choice(tc: &ToolChoice) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use conduit_ir::canonical::{CanonicalChatRequest, CanonicalMessage, Sampling, ToolDef};
+    use conduit_ir::canonical::{
+        CanonicalChatRequest, CanonicalContent, CanonicalMessage, ResponseFormat, Role, Sampling,
+        ToolDef,
+    };
 
     use super::*;
+    use crate::WireCodec;
+    use serde_json::json;
 
     fn make_request() -> CanonicalChatRequest {
         CanonicalChatRequest::new("gpt-4o", vec![CanonicalMessage::user("Hello")])
@@ -460,6 +547,123 @@ mod tests {
         assert!((v["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-6);
         assert_eq!(v["max_tokens"].as_u64().unwrap(), 256);
         assert_eq!(v["seed"].as_u64().unwrap(), 42);
+    }
+
+    #[test]
+    fn prefer_max_completion_tokens_emits_modern_field() {
+        let mut req = make_request();
+        req.sampling.max_tokens = Some(128);
+        req.sampling.prefer_max_completion_tokens = true;
+        let v = encode_request(&req, false);
+        assert_eq!(v["max_completion_tokens"].as_u64(), Some(128));
+        assert!(v.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn stop_string_round_trip_via_encode() {
+        let mut req = make_request();
+        req.sampling.stop = Some(vec!["END".into()]);
+        let v = encode_request(&req, false);
+        assert_eq!(v["stop"].as_str(), Some("END"));
+        req.sampling.stop = Some(vec!["A".into(), "B".into()]);
+        let v = encode_request(&req, false);
+        assert_eq!(v["stop"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn json_schema_name_and_description_preserved() {
+        let mut req = make_request();
+        req.response_format = Some(ResponseFormat::JsonSchema {
+            name: Some("my_schema".into()),
+            description: Some("for tests".into()),
+            schema: json!({"type": "object"}),
+            strict: Some(true),
+        });
+        let v = encode_request(&req, false);
+        assert_eq!(v["response_format"]["type"], "json_schema");
+        assert_eq!(v["response_format"]["json_schema"]["name"], "my_schema");
+        assert_eq!(
+            v["response_format"]["json_schema"]["description"],
+            "for tests"
+        );
+    }
+
+    #[test]
+    fn input_audio_and_file_encoded() {
+        let mut req = make_request();
+        req.messages = vec![CanonicalMessage {
+            role: Role::User,
+            content: vec![
+                CanonicalContent::Text {
+                    text: "hi".into(),
+                },
+                CanonicalContent::InputAudio {
+                    data: "AAAA".into(),
+                    format: Some("wav".into()),
+                },
+                CanonicalContent::File {
+                    file_id: Some("file-9".into()),
+                    file_data: None,
+                    filename: Some("x.pdf".into()),
+                },
+            ],
+            name: None,
+        }];
+        let v = encode_request(&req, false);
+        let content = v["messages"][0]["content"].as_array().unwrap();
+        assert!(content.iter().any(|p| p["type"] == "input_audio"
+            && p["input_audio"]["data"] == "AAAA"
+            && p["input_audio"]["format"] == "wav"));
+        assert!(content.iter().any(|p| p["type"] == "file"
+            && p["file"]["file_id"] == "file-9"
+            && p["file"]["filename"] == "x.pdf"));
+    }
+
+    #[test]
+    fn user_and_store_reemitted_from_meta() {
+        let mut req = make_request();
+        req.meta.user = Some("user-42".into());
+        req.meta.extra.insert("store".into(), json!(true));
+        req.meta
+            .extra
+            .insert("prompt_cache_key".into(), json!("ck"));
+        let v = encode_request(&req, false);
+        assert_eq!(v["user"], "user-42");
+        assert_eq!(v["store"], true);
+        assert_eq!(v["prompt_cache_key"], "ck");
+    }
+
+    #[test]
+    fn decode_encode_max_completion_tokens_and_stop_string() {
+        // Drive the real shipped path: decode_request → encode_request.
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 99,
+            "stop": "END",
+            "store": true,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "goal_out",
+                    "schema": {"type": "object", "properties": {"x": {"type": "string"}}},
+                    "strict": true
+                }
+            }
+        });
+        let req = crate::openai::OpenAICodec::decode_request(
+            body,
+            "gpt-4o".into(),
+            false,
+            "rid".into(),
+            "kid".into(),
+        )
+        .unwrap();
+        let wire = crate::openai::OpenAICodec::encode_request(&req, false).0;
+        assert_eq!(wire["max_completion_tokens"], 99);
+        assert!(wire.get("max_tokens").is_none());
+        assert_eq!(wire["stop"], "END");
+        assert_eq!(wire["store"], true);
+        assert_eq!(wire["response_format"]["json_schema"]["name"], "goal_out");
     }
 
     #[test]

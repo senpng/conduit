@@ -135,20 +135,23 @@ pub fn decode_request(
     let response_format = decode_response_format(&body["response_format"]);
 
     // Prefer max_tokens; fall back to max_completion_tokens (newer OpenAI clients).
-    let max_tokens = body["max_tokens"]
-        .as_u64()
-        .or_else(|| body["max_completion_tokens"].as_u64())
-        .map(|v| v as u32);
+    // When only max_completion_tokens is set (or both and we take max_completion
+    // path), mark prefer_max_completion_tokens so encode emits the modern field.
+    let (max_tokens, prefer_max_completion_tokens) = if let Some(v) = body["max_tokens"].as_u64() {
+        // Explicit legacy max_tokens wins when both present (historical Conduit rule).
+        (Some(v as u32), false)
+    } else if let Some(v) = body["max_completion_tokens"].as_u64() {
+        (Some(v as u32), true)
+    } else {
+        (None, false)
+    };
 
     let sampling = Sampling {
         temperature: body["temperature"].as_f64().map(|v| v as f32),
         top_p: body["top_p"].as_f64().map(|v| v as f32),
         max_tokens,
-        stop: body["stop"].as_array().map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        }),
+        prefer_max_completion_tokens,
+        stop: decode_stop(&body["stop"]),
         seed: body["seed"].as_u64(),
         presence_penalty: body["presence_penalty"].as_f64().map(|v| v as f32),
         frequency_penalty: body["frequency_penalty"].as_f64().map(|v| v as f32),
@@ -190,11 +193,58 @@ pub fn decode_request(
                 meta.extra
                     .insert("parallel_tool_calls".into(), v.clone());
             }
+            // P2: newer Chat request knobs preserved for upstream re-emit.
+            for key in [
+                "store",
+                "prompt_cache_key",
+                "prompt_cache_options",
+                "prompt_cache_retention",
+                "prediction",
+                "modalities",
+                "audio",
+                "logprobs",
+                "top_logprobs",
+                "moderation",
+                "stream_options",
+                "web_search_options",
+                "safety_identifier",
+            ] {
+                if let Some(v) = body.get(key).filter(|v| !v.is_null()) {
+                    meta.extra.insert(key.into(), v.clone());
+                }
+            }
             meta
         },
         stream,
         loss_report: Default::default(),
     })
+}
+
+/// OpenAI `stop`: string | string[] | null.
+fn decode_stop(val: &Value) -> Option<Vec<String>> {
+    match val {
+        Value::Null => None,
+        Value::String(s) => {
+            if s.is_empty() {
+                None
+            } else {
+                Some(vec![s.clone()])
+            }
+        }
+        Value::Array(arr) => {
+            let stops: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .filter(|s| !s.is_empty())
+                .collect();
+            if stops.is_empty() {
+                None
+            } else {
+                Some(stops)
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Decode system/developer content: plain string or multimodal array of text parts.
@@ -272,6 +322,35 @@ fn decode_user_content(val: &Value) -> Vec<CanonicalContent> {
                         detail,
                     })
                 }
+                Some("input_audio") => {
+                    let data = part["input_audio"]["data"]
+                        .as_str()
+                        .or_else(|| part["data"].as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if data.is_empty() {
+                        return None;
+                    }
+                    let format = part["input_audio"]["format"]
+                        .as_str()
+                        .or_else(|| part["format"].as_str())
+                        .map(String::from);
+                    Some(CanonicalContent::InputAudio { data, format })
+                }
+                Some("file") => {
+                    let file = &part["file"];
+                    let file_id = file["file_id"].as_str().map(String::from);
+                    let file_data = file["file_data"].as_str().map(String::from);
+                    let filename = file["filename"].as_str().map(String::from);
+                    if file_id.is_none() && file_data.is_none() {
+                        return None;
+                    }
+                    Some(CanonicalContent::File {
+                        file_id,
+                        file_data,
+                        filename,
+                    })
+                }
                 _ => None,
             })
             .collect();
@@ -307,9 +386,17 @@ fn decode_response_format(val: &Value) -> Option<ResponseFormat> {
     match val["type"].as_str() {
         Some("json_object") => Some(ResponseFormat::JsonObject),
         Some("json_schema") => {
-            let schema = val["json_schema"]["schema"].clone();
-            let strict = val["json_schema"]["strict"].as_bool();
-            Some(ResponseFormat::JsonSchema { schema, strict })
+            let js = &val["json_schema"];
+            let schema = js["schema"].clone();
+            let strict = js["strict"].as_bool();
+            let name = js["name"].as_str().map(String::from);
+            let description = js["description"].as_str().map(String::from);
+            Some(ResponseFormat::JsonSchema {
+                name,
+                description,
+                schema,
+                strict,
+            })
         }
         _ => None,
     }
@@ -479,13 +566,122 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "response_format": {
                 "type": "json_schema",
-                "json_schema": {"name": "r", "schema": {"type": "object"}, "strict": true}
+                "json_schema": {
+                    "name": "r",
+                    "description": "desc",
+                    "schema": {"type": "object"},
+                    "strict": true
+                }
             }
         });
         let req = decode(body);
-        assert!(matches!(
-            req.response_format,
-            Some(ResponseFormat::JsonSchema { .. })
-        ));
+        match req.response_format {
+            Some(ResponseFormat::JsonSchema {
+                name,
+                description,
+                schema,
+                strict,
+            }) => {
+                assert_eq!(name.as_deref(), Some("r"));
+                assert_eq!(description.as_deref(), Some("desc"));
+                assert_eq!(schema["type"], "object");
+                assert_eq!(strict, Some(true));
+            }
+            other => panic!("expected JsonSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_string_and_array_decoded() {
+        let req = decode(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": "END"
+        }));
+        assert_eq!(req.sampling.stop.as_deref(), Some(&["END".to_string()][..]));
+
+        let req = decode(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": ["A", "B"]
+        }));
+        assert_eq!(
+            req.sampling.stop.as_ref().map(|v| v.as_slice()),
+            Some(&["A".to_string(), "B".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn max_completion_tokens_sets_prefer_flag() {
+        let req = decode(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 128
+        }));
+        assert_eq!(req.sampling.max_tokens, Some(128));
+        assert!(req.sampling.prefer_max_completion_tokens);
+    }
+
+    #[test]
+    fn max_tokens_clears_prefer_flag() {
+        let req = decode(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 64,
+            "max_completion_tokens": 128
+        }));
+        assert_eq!(req.sampling.max_tokens, Some(64));
+        assert!(!req.sampling.prefer_max_completion_tokens);
+    }
+
+    #[test]
+    fn input_audio_and_file_content_parts() {
+        let req = decode(json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "listen"},
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+                    {"type": "file", "file": {"file_id": "file-1", "filename": "a.pdf"}}
+                ]
+            }]
+        }));
+        assert!(
+            req.messages[0]
+                .content
+                .iter()
+                .any(|c| matches!(c, CanonicalContent::Text { text } if text == "listen"))
+        );
+        assert!(req.messages[0].content.iter().any(|c| matches!(
+            c,
+            CanonicalContent::InputAudio {
+                data,
+                format
+            } if data == "AAAA" && format.as_deref() == Some("wav")
+        )));
+        assert!(req.messages[0].content.iter().any(|c| matches!(
+            c,
+            CanonicalContent::File {
+                file_id,
+                filename,
+                ..
+            } if file_id.as_deref() == Some("file-1") && filename.as_deref() == Some("a.pdf")
+        )));
+    }
+
+    #[test]
+    fn newer_chat_knobs_preserved_in_meta_extra() {
+        let req = decode(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "store": true,
+            "prompt_cache_key": "ck-1",
+            "modalities": ["text"],
+            "logprobs": true,
+            "top_logprobs": 2,
+            "user": "u-1"
+        }));
+        assert_eq!(req.meta.user.as_deref(), Some("u-1"));
+        assert_eq!(req.meta.extra.get("store"), Some(&json!(true)));
+        assert_eq!(
+            req.meta.extra.get("prompt_cache_key"),
+            Some(&json!("ck-1"))
+        );
+        assert_eq!(req.meta.extra.get("logprobs"), Some(&json!(true)));
     }
 }

@@ -21,6 +21,19 @@ pub enum CanonicalContent {
         media_type: Option<String>,
         detail: Option<String>,
     },
+    /// OpenAI Chat Completions `input_audio` content part.
+    InputAudio {
+        /// Base64-encoded audio data.
+        data: String,
+        /// Format hint, e.g. `wav` / `mp3`.
+        format: Option<String>,
+    },
+    /// OpenAI Chat Completions `file` content part.
+    File {
+        file_id: Option<String>,
+        file_data: Option<String>,
+        filename: Option<String>,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -145,6 +158,11 @@ pub enum ResponseFormat {
     Text,
     JsonObject,
     JsonSchema {
+        /// Structured Outputs schema name (OpenAI requires this; max 64 chars).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         schema: serde_json::Value,
         strict: Option<bool>,
     },
@@ -165,6 +183,11 @@ pub struct Sampling {
     pub top_k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// When true, OpenAI chat encode prefers `max_completion_tokens` over deprecated
+    /// `max_tokens` (set when the client sent `max_completion_tokens`, or when only
+    /// a generic cap is known and the official contract should be used).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prefer_max_completion_tokens: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
