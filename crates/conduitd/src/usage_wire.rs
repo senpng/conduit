@@ -337,6 +337,8 @@ fn build_ledger_rows(
         affinity_hit: req.affinity_hit,
         pool_id: req.pool_id,
         selected_reason: req.selected_reason,
+        loss_count: req.loss_count,
+        wire_format: req.wire_format,
         ..conduit_store::UsageRecordRow::stamped()
     };
 
@@ -399,6 +401,8 @@ mod tests {
             affinity_hit: None,
             pool_id: None,
             selected_reason: Some("fixed".into()),
+            loss_count: 0,
+            wire_format: Some("openai.chat".into()),
             attempts: Vec::new(),
         }
     }
@@ -443,6 +447,40 @@ mod tests {
         assert_eq!(rows[0].duration_ms, Some(100));
         assert_eq!(rows[0].ttfb_ms, Some(25));
         assert_eq!(rows[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(rows[0].loss_count, 0);
+        assert_eq!(rows[0].wire_format.as_deref(), Some("openai.chat"));
+    }
+
+    #[tokio::test]
+    async fn loss_count_persists_on_usage_row() {
+        let pool = open_db("sqlite::memory:").await.unwrap();
+        let (record_fn, _writer) = make_record_fn(pool.clone());
+
+        let mut req = base_req();
+        req.request_id = "tr-loss".into();
+        req.loss_count = 3;
+        (record_fn)(req).await.unwrap();
+        wait_for_rows(&pool, 1).await;
+
+        let rows = UsageRepo::new(&pool).list(10, None, None).await.unwrap();
+        assert_eq!(rows[0].request_id, "tr-loss");
+        assert_eq!(rows[0].loss_count, 3);
+    }
+
+    #[tokio::test]
+    async fn wire_format_persists_on_usage_row() {
+        let pool = open_db("sqlite::memory:").await.unwrap();
+        let (record_fn, _writer) = make_record_fn(pool.clone());
+
+        let mut req = base_req();
+        req.request_id = "tr-wire".into();
+        req.wire_format = Some("openai.responses".into());
+        (record_fn)(req).await.unwrap();
+        wait_for_rows(&pool, 1).await;
+
+        let rows = UsageRepo::new(&pool).list(10, None, None).await.unwrap();
+        assert_eq!(rows[0].request_id, "tr-wire");
+        assert_eq!(rows[0].wire_format.as_deref(), Some("openai.responses"));
     }
 
     #[tokio::test]

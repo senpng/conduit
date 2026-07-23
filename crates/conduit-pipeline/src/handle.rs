@@ -437,7 +437,8 @@ impl PipelineHandle {
             match result {
                 Ok((resp, loss)) => {
                     let attempt_ms = elapsed_ms(attempt_started);
-                    ctx.loss_report = loss;
+                    ctx.loss_report.merge(loss);
+                    log_codec_losses(&ctx);
                     ctx.merge_usage(&resp.usage);
                     let cost_usd = egress::compute_cost(
                         &resolved.provider_kind,
@@ -645,7 +646,8 @@ impl PipelineHandle {
 
             match result {
                 Ok((stream, loss)) => {
-                    ctx.loss_report = loss;
+                    ctx.loss_report.merge(loss);
+                    log_codec_losses(&ctx);
                     self.remember_session_affinity(&ctx, &resolved);
 
                     let preferred = self.session_preferred(&ctx);
@@ -684,6 +686,11 @@ impl PipelineHandle {
                             pool_id: route_meta.pool_id,
                             selected_reason: route_meta.selected_reason,
                             prior_attempts,
+                            loss_count: ctx.loss_report.len() as u32,
+                            wire_format: ctx
+                                .ingress_wire
+                                .as_ref()
+                                .map(|w| w.format.as_str().to_string()),
                         },
                     );
                     return Ok(PipelineResult::Streaming(Box::pin(instrumented)));
@@ -987,12 +994,38 @@ impl PipelineHandle {
             affinity_hit: route_meta.affinity_hit,
             pool_id: route_meta.pool_id,
             selected_reason: route_meta.selected_reason,
+            loss_count: ctx.loss_report.len() as u32,
+            wire_format: ctx
+                .ingress_wire
+                .as_ref()
+                .map(|w| w.format.as_str().to_string()),
             attempts: attempts.to_vec(),
         };
         if let Err(e) = self.deps.quota.record(&req).await {
             warn!(error = %e, request_id = %ctx.request_id, "usage record failed");
         }
     }
+}
+
+/// Emit a structured warn when codec translation degraded any fields.
+/// Ledger only stores `loss_count`; field detail lives here for operators.
+fn log_codec_losses(ctx: &PipelineContext) {
+    if ctx.loss_report.is_empty() {
+        return;
+    }
+    warn!(
+        request_id = %ctx.request_id,
+        alias = %ctx.request.alias,
+        wire = %ctx
+            .ingress_wire
+            .as_ref()
+            .map(|w| w.format.as_str())
+            .unwrap_or(""),
+        loss_count = ctx.loss_report.len(),
+        loss_fields = %ctx.loss_report.field_names(),
+        loss_summary = %ctx.loss_report.summary(),
+        "codec translation losses"
+    );
 }
 
 struct RouteObs {

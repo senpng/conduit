@@ -281,7 +281,7 @@ impl<'a> UsageRepo<'a> {
                    status, error_class, http_status, finish_reason,
                    duration_ms, ttfb_ms, route_strategy,
                    attempt_no, attempt_count, session_id, affinity_hit,
-                   pool_id, selected_reason
+                   pool_id, selected_reason, loss_count, wire_format
             FROM usage_records
             WHERE (?1 IS NULL OR downstream_key_id = ?1)
               AND (?2 IS NULL OR date(replace(substr(ts, 1, 19), 'T', ' '), ?4) LIKE ?2)
@@ -734,6 +734,8 @@ impl UsageRecordRow {
             affinity_hit: None,
             pool_id: None,
             selected_reason: None,
+            loss_count: 0,
+            wire_format: None,
         }
     }
 }
@@ -838,10 +840,10 @@ where
                status, error_class, http_status, finish_reason,
                duration_ms, ttfb_ms, route_strategy,
                attempt_no, attempt_count, session_id, affinity_hit,
-               pool_id, selected_reason
+               pool_id, selected_reason, loss_count, wire_format
            ) VALUES (
                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
            )"#,
     )
     .bind(&row.id)
@@ -873,6 +875,8 @@ where
     .bind(row.affinity_hit.map(|b| b as i32))
     .bind(&row.pool_id)
     .bind(&row.selected_reason)
+    .bind(row.loss_count as i64)
+    .bind(&row.wire_format)
     .execute(ex)
     .await
     .map_err(|e| StoreError::Sqlx(e.to_string()))?;
@@ -957,6 +961,8 @@ fn map_row(r: sqlx::sqlite::SqliteRow) -> UsageRecordRow {
             .map(|b| b != 0),
         pool_id: r.try_get("pool_id").ok().flatten(),
         selected_reason: r.try_get("selected_reason").ok().flatten(),
+        loss_count: r.try_get::<i64, _>("loss_count").unwrap_or(0) as u32,
+        wire_format: r.try_get("wire_format").ok().flatten(),
     }
 }
 

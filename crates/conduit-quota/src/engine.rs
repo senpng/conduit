@@ -196,6 +196,8 @@ mod tests {
             affinity_hit: None,
             pool_id: None,
             selected_reason: Some("fixed".into()),
+            loss_count: 0,
+            wire_format: Some("openai.chat".into()),
             attempts: Vec::new(),
         }
     }

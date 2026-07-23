@@ -3494,6 +3494,20 @@ fn draw_usage_record_detail(
                 u.error_class.clone().unwrap_or_else(|| "—".into()),
             ),
             (
+                "wire",
+                u.wire_format
+                    .clone()
+                    .unwrap_or_else(|| "—".into()),
+            ),
+            (
+                "loss",
+                if u.loss_count == 0 {
+                    "0".into()
+                } else {
+                    format!("{}  (fields in daemon logs)", u.loss_count)
+                },
+            ),
+            (
                 "duration",
                 u.duration_ms
                     .map(|ms| format!("{ms}ms"))

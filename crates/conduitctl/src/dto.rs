@@ -259,6 +259,11 @@ pub struct UsageRecordView {
     pub affinity_hit: Option<bool>,
     pub pool_id: Option<String>,
     pub selected_reason: Option<String>,
+    /// Codec degradation warning count (`LossReport::len`). Field detail is in daemon logs.
+    #[serde(default)]
+    pub loss_count: u32,
+    /// Client ingress wire protocol (`openai.chat` / `openai.responses` / `anthropic.messages`).
+    pub wire_format: Option<String>,
 }
 
 fn default_ok_status() -> String {
@@ -787,6 +792,20 @@ mod tests {
         assert_eq!(u.duration_ms, Some(90));
         assert_eq!(u.attempt_count, 2);
         assert_eq!(u.selected_reason.as_deref(), Some("retry"));
+        assert_eq!(u.loss_count, 0);
+        assert!(u.wire_format.is_none());
+    }
+
+    #[test]
+    fn usage_record_deserializes_wire_format_and_loss_count() {
+        let raw = r#"{
+            "id":"1","ts":"t","request_id":"r",
+            "status":"ok","cost_usd":0.01,"stream":true,
+            "wire_format":"openai.responses","loss_count":2
+        }"#;
+        let u: UsageRecordView = serde_json::from_str(raw).unwrap();
+        assert_eq!(u.wire_format.as_deref(), Some("openai.responses"));
+        assert_eq!(u.loss_count, 2);
     }
 
     #[test]

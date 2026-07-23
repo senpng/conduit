@@ -86,6 +86,11 @@ pub struct QuotaRecordRequest {
     pub affinity_hit: Option<bool>,
     pub pool_id: Option<String>,
     pub selected_reason: Option<String>,
+    /// Number of codec degradation warnings accumulated for this request
+    /// ([`conduit_ir::loss::LossReport`] length). Details stay in logs, not the ledger.
+    pub loss_count: u32,
+    /// Client ingress wire protocol (`openai.chat` / `openai.responses` / `anthropic.messages`).
+    pub wire_format: Option<String>,
     /// Per-try history (may be empty for single-shot success).
     pub attempts: Vec<QuotaAttemptRecord>,
 }

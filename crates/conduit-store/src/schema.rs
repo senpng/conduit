@@ -202,6 +202,11 @@ pub struct UsageRecordRow {
     pub affinity_hit: Option<bool>,
     pub pool_id: Option<String>,
     pub selected_reason: Option<String>,
+    /// Count of codec degradation warnings (`LossReport::len`). Details are logged only.
+    #[serde(default)]
+    pub loss_count: u32,
+    /// Client ingress wire protocol (`openai.chat` / `openai.responses` / `anthropic.messages`).
+    pub wire_format: Option<String>,
 }
 
 fn default_usage_status() -> String {

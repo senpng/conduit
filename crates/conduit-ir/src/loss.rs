@@ -50,6 +50,26 @@ impl LossReport {
     pub fn len(&self) -> usize {
         self.warnings.len()
     }
+
+    /// Comma-separated unique field paths that were degraded (for logs / metrics labels).
+    pub fn field_names(&self) -> String {
+        let mut seen = Vec::new();
+        for w in &self.warnings {
+            if !seen.iter().any(|s| s == &w.field) {
+                seen.push(w.field.clone());
+            }
+        }
+        seen.join(",")
+    }
+
+    /// Compact one-line summary: `field: original → degraded` joined by `; `.
+    pub fn summary(&self) -> String {
+        self.warnings
+            .iter()
+            .map(|w| format!("{}: {} → {}", w.field, w.original, w.degraded_to))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -109,5 +129,16 @@ mod tests {
         let back: LossReport = serde_json::from_str(&json).unwrap();
         assert_eq!(back.len(), 1);
         assert_eq!(back.warnings[0].field, "temperature");
+    }
+
+    #[test]
+    fn field_names_and_summary() {
+        let mut r = LossReport::default();
+        r.add("tool_choice", "AnyOf", "Required", "unsupported");
+        r.add("tool_choice", "AnyOf", "Required", "again");
+        r.add("choices", "2 choices", "choices[0] only", "n>1");
+        assert_eq!(r.field_names(), "tool_choice,choices");
+        assert!(r.summary().contains("tool_choice: AnyOf → Required"));
+        assert!(r.summary().contains("choices: 2 choices → choices[0] only"));
     }
 }

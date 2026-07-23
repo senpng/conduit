@@ -78,6 +78,8 @@ impl PipelineContext {
             request.id.clone()
         };
 
+        // Seed from ingress decode losses (if any), then merge upstream codec losses later.
+        let loss_report = request.loss_report.clone();
         Self {
             request_id,
             started_at: Utc::now(),
@@ -86,7 +88,7 @@ impl PipelineContext {
             routing_table,
             resolved: None,
             usage: Usage::default(),
-            loss_report: LossReport::default(),
+            loss_report,
             attempt_no: 0,
             ingress_wire: Some(IngressWire {
                 format: wire_format,

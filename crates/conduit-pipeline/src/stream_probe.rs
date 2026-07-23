@@ -41,6 +41,10 @@ pub struct StreamRecordMeta {
     pub selected_reason: Option<String>,
     /// Failed (or prior) attempts before this stream was opened.
     pub prior_attempts: Vec<QuotaAttemptRecord>,
+    /// Codec degradation count at stream open (ingress + upstream encode).
+    pub loss_count: u32,
+    /// Client ingress wire protocol at stream open.
+    pub wire_format: Option<String>,
 }
 
 /// Wraps a provider stream; on completion records usage/cost to the quota ledger.
@@ -232,6 +236,8 @@ impl UsageTrackingStream {
             affinity_hit: self.meta.affinity_hit,
             pool_id: self.meta.pool_id.clone(),
             selected_reason: self.meta.selected_reason.clone(),
+            loss_count: self.meta.loss_count,
+            wire_format: self.meta.wire_format.clone(),
             attempts,
         };
         let quota = self.quota.clone();
@@ -387,6 +393,8 @@ mod tests {
             pool_id: None,
             selected_reason: Some("fixed".into()),
             prior_attempts: Vec::new(),
+            loss_count: 0,
+            wire_format: Some("openai.chat".into()),
         }
     }
 

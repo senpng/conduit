@@ -86,7 +86,9 @@ CREATE TABLE IF NOT EXISTS usage_records (
     session_id           TEXT,
     affinity_hit         INTEGER,
     pool_id              TEXT,
-    selected_reason      TEXT
+    selected_reason      TEXT,
+    loss_count           INTEGER NOT NULL DEFAULT 0,
+    wire_format          TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_usage_ts
@@ -214,6 +216,8 @@ async fn migrate_usage_request_ledger(pool: &SqlitePool) -> Result<(), StoreErro
         "ALTER TABLE usage_records ADD COLUMN affinity_hit INTEGER",
         "ALTER TABLE usage_records ADD COLUMN pool_id TEXT",
         "ALTER TABLE usage_records ADD COLUMN selected_reason TEXT",
+        "ALTER TABLE usage_records ADD COLUMN loss_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE usage_records ADD COLUMN wire_format TEXT",
     ] {
         if let Err(error) = sqlx::query(sql).execute(pool).await {
             if !error.to_string().contains("duplicate column name") {
