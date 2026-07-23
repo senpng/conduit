@@ -7,5 +7,8 @@ pub mod sse;
 
 pub use auth::{AuthStrategy, BearerAuth, CompositeAuth, HeaderAuth};
 pub use client::HttpClientFactory;
-pub use provider::{ProviderClient, ProviderClientConfig, UpstreamPath};
+pub use provider::{ProviderClient, ProviderClientConfig, TimeoutConfig, UpstreamPath};
 pub use rate_limit::RateLimitHeaderSink;
+pub use sse::{
+    classify_transport_message, map_reqwest_error, response_to_sse, StreamTimeoutOpts,
+};

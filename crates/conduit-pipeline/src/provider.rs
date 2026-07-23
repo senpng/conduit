@@ -12,7 +12,7 @@ use conduit_ir::{
     error::ProviderError,
     loss::LossReport,
 };
-use conduit_upstream::provider::{ProviderClient, ProviderClientConfig};
+use conduit_upstream::provider::{ProviderClient, ProviderClientConfig, TimeoutConfig};
 use conduit_upstream::RateLimitHeaderSink;
 use futures::stream::{BoxStream, StreamExt};
 use secrecy::SecretString;
@@ -523,6 +523,7 @@ async fn claude_oauth_stream(
         &resolved.request_overrides,
         rate_limit_sink,
         &resolved.provider_id,
+        TimeoutConfig::default().stream_timeout_opts(),
     )
     .await
 }

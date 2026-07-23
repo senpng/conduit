@@ -23,7 +23,7 @@ use crate::{
     claude_oauth,
     client::HttpClientFactory,
     rate_limit::{self, RateLimitHeaderSink},
-    sse::response_to_sse,
+    sse::{map_reqwest_error, response_to_sse},
 };
 
 pub type ChatResult = (CanonicalChatResponse, LossReport);
@@ -39,8 +39,11 @@ pub struct TimeoutConfig {
     pub connect_ms: u64,
     /// Max time from sending request to receiving first byte of response body.
     pub first_byte_ms: u64,
-    /// Max time with no data received during a streaming response.
+    /// Max quiet period with no SSE data during a streaming response.
     pub stream_idle_ms: u64,
+    /// Hard cap for a streaming response after headers are received.
+    /// Aligns with gateway `TimeoutLayer` (300s) by default.
+    pub stream_overall_ms: u64,
     /// Overall hard cap for the entire request (non-streaming).
     pub overall_ms: u64,
 }
@@ -51,7 +54,18 @@ impl Default for TimeoutConfig {
             connect_ms: 5_000,
             first_byte_ms: 30_000,
             stream_idle_ms: 60_000,
+            stream_overall_ms: 300_000,
             overall_ms: 120_000,
+        }
+    }
+}
+
+impl TimeoutConfig {
+    /// Idle + overall options for an open SSE body.
+    pub fn stream_timeout_opts(&self) -> crate::sse::StreamTimeoutOpts {
+        crate::sse::StreamTimeoutOpts {
+            idle_ms: self.stream_idle_ms,
+            overall_ms: self.stream_overall_ms,
         }
     }
 }
@@ -285,18 +299,15 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
 
         let started = std::time::Instant::now();
         let resp = builder.send().await.map_err(|e| {
+            let err = map_reqwest_error(e);
             debug!(
                 provider = %self.config.id,
                 url = %url,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                error = %e,
+                error = %err,
                 "upstream compact transport error"
             );
-            if e.is_timeout() {
-                ProviderError::Timeout
-            } else {
-                ProviderError::Network(e.to_string())
-            }
+            err
         })?;
 
         rate_limit::emit(
@@ -453,20 +464,16 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
 
         let started = std::time::Instant::now();
         let resp = builder.send().await.map_err(|e| {
+            let err = map_reqwest_error(e);
             debug!(
                 request_id = %req.id,
                 provider = %self.config.id,
                 url = %url,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                error = %e,
-                is_timeout = e.is_timeout(),
+                error = %err,
                 "upstream chat transport error"
             );
-            if e.is_timeout() {
-                ProviderError::Timeout
-            } else {
-                ProviderError::Network(e.to_string())
-            }
+            err
         })?;
 
         // Capture rate-limit headers before consuming the body.
@@ -543,6 +550,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
                 &self.config.request_overrides,
                 self.config.rate_limit_sink.clone(),
                 &self.config.id,
+                self.config.timeouts.stream_timeout_opts(),
             )
             .await;
         }
@@ -557,6 +565,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         apply_request_overrides(&mut body, &self.config.request_overrides);
 
         let body_bytes = body.to_string().len();
+        let stream_opts = self.config.timeouts.stream_timeout_opts();
         debug!(
             request_id = %req.id,
             provider = %self.config.id,
@@ -567,6 +576,8 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
             body_bytes,
             message_count = req.messages.len(),
             first_byte_ms = self.config.timeouts.first_byte_ms,
+            stream_idle_ms = stream_opts.idle_ms,
+            stream_overall_ms = stream_opts.overall_ms,
             "upstream chat_stream request"
         );
 
@@ -581,30 +592,27 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         )
         .await
         .map_err(|_| {
-            debug!(
+            warn!(
                 request_id = %req.id,
                 provider = %self.config.id,
                 url = %url,
                 elapsed_ms = started.elapsed().as_millis() as u64,
+                first_byte_ms = self.config.timeouts.first_byte_ms,
                 "upstream chat_stream first-byte timeout"
             );
             ProviderError::Timeout
         })?
         .map_err(|e| {
-            debug!(
+            let err = map_reqwest_error(e);
+            warn!(
                 request_id = %req.id,
                 provider = %self.config.id,
                 url = %url,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                error = %e,
-                is_timeout = e.is_timeout(),
+                error = %err,
                 "upstream chat_stream transport error"
             );
-            if e.is_timeout() {
-                ProviderError::Timeout
-            } else {
-                ProviderError::Network(e.to_string())
-            }
+            err
         })?;
 
         rate_limit::emit(
@@ -628,7 +636,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
             "upstream chat_stream headers ok; beginning SSE"
         );
 
-        let sse = response_to_sse(resp);
+        let sse = response_to_sse(resp, stream_opts);
         let mut decode_state = C::StreamState::default();
         let provider_id = self.config.id.clone();
         let stream = sse
@@ -651,7 +659,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
                     }
                 }
                 Err(e) => {
-                    debug!(
+                    warn!(
                         provider = %provider_id,
                         error = %e,
                         "upstream SSE event error"
@@ -680,7 +688,7 @@ impl<C: WireCodec + 'static> ProviderClient<C> {
         let resp = builder
             .send()
             .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+            .map_err(map_reqwest_error)?;
         if !resp.status().is_success() {
             return Ok(vec![]);
         }

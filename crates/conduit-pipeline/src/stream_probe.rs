@@ -279,10 +279,12 @@ impl Stream for UsageTrackingStream {
             }
             Poll::Ready(Some(Err(e))) => {
                 // Clone error for ledger; still surface original to client.
-                debug!(
+                // INFO/WARN so operators see timeout vs network without raising log level.
+                warn!(
                     request_id = %self.meta.request_id,
                     provider_id = %self.meta.provider_id,
                     error = %e,
+                    error_class = %provider_error_class(&e),
                     "stream terminal error"
                 );
                 self.terminal_error = Some(clone_provider_error(&e));

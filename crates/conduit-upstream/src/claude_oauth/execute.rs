@@ -6,6 +6,7 @@ use std::{collections::HashMap, time::Duration};
 
 use conduit_codec::WireCodec;
 use conduit_ir::{canonical::CanonicalChatRequest, error::ProviderError};
+use eventsource_stream::Eventsource;
 use futures::stream::{StreamExt, TryStreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Map, Value};
@@ -22,6 +23,7 @@ use super::{
 use crate::{
     provider::{apply_request_overrides, ChatResult, StreamResult},
     rate_limit::{self, RateLimitHeaderSink},
+    sse::{classify_transport_message, with_stream_timeouts, StreamTimeoutOpts},
 };
 
 fn map_status(status: u16, body: &str) -> ProviderError {
@@ -32,6 +34,22 @@ fn map_status(status: u16, body: &str) -> ProviderError {
         413 => ProviderError::ContextLengthExceeded,
         s if s >= 500 => ProviderError::Upstream5xx(format!("{s}: {body}")),
         s => ProviderError::InvalidRequest(format!("HTTP {s}: {body}")),
+    }
+}
+
+/// Map a wreq (Chrome-TLS) error into `ProviderError`.
+fn map_wreq_error(e: wreq::Error) -> ProviderError {
+    if e.is_timeout() {
+        ProviderError::Timeout
+    } else {
+        classify_transport_message(&e.to_string())
+    }
+}
+
+fn map_eventsource_error(e: eventsource_stream::EventStreamError<ProviderError>) -> ProviderError {
+    match e {
+        eventsource_stream::EventStreamError::Transport(inner) => inner,
+        other => classify_transport_message(&other.to_string()),
     }
 }
 
@@ -130,19 +148,15 @@ pub async fn chat_oauth<C: WireCodec + 'static>(
 
     let started = std::time::Instant::now();
     let resp = builder.send().await.map_err(|e| {
-        debug!(
+        let err = map_wreq_error(e);
+        warn!(
             provider_id,
             url = %url,
             elapsed_ms = started.elapsed().as_millis() as u64,
-            error = %e,
-            is_timeout = e.is_timeout(),
+            error = %err,
             "claude_oauth chat transport error"
         );
-        if e.is_timeout() {
-            ProviderError::Timeout
-        } else {
-            ProviderError::Network(e.to_string())
-        }
+        err
     })?;
 
     // Success and error responses may carry anthropic-ratelimit-* headers.
@@ -197,6 +211,7 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
     request_overrides: &Map<String, Value>,
     rate_limit_sink: Option<RateLimitHeaderSink>,
     provider_id: &str,
+    stream_timeouts: StreamTimeoutOpts,
 ) -> Result<StreamResult, ProviderError> {
     debug_assert!(is_claude_oauth_kind(kind));
     let url = messages_url(base_url);
@@ -220,6 +235,8 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
         message_count = req.messages.len(),
         body_bytes = prepared.body.to_string().len(),
         extra_betas = prepared.extra_betas.len(),
+        stream_idle_ms = stream_timeouts.idle_ms,
+        stream_overall_ms = stream_timeouts.overall_ms,
         "claude_oauth chat_stream request"
     );
 
@@ -230,19 +247,15 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
 
     let started = std::time::Instant::now();
     let resp = builder.send().await.map_err(|e| {
-        debug!(
+        let err = map_wreq_error(e);
+        warn!(
             provider_id,
             url = %url,
             elapsed_ms = started.elapsed().as_millis() as u64,
-            error = %e,
-            is_timeout = e.is_timeout(),
+            error = %err,
             "claude_oauth chat_stream transport error"
         );
-        if e.is_timeout() {
-            ProviderError::Timeout
-        } else {
-            ProviderError::Network(e.to_string())
-        }
+        err
     })?;
 
     rate_limit::emit(
@@ -271,22 +284,38 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
         "claude_oauth chat_stream headers ok; beginning SSE"
     );
 
-    use eventsource_stream::Eventsource;
-
     let byte_stream = resp
         .bytes_stream()
-        .map_err(|e| ProviderError::Network(e.to_string()));
+        .map_err(|e| classify_transport_message(&e.to_string()));
 
     let mut decode_state = C::StreamState::default();
     let provider_id = provider_id.to_string();
-    let stream = byte_stream
-        .eventsource()
-        .map_err(|e| ProviderError::Network(e.to_string()))
+    let sse = with_stream_timeouts(
+        byte_stream
+            .eventsource()
+            .map_err(map_eventsource_error)
+            .filter_map(|result| async move {
+                match result {
+                    Ok(event) => {
+                        if event.data.is_empty() {
+                            None
+                        } else if event.data == "[DONE]" {
+                            Some(Ok("[DONE]".to_string()))
+                        } else {
+                            Some(Ok(event.data))
+                        }
+                    }
+                    Err(e) => Some(Err(e)),
+                }
+            }),
+        stream_timeouts,
+    );
+
+    let stream = sse
         .map(move |result| {
             let tool_reverse = tool_reverse.clone();
             match result {
-                Ok(event) => {
-                    let mut data = event.data;
+                Ok(mut data) => {
                     if data.is_empty() || data == "[DONE]" {
                         return Ok(Vec::new());
                     }
@@ -312,7 +341,7 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
                     }
                 }
                 Err(e) => {
-                    debug!(
+                    warn!(
                         provider_id = %provider_id,
                         error = %e,
                         "claude_oauth SSE event error"
