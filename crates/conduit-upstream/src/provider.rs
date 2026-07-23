@@ -39,7 +39,8 @@ pub struct TimeoutConfig {
     pub connect_ms: u64,
     /// Max time from sending request to receiving first byte of response body.
     pub first_byte_ms: u64,
-    /// Max quiet period with no SSE data during a streaming response.
+    /// Max quiet period with no upstream body bytes during a streaming response.
+    /// Idle is measured on the raw byte stream so SSE comment keepalives count.
     pub stream_idle_ms: u64,
     /// Hard cap for a streaming response after headers are received.
     /// Aligns with gateway `TimeoutLayer` (300s) by default.
@@ -53,7 +54,9 @@ impl Default for TimeoutConfig {
         Self {
             connect_ms: 5_000,
             first_byte_ms: 30_000,
-            stream_idle_ms: 60_000,
+            // 3 minutes: reasoning models often pause between tokens / rounds.
+            // Still well under stream_overall_ms so truly stuck streams die.
+            stream_idle_ms: 180_000,
             stream_overall_ms: 300_000,
             overall_ms: 120_000,
         }

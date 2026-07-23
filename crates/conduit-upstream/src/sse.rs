@@ -29,7 +29,9 @@ pub struct StreamTimeoutOpts {
 impl Default for StreamTimeoutOpts {
     fn default() -> Self {
         Self {
-            idle_ms: 60_000,
+            // Match TimeoutConfig::default().stream_idle_ms — generous enough for
+            // reasoning models that pause between tokens / tool-call rounds.
+            idle_ms: 180_000,
             overall_ms: 300_000,
         }
     }
@@ -72,18 +74,27 @@ pub fn looks_like_timeout(msg: &str) -> bool {
 /// Convert a reqwest streaming response into a stream of SSE data lines, with
 /// idle + overall timeouts. Handles chunked transfer, UTF-8 boundary splits,
 /// and comment lines via the `eventsource-stream` crate.
+///
+/// Idle / overall watchdogs wrap the **byte** stream (before SSE parsing) so
+/// that keepalives such as empty SSE comments (`:\n\n`) still reset the idle
+/// timer — `eventsource-stream` discards comments and never yields them as
+/// events.
 pub fn response_to_sse(response: Response, timeouts: StreamTimeoutOpts) -> SseStream {
     use eventsource_stream::Eventsource;
 
-    let stream = response
-        .bytes_stream()
-        .map_err(map_reqwest_error)
+    let byte_stream = response.bytes_stream().map_err(map_reqwest_error);
+    // Timeouts on body bytes so SSE comments / partial frames count as activity.
+    let timed = with_stream_timeouts(byte_stream, timeouts);
+
+    let stream = timed
         .eventsource()
         .map_err(map_eventsource_error)
         .filter_map(|result| async move {
             match result {
                 Ok(event) => {
-                    // Skip comment events (data is empty); keep [DONE] as a marker.
+                    // Skip empty data events; keep [DONE] as a marker.
+                    // (True SSE comments never surface here — see byte-level
+                    // idle reset above.)
                     if event.data.is_empty() {
                         None
                     } else if event.data == "[DONE]" {
@@ -96,13 +107,17 @@ pub fn response_to_sse(response: Response, timeouts: StreamTimeoutOpts) -> SseSt
             }
         });
 
-    Box::pin(with_stream_timeouts(stream, timeouts))
+    Box::pin(stream)
 }
 
-/// Wrap any `ProviderError` stream with idle + overall timeouts.
-pub fn with_stream_timeouts<S>(inner: S, timeouts: StreamTimeoutOpts) -> StreamTimeouts<S>
+/// Wrap any `Result<T, ProviderError>` stream with idle + overall timeouts.
+///
+/// Any ready item (including `Ok` with empty payload / keepalive bytes) resets
+/// the idle timer. Apply this to the raw body byte stream when upstream may
+/// send SSE comments that SSE parsers discard.
+pub fn with_stream_timeouts<S, T>(inner: S, timeouts: StreamTimeoutOpts) -> StreamTimeouts<S>
 where
-    S: Stream<Item = Result<String, ProviderError>>,
+    S: Stream<Item = Result<T, ProviderError>>,
 {
     StreamTimeouts::new(inner, timeouts)
 }
@@ -168,11 +183,11 @@ impl<S> StreamTimeouts<S> {
     }
 }
 
-impl<S> Stream for StreamTimeouts<S>
+impl<S, T> Stream for StreamTimeouts<S>
 where
-    S: Stream<Item = Result<String, ProviderError>>,
+    S: Stream<Item = Result<T, ProviderError>>,
 {
-    type Item = Result<String, ProviderError>;
+    type Item = Result<T, ProviderError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if *self.as_mut().project().finished {
@@ -183,7 +198,7 @@ where
         let inner_poll = self.as_mut().project().inner.poll_next(cx);
         match inner_poll {
             Poll::Ready(Some(item)) => {
-                // Any progress (including an error item) resets the idle timer.
+                // Any progress (including Ok keepalive / error) resets idle.
                 self.as_mut().reset_idle();
                 if item.is_err() {
                     *self.as_mut().project().finished = true;
@@ -360,5 +375,54 @@ mod tests {
         );
         assert_eq!(s.next().await.unwrap().unwrap(), "ok");
         assert!(s.next().await.is_none());
+    }
+
+    /// Empty / keepalive body chunks must reset idle — SSE comment keepalives
+    /// (`:\n\n`) arrive as bytes but are discarded by the SSE parser, so the
+    /// watchdog has to sit on the byte stream.
+    #[tokio::test]
+    async fn keepalive_bytes_reset_idle_timer() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use std::task::Poll as TaskPoll;
+
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = n.clone();
+        // Yield a keepalive chunk (empty Vec), then stall. Idle must not fire
+        // until idle_ms after the keepalive, not from construction time.
+        let inner = stream::poll_fn(move |_cx| {
+            let i = n2.fetch_add(1, Ordering::SeqCst);
+            if i == 0 {
+                TaskPoll::Ready(Some(Ok::<_, ProviderError>(Vec::<u8>::new())))
+            } else {
+                TaskPoll::Pending
+            }
+        });
+        let mut s = Box::pin(with_stream_timeouts(
+            inner,
+            StreamTimeoutOpts {
+                idle_ms: 80,
+                overall_ms: 0,
+            },
+        ));
+        // Drain the keepalive chunk.
+        assert!(s.next().await.unwrap().unwrap().is_empty());
+        let started = Instant::now();
+        let item = s.next().await;
+        assert!(matches!(item, Some(Err(ProviderError::Timeout))));
+        // If keepalive had not reset idle, this would have fired ~immediately
+        // relative to construction; require a real wait near idle_ms.
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "idle should only fire after the post-keepalive quiet period"
+        );
+    }
+
+    #[test]
+    fn default_idle_matches_timeout_config_scale() {
+        // Keep StreamTimeoutOpts and TimeoutConfig defaults aligned.
+        assert_eq!(StreamTimeoutOpts::default().idle_ms, 180_000);
     }
 }

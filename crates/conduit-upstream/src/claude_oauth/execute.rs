@@ -284,32 +284,33 @@ pub async fn chat_oauth_stream<C: WireCodec + 'static>(
         "claude_oauth chat_stream headers ok; beginning SSE"
     );
 
-    let byte_stream = resp
-        .bytes_stream()
-        .map_err(|e| classify_transport_message(&e.to_string()));
+    // Timeouts on body bytes so SSE comment keepalives reset idle (the SSE
+    // parser discards comments and never yields them as events).
+    let byte_stream = with_stream_timeouts(
+        resp.bytes_stream()
+            .map_err(|e| classify_transport_message(&e.to_string())),
+        stream_timeouts,
+    );
 
     let mut decode_state = C::StreamState::default();
     let provider_id = provider_id.to_string();
-    let sse = with_stream_timeouts(
-        byte_stream
-            .eventsource()
-            .map_err(map_eventsource_error)
-            .filter_map(|result| async move {
-                match result {
-                    Ok(event) => {
-                        if event.data.is_empty() {
-                            None
-                        } else if event.data == "[DONE]" {
-                            Some(Ok("[DONE]".to_string()))
-                        } else {
-                            Some(Ok(event.data))
-                        }
+    let sse = byte_stream
+        .eventsource()
+        .map_err(map_eventsource_error)
+        .filter_map(|result| async move {
+            match result {
+                Ok(event) => {
+                    if event.data.is_empty() {
+                        None
+                    } else if event.data == "[DONE]" {
+                        Some(Ok("[DONE]".to_string()))
+                    } else {
+                        Some(Ok(event.data))
                     }
-                    Err(e) => Some(Err(e)),
                 }
-            }),
-        stream_timeouts,
-    );
+                Err(e) => Some(Err(e)),
+            }
+        });
 
     let stream = sse
         .map(move |result| {
