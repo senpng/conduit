@@ -310,8 +310,11 @@ pub async fn run(
     let gateway_addr: SocketAddr = format!("127.0.0.1:{}", port).parse()?;
     let console_addr: SocketAddr = format!("127.0.0.1:{}", cfg.gateway.console_port).parse()?;
 
-    info!(%gateway_addr, "gateway listening");
-    info!(%console_addr, "console API listening");
+    // Cleartext only (loopback). axum::serve auto-detects HTTP/1.1 and h2c
+    // (prior-knowledge). TLS/HTTPS for external clients belongs on a reverse
+    // proxy; this process does not terminate TLS.
+    info!(%gateway_addr, "gateway listening (HTTP/1.1 + h2c)");
+    info!(%console_addr, "console API listening (HTTP/1.1 + h2c)");
 
     let gateway_listener = TcpListener::bind(gateway_addr).await?;
     let console_listener = TcpListener::bind(console_addr).await?;
