@@ -11,7 +11,11 @@ pub use encoder::{
     encode_message_stop_frame, finish_reason_to_anthropic, AnthropicStreamEncoder,
     GPT_THINKING_SIGNATURE,
 };
-use serde_json::Value;
+use encoder::{
+    content_block_stop, input_json_delta, signature_delta, sse_event, text_block_start, text_delta,
+    thinking_block_start, thinking_delta, tool_use_start,
+};
+use serde_json::{json, Value};
 pub use state::{decode_event, AnthropicStreamState};
 
 /// Decode a single Anthropic SSE line pair.
@@ -28,89 +32,65 @@ pub fn decode_chunk_event(event: &str, data: &str) -> Result<Vec<CanonicalChunk>
 ///
 /// Prefer [`AnthropicStreamEncoder`] for Claude Code / client-facing streams.
 pub fn encode_chunk(chunk: &CanonicalChunk, _resp_id: &str) -> Option<String> {
-    use serde_json::json;
+    let idx = chunk.block_index;
 
-    // Tool use start
+    // Tool use start (id/name present, no delta/finish) — before bare kind match
+    // so ToolUse kind with ids reuses the same frame builder.
     if chunk.delta.is_none()
         && chunk.finish_reason.is_none()
         && (chunk.tool_use_id.is_some() || chunk.tool_name.is_some())
     {
-        let block = json!({
-            "type": "tool_use",
-            "id": chunk.tool_use_id.as_deref().unwrap_or(""),
-            "name": chunk.tool_name.as_deref().unwrap_or(""),
-            "input": {}
-        });
-        let data = json!({
-            "type": "content_block_start",
-            "index": chunk.block_index,
-            "content_block": block,
-        });
-        return Some(format!("event: content_block_start\ndata: {data}\n\n"));
+        return Some(tool_use_start(
+            idx,
+            chunk.tool_use_id.as_deref().unwrap_or(""),
+            chunk.tool_name.as_deref().unwrap_or(""),
+        ));
     }
 
-    // Block start (kind set, no delta, no finish)
+    // Bare block start (kind set, no delta, no finish)
     if let (Some(kind), None) = (&chunk.block_kind, &chunk.delta) {
         if chunk.finish_reason.is_none() {
-            let block = match kind {
-                BlockKind::Text => json!({"type": "text", "text": ""}),
-                BlockKind::Thinking => json!({"type": "thinking", "thinking": ""}),
-                BlockKind::ToolUse => json!({
-                    "type": "tool_use",
-                    "id": chunk.tool_use_id.as_deref().unwrap_or(""),
-                    "name": chunk.tool_name.as_deref().unwrap_or(""),
-                    "input": {}
-                }),
-                _ => json!({"type": "text", "text": ""}),
-            };
-            let data = json!({
-                "type": "content_block_start",
-                "index": chunk.block_index,
-                "content_block": block,
+            return Some(match kind {
+                BlockKind::Thinking => thinking_block_start(idx),
+                BlockKind::ToolUse => tool_use_start(
+                    idx,
+                    chunk.tool_use_id.as_deref().unwrap_or(""),
+                    chunk.tool_name.as_deref().unwrap_or(""),
+                ),
+                // Text and unknown kinds → empty text block.
+                _ => text_block_start(idx),
             });
-            return Some(format!("event: content_block_start\ndata: {data}\n\n"));
         }
     }
 
     // Block delta
     if let Some(delta) = &chunk.delta {
-        let delta_val = match delta {
-            BlockDelta::TextDelta { text } => json!({"type": "text_delta", "text": text}),
+        return match delta {
+            BlockDelta::TextDelta { text } => Some(text_delta(idx, text)),
             BlockDelta::InputJsonDelta { partial_json } => {
-                json!({"type": "input_json_delta", "partial_json": partial_json})
+                Some(input_json_delta(idx, partial_json))
             }
-            BlockDelta::ThinkingDelta { thinking } => {
-                json!({"type": "thinking_delta", "thinking": thinking})
-            }
-            BlockDelta::SignatureDelta { signature } => {
-                json!({"type": "signature_delta", "signature": signature})
-            }
-            _ => return None,
+            BlockDelta::ThinkingDelta { thinking } => Some(thinking_delta(idx, thinking)),
+            BlockDelta::SignatureDelta { signature } => Some(signature_delta(idx, signature)),
+            _ => None,
         };
-        let data = json!({
-            "type": "content_block_delta",
-            "index": chunk.block_index,
-            "delta": delta_val,
-        });
-        return Some(format!("event: content_block_delta\ndata: {data}\n\n"));
     }
 
     // Finish → message_delta
     if let Some(fr) = &chunk.finish_reason {
-        let stop_str = finish_reason_to_anthropic(fr);
-        let usage_val = chunk
+        let usage = chunk
             .usage
-            .as_ref()
-            .map(anthropic_usage_json)
-            .unwrap_or_else(|| {
-                anthropic_usage_json(&conduit_ir::canonical::Usage::default())
-            });
+            .clone()
+            .unwrap_or_default();
         let data = json!({
             "type": "message_delta",
-            "delta": {"stop_reason": stop_str, "stop_sequence": null},
-            "usage": usage_val,
+            "delta": {
+                "stop_reason": finish_reason_to_anthropic(fr),
+                "stop_sequence": null,
+            },
+            "usage": anthropic_usage_json(&usage),
         });
-        return Some(format!("event: message_delta\ndata: {data}\n\n"));
+        return Some(sse_event("message_delta", &data));
     }
 
     // content_block_stop (empty marker with block_index)
@@ -120,8 +100,7 @@ pub fn encode_chunk(chunk: &CanonicalChunk, _resp_id: &str) -> Option<String> {
         && chunk.tool_use_id.is_none()
         && chunk.tool_name.is_none()
     {
-        let data = json!({"type": "content_block_stop", "index": chunk.block_index});
-        return Some(format!("event: content_block_stop\ndata: {data}\n\n"));
+        return Some(content_block_stop(idx));
     }
 
     None

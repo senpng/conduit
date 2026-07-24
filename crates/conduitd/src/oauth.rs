@@ -155,27 +155,29 @@ fn spawn_tcp_forwarder(
                     info!(from = from_port, "oauth forwarder stopped");
                     break;
                 }
-                accepted = listener.accept() => {
-                    match accepted {
-                        Ok((mut inbound, _)) => {
-                            tokio::spawn(async move {
-                                match tokio::net::TcpStream::connect(("127.0.0.1", to_port)).await {
-                                    Ok(mut outbound) => {
-                                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, to_port, "oauth forwarder connect failed");
-                                    }
+                accepted = listener.accept() => match accepted {
+                    Ok((mut inbound, _)) => {
+                        tokio::spawn(async move {
+                            match tokio::net::TcpStream::connect(("127.0.0.1", to_port)).await {
+                                Ok(mut outbound) => {
+                                    let _ = tokio::io::copy_bidirectional(
+                                        &mut inbound,
+                                        &mut outbound,
+                                    )
+                                    .await;
                                 }
-                            });
-                        }
-                        Err(e) => {
-                            // WouldBlock / interrupted under load — continue until shutdown.
-                            if e.kind() != std::io::ErrorKind::WouldBlock {
-                                warn!(error = %e, "oauth forwarder accept failed");
+                                Err(e) => {
+                                    warn!(error = %e, to_port, "oauth forwarder connect failed");
+                                }
                             }
-                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        }
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "oauth forwarder accept failed");
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                 }
             }
@@ -288,33 +290,12 @@ async fn start_pkce_flow(
 ) -> Result<SessionView, OAuthError> {
     let pkce = generate_pkce()?;
     let oauth_state = generate_state();
-
     let proxy = resolve_effective_proxy(None, state.proxy_url.as_deref());
-    // IdP-registered callback ports cannot change; if busy, forward fixed → ephemeral.
-    let (preferred_port, callback_path) = match kind {
-        OAuthProviderKind::Claude => (
-            conduit_oauth::providers::claude::CALLBACK_PORT,
-            "/callback",
-        ),
-        OAuthProviderKind::Codex => (
-            conduit_oauth::providers::codex::CALLBACK_PORT,
-            "/auth/callback",
-        ),
-        OAuthProviderKind::Xai => unreachable!(),
-    };
-    let (listen_port, needs_forwarder) = resolve_callback_listen_port(state, preferred_port)?;
 
-    let auth_url = match kind {
-        OAuthProviderKind::Claude => {
-            ClaudeOAuth::with_proxy_url(proxy.clone())?
-                .generate_auth_url(&oauth_state, &pkce)
-        }
-        OAuthProviderKind::Codex => {
-            CodexOAuth::with_proxy_url(proxy)?
-                .generate_auth_url(&oauth_state, &pkce)
-        }
-        OAuthProviderKind::Xai => unreachable!(),
-    };
+    // IdP-registered callback ports cannot change; if busy, forward fixed → ephemeral.
+    let (preferred_port, callback_path) = pkce_callback_endpoint(kind);
+    let (listen_port, needs_forwarder) = resolve_callback_listen_port(state, preferred_port)?;
+    let auth_url = pkce_auth_url(kind, proxy, &oauth_state, &pkce)?;
 
     let session = OAuthSession {
         id: session_id.clone(),
@@ -323,7 +304,7 @@ async fn start_pkce_flow(
         created_at: Instant::now(),
         name: body.name,
         provider_id: body.provider_id,
-        state: Some(oauth_state.clone()),
+        state: Some(oauth_state),
         pkce: Some(pkce),
         auth_url: Some(auth_url),
         user_code: None,
@@ -350,6 +331,36 @@ async fn start_pkce_flow(
         callback_path,
     )?;
     Ok(view)
+}
+
+/// Fixed IdP callback port + path for PKCE providers.
+fn pkce_callback_endpoint(kind: OAuthProviderKind) -> (u16, &'static str) {
+    match kind {
+        OAuthProviderKind::Claude => (
+            conduit_oauth::providers::claude::CALLBACK_PORT,
+            "/callback",
+        ),
+        OAuthProviderKind::Codex => (
+            conduit_oauth::providers::codex::CALLBACK_PORT,
+            "/auth/callback",
+        ),
+        OAuthProviderKind::Xai => unreachable!("device flow uses start_device_flow"),
+    }
+}
+
+fn pkce_auth_url(
+    kind: OAuthProviderKind,
+    proxy: Option<String>,
+    oauth_state: &str,
+    pkce: &conduit_oauth::pkce::PkceCodes,
+) -> Result<String, OAuthError> {
+    match kind {
+        OAuthProviderKind::Claude => Ok(ClaudeOAuth::with_proxy_url(proxy)?
+            .generate_auth_url(oauth_state, pkce)),
+        OAuthProviderKind::Codex => Ok(CodexOAuth::with_proxy_url(proxy)?
+            .generate_auth_url(oauth_state, pkce)),
+        OAuthProviderKind::Xai => unreachable!("device flow uses start_device_flow"),
+    }
 }
 
 fn spawn_callback_server(
@@ -379,32 +390,9 @@ fn spawn_callback_server(
 
     let state_cb = state.clone();
     let sid = session_id.clone();
-    let port = listen_port;
-
     tokio::spawn(async move {
-        // Bind the provider-specific path. Codex uses `/auth/callback` and also
-        // accepts a `/callback` alias; Claude's path *is* `/callback`, so do not
-        // register it twice (axum panics on overlapping method routes).
-        let make_handler = |state: Arc<DaemonState>, sid: String| {
-            move |q: Query<CallbackQuery>| {
-                let state = state.clone();
-                let sid = sid.clone();
-                async move { handle_callback(state, sid, kind, q.0).await }
-            }
-        };
-
-        let mut app = axum::Router::new().route(
-            callback_path,
-            axum::routing::get(make_handler(state_cb.clone(), sid.clone())),
-        );
-        if callback_path != "/callback" {
-            app = app.route(
-                "/callback",
-                axum::routing::get(make_handler(state_cb.clone(), sid.clone())),
-            );
-        }
-
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let app = oauth_callback_router(state_cb.clone(), sid.clone(), kind, callback_path);
+        let addr = SocketAddr::from(([127, 0, 0, 1], listen_port));
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) => {
@@ -417,7 +405,6 @@ fn spawn_callback_server(
             }
         };
         info!(%addr, kind = %kind, session = %sid, "oauth callback server listening");
-
         let server = axum::serve(listener, app).with_graceful_shutdown(async {
             let _ = rx.await;
         });
@@ -429,6 +416,36 @@ fn spawn_callback_server(
     });
 
     Ok(())
+}
+
+/// Bind provider callback path; Codex also aliases `/callback`.
+///
+/// Claude's primary path *is* `/callback`, so never register it twice (axum
+/// panics on overlapping method routes).
+fn oauth_callback_router(
+    state: Arc<DaemonState>,
+    session_id: String,
+    kind: OAuthProviderKind,
+    callback_path: &'static str,
+) -> axum::Router {
+    let make_handler = |state: Arc<DaemonState>, sid: String| {
+        move |q: Query<CallbackQuery>| {
+            let state = state.clone();
+            let sid = sid.clone();
+            async move { handle_callback(state, sid, kind, q.0).await }
+        }
+    };
+    let mut app = axum::Router::new().route(
+        callback_path,
+        axum::routing::get(make_handler(state.clone(), session_id.clone())),
+    );
+    if callback_path != "/callback" {
+        app = app.route(
+            "/callback",
+            axum::routing::get(make_handler(state, session_id)),
+        );
+    }
+    app
 }
 
 #[derive(Debug, Deserialize)]
@@ -454,9 +471,8 @@ fn oauth_callback_state_ok(
     expected: Option<&str>,
     state_candidates: &[&str],
 ) -> Result<(), &'static str> {
-    let expected = match expected.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) => s,
-        None => return Ok(()),
+    let Some(expected) = expected.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
     };
     let mut saw_any = false;
     for raw in state_candidates {
@@ -499,6 +515,42 @@ fn oauth_state_candidates(
     out
 }
 
+/// Mark session Error, stop the local callback server, return error HTML.
+fn fail_callback(
+    state: &DaemonState,
+    session_id: &str,
+    msg: impl Into<String>,
+) -> axum::response::Response {
+    let msg = msg.into();
+    let _ = state.oauth.sessions.update(session_id, |s| {
+        s.status = SessionStatus::Error;
+        s.error = Some(msg.clone());
+    });
+    stop_callback(state, session_id);
+    Html(error_page(&msg)).into_response()
+}
+
+/// Mark session Completed (with provider id), stop callback, return success HTML.
+fn complete_callback(
+    state: &DaemonState,
+    session_id: &str,
+    kind: OAuthProviderKind,
+    provider_id: String,
+) -> axum::response::Response {
+    let email = state
+        .oauth
+        .sessions
+        .get(session_id)
+        .and_then(|s| s.email.clone())
+        .unwrap_or_default();
+    let _ = state.oauth.sessions.update(session_id, |s| {
+        s.status = SessionStatus::Completed;
+        s.completed_provider_id = Some(provider_id);
+    });
+    stop_callback(state, session_id);
+    Html(success_page(kind.as_str(), &email)).into_response()
+}
+
 async fn handle_callback(
     state: Arc<DaemonState>,
     session_id: String,
@@ -507,25 +559,12 @@ async fn handle_callback(
 ) -> impl IntoResponse {
     if let Some(err) = q.error {
         let msg = q.error_description.unwrap_or(err);
-        let _ = state.oauth.sessions.update(&session_id, |s| {
-            s.status = SessionStatus::Error;
-            s.error = Some(msg.clone());
-        });
-        stop_callback(&state, &session_id);
-        return Html(error_page(&msg)).into_response();
+        return fail_callback(&state, &session_id, msg);
     }
 
     let code = match q.code {
         Some(c) if !c.is_empty() => c,
-        _ => {
-            let msg = "missing authorization code";
-            let _ = state.oauth.sessions.update(&session_id, |s| {
-                s.status = SessionStatus::Error;
-                s.error = Some(msg.into());
-            });
-            stop_callback(&state, &session_id);
-            return Html(error_page(msg)).into_response();
-        }
+        _ => return fail_callback(&state, &session_id, "missing authorization code"),
     };
 
     let session = match state.oauth.sessions.get(&session_id) {
@@ -544,76 +583,44 @@ async fn handle_callback(
             candidates = ?candidates,
             "{msg}"
         );
-        let _ = state.oauth.sessions.update(&session_id, |s| {
-            s.status = SessionStatus::Error;
-            s.error = Some(msg.into());
-        });
-        stop_callback(&state, &session_id);
-        return Html(error_page(msg)).into_response();
+        return fail_callback(&state, &session_id, msg);
     }
 
-    let pkce = match session.pkce {
-        Some(ref p) => p.clone(),
-        None => {
-            let _ = state.oauth.sessions.update(&session_id, |s| {
-                s.status = SessionStatus::Error;
-                s.error = Some("missing pkce".into());
-            });
-            stop_callback(&state, &session_id);
-            return Html(error_page("missing pkce")).into_response();
-        }
+    let Some(pkce) = session.pkce.clone() else {
+        return fail_callback(&state, &session_id, "missing pkce");
     };
 
     let proxy = resolve_effective_proxy(None, state.proxy_url.as_deref());
-    let exchange = match kind {
-        OAuthProviderKind::Claude => match ClaudeOAuth::with_proxy_url(proxy) {
-            Ok(oauth) => {
-                oauth
-                    .exchange_code(&code, session.state.as_deref().unwrap_or(""), &pkce)
-                    .await
-            }
-            Err(e) => Err(e),
-        },
-        OAuthProviderKind::Codex => match CodexOAuth::with_proxy_url(proxy) {
-            Ok(oauth) => oauth.exchange_code(&code, &pkce).await,
-            Err(e) => Err(e),
-        },
-        OAuthProviderKind::Xai => unreachable!(),
-    };
-
+    let exchange = exchange_pkce_code(kind, proxy, &code, session.state.as_deref(), &pkce).await;
     match exchange {
         Ok(cred) => match persist_credential(&state, &session, cred).await {
-            Ok(provider_id) => {
-                let email = state
-                    .oauth
-                    .sessions
-                    .get(&session_id)
-                    .and_then(|s| s.email.clone())
-                    .unwrap_or_default();
-                let _ = state.oauth.sessions.update(&session_id, |s| {
-                    s.status = SessionStatus::Completed;
-                    s.completed_provider_id = Some(provider_id);
-                });
-                stop_callback(&state, &session_id);
-                Html(success_page(kind.as_str(), &email)).into_response()
-            }
-            Err(e) => {
-                let _ = state.oauth.sessions.update(&session_id, |s| {
-                    s.status = SessionStatus::Error;
-                    s.error = Some(e.to_string());
-                });
-                stop_callback(&state, &session_id);
-                Html(error_page(&e.to_string())).into_response()
-            }
+            Ok(provider_id) => complete_callback(&state, &session_id, kind, provider_id),
+            Err(e) => fail_callback(&state, &session_id, e.to_string()),
         },
-        Err(e) => {
-            let _ = state.oauth.sessions.update(&session_id, |s| {
-                s.status = SessionStatus::Error;
-                s.error = Some(e.to_string());
-            });
-            stop_callback(&state, &session_id);
-            Html(error_page(&e.to_string())).into_response()
+        Err(e) => fail_callback(&state, &session_id, e.to_string()),
+    }
+}
+
+/// PKCE code exchange for Claude/Codex (device-flow XAI never hits the callback).
+async fn exchange_pkce_code(
+    kind: OAuthProviderKind,
+    proxy: Option<String>,
+    code: &str,
+    state: Option<&str>,
+    pkce: &conduit_oauth::pkce::PkceCodes,
+) -> Result<OAuthCredential, OAuthError> {
+    match kind {
+        OAuthProviderKind::Claude => {
+            ClaudeOAuth::with_proxy_url(proxy)?
+                .exchange_code(code, state.unwrap_or(""), pkce)
+                .await
         }
+        OAuthProviderKind::Codex => {
+            CodexOAuth::with_proxy_url(proxy)?
+                .exchange_code(code, pkce)
+                .await
+        }
+        OAuthProviderKind::Xai => unreachable!("device flow does not use browser callback"),
     }
 }
 
@@ -655,69 +662,69 @@ async fn start_device_flow(
     let view = session.view();
     state.oauth.sessions.insert(session);
 
-    // Background poll — cancel when session status leaves Pending.
-    let state_bg = state.clone();
-    let sid = session_id.clone();
-    let proxy_bg = resolve_effective_proxy(None, state.proxy_url.as_deref());
+    spawn_device_poll(state.clone(), session_id, device);
+    Ok(view)
+}
+
+/// Background poll for Grok device authorization; cancel when status leaves Pending.
+fn spawn_device_poll(
+    state: Arc<DaemonState>,
+    session_id: String,
+    device: conduit_oauth::providers::grok::DeviceCodeResponse,
+) {
+    let proxy = resolve_effective_proxy(None, state.proxy_url.as_deref());
     tokio::spawn(async move {
-        let oauth = match GrokOAuth::with_proxy_url(proxy_bg) {
+        let mark_err = |msg: String, only_pending: bool| {
+            let _ = state.oauth.sessions.update(&session_id, |s| {
+                if !only_pending || s.status == SessionStatus::Pending {
+                    s.status = SessionStatus::Error;
+                    s.error = Some(msg);
+                }
+            });
+        };
+
+        let oauth = match GrokOAuth::with_proxy_url(proxy) {
             Ok(o) => o,
             Err(e) => {
-                let _ = state_bg.oauth.sessions.update(&sid, |s| {
-                    s.status = SessionStatus::Error;
-                    s.error = Some(e.to_string());
-                });
+                mark_err(e.to_string(), false);
                 return;
             }
         };
-        let sessions = state_bg.oauth.sessions.clone();
-        let sid_check = sid.clone();
+        let sessions = state.oauth.sessions.clone();
+        let sid = session_id.clone();
         let result = oauth
             .wait_for_authorization_cancellable(&device, || {
                 sessions
-                    .get(&sid_check)
+                    .get(&sid)
                     .map(|s| s.status != SessionStatus::Pending)
                     .unwrap_or(true)
             })
             .await;
+
         match result {
             Ok(cred) => {
-                let sess = state_bg.oauth.sessions.get(&sid);
-                if let Some(sess) = sess {
-                    if sess.status != SessionStatus::Pending {
-                        return;
+                let Some(sess) = state.oauth.sessions.get(&session_id) else {
+                    return;
+                };
+                if sess.status != SessionStatus::Pending {
+                    return;
+                }
+                match persist_credential(&state, &sess, cred).await {
+                    Ok(pid) => {
+                        let _ = state.oauth.sessions.update(&session_id, |s| {
+                            s.status = SessionStatus::Completed;
+                            s.completed_provider_id = Some(pid);
+                        });
                     }
-                    match persist_credential(&state_bg, &sess, cred).await {
-                        Ok(pid) => {
-                            let _ = state_bg.oauth.sessions.update(&sid, |s| {
-                                s.status = SessionStatus::Completed;
-                                s.completed_provider_id = Some(pid);
-                            });
-                        }
-                        Err(e) => {
-                            let _ = state_bg.oauth.sessions.update(&sid, |s| {
-                                s.status = SessionStatus::Error;
-                                s.error = Some(e.to_string());
-                            });
-                        }
-                    }
+                    Err(e) => mark_err(e.to_string(), false),
                 }
             }
             Err(OAuthError::SessionCancelled) => {
                 // User cancelled — status already Cancelled.
             }
-            Err(e) => {
-                let _ = state_bg.oauth.sessions.update(&sid, |s| {
-                    if s.status == SessionStatus::Pending {
-                        s.status = SessionStatus::Error;
-                        s.error = Some(e.to_string());
-                    }
-                });
-            }
+            Err(e) => mark_err(e.to_string(), true),
         }
     });
-
-    Ok(view)
 }
 
 // ── Persist ───────────────────────────────────────────────────────────────────
@@ -729,38 +736,7 @@ async fn persist_credential(
 ) -> Result<String, OAuthError> {
     let email = cred.email.clone();
     let kind = session.kind;
-    // Codex: CLIProxyAPI multi-auth stable id from email + plan + account (team).
-    let stable_codex_id = if kind == OAuthProviderKind::Codex {
-        conduit_oauth::providers::codex::stable_provider_id(
-            cred.email.as_deref(),
-            cred.plan_type_str(),
-            cred.account_id.as_deref(),
-        )
-    } else {
-        None
-    };
-    let id = if let Some(ref pid) = session.provider_id {
-        pid.clone()
-    } else if let Some(ref sid) = stable_codex_id {
-        // Reuse existing provider row with same stable id if present.
-        sid.clone()
-    } else {
-        Ulid::new().to_string()
-    };
-    let name = session.name.clone().unwrap_or_else(|| match kind {
-        OAuthProviderKind::Codex => conduit_oauth::providers::codex::display_provider_name(
-            cred.email.as_deref(),
-            cred.plan_type_str(),
-        ),
-        _ => match &email {
-            Some(e) if !e.is_empty() => format!("{} ({e})", kind.as_str()),
-            _ => format!("{}-oauth", kind.as_str()),
-        },
-    });
-    let base_url = cred
-        .base_url
-        .clone()
-        .unwrap_or_else(|| kind.default_base_url().to_string());
+    let (id, name, base_url) = resolve_oauth_provider_identity(session, &cred);
     let now = Utc::now().to_rfc3339();
     let upstream_key_ref = format!("secret://upstream_key/{id}");
 
@@ -784,15 +760,12 @@ async fn persist_credential(
         deleted_at: None,
     };
 
-    if existing.is_some() {
-        repo.update(&row)
-            .await
-            .map_err(|e| OAuthError::Credential(e.to_string()))?;
+    let write = if existing.is_some() {
+        repo.update(&row).await
     } else {
-        repo.insert(&row)
-            .await
-            .map_err(|e| OAuthError::Credential(e.to_string()))?;
-    }
+        repo.insert(&row).await
+    };
+    write.map_err(|e| OAuthError::Credential(e.to_string()))?;
 
     let bytes = cred.to_json_bytes()?;
     state
@@ -815,6 +788,44 @@ async fn persist_credential(
     Ok(id)
 }
 
+/// Provider id / display name / base_url for a completed OAuth credential.
+fn resolve_oauth_provider_identity(
+    session: &OAuthSession,
+    cred: &OAuthCredential,
+) -> (String, String, String) {
+    let kind = session.kind;
+    // Codex: CLIProxyAPI multi-auth stable id from email + plan + account (team).
+    let stable_codex_id = (kind == OAuthProviderKind::Codex)
+        .then(|| {
+            conduit_oauth::providers::codex::stable_provider_id(
+                cred.email.as_deref(),
+                cred.plan_type_str(),
+                cred.account_id.as_deref(),
+            )
+        })
+        .flatten();
+    let id = session
+        .provider_id
+        .clone()
+        .or(stable_codex_id)
+        .unwrap_or_else(|| Ulid::new().to_string());
+    let name = session.name.clone().unwrap_or_else(|| match kind {
+        OAuthProviderKind::Codex => conduit_oauth::providers::codex::display_provider_name(
+            cred.email.as_deref(),
+            cred.plan_type_str(),
+        ),
+        _ => match cred.email.as_deref().filter(|e| !e.is_empty()) {
+            Some(e) => format!("{} ({e})", kind.as_str()),
+            None => format!("{}-oauth", kind.as_str()),
+        },
+    });
+    let base_url = cred
+        .base_url
+        .clone()
+        .unwrap_or_else(|| kind.default_base_url().to_string());
+    (id, name, base_url)
+}
+
 fn stop_callback(state: &DaemonState, session_id: &str) {
     if let Some(h) = state.oauth.callbacks.lock().remove(session_id) {
         let _ = h.shutdown.send(());
@@ -828,24 +839,39 @@ fn success_page(kind: &str, email: &str) -> String {
     let detail = if email.is_empty() {
         format!("{kind} OAuth completed.")
     } else {
-        format!("{kind} OAuth completed for <b>{email}</b>.")
+        format!("{kind} OAuth completed for <b>{}</b>.", html_escape(email))
     };
-    format!(
-        r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Authorization Success</title>
-<style>body{{font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f5f5f5}}
-.box{{background:#fff;padding:2rem;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.1);text-align:center;max-width:420px}}
-h1{{color:#4caf50}}</style></head><body><div class="box"><h1>授权成功</h1><p>{detail}</p>
-<p>你可以关闭此窗口。</p></div></body></html>"#
-    )
+    oauth_result_page("Authorization Success", "#4caf50", "授权成功", &detail, true)
 }
 
 fn error_page(msg: &str) -> String {
-    let msg = html_escape(msg);
+    oauth_result_page(
+        "Authorization Failed",
+        "#f44336",
+        "授权失败",
+        &html_escape(msg),
+        false,
+    )
+}
+
+/// Shared chrome for browser OAuth callback result pages.
+fn oauth_result_page(
+    title: &str,
+    heading_color: &str,
+    heading: &str,
+    body_html: &str,
+    show_close_hint: bool,
+) -> String {
+    let close = if show_close_hint {
+        "<p>你可以关闭此窗口。</p>"
+    } else {
+        ""
+    };
     format!(
-        r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Authorization Failed</title>
+        r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>{title}</title>
 <style>body{{font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f5f5f5}}
 .box{{background:#fff;padding:2rem;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.1);text-align:center;max-width:420px}}
-h1{{color:#f44336}}</style></head><body><div class="box"><h1>授权失败</h1><p>{msg}</p></div></body></html>"#
+h1{{color:{heading_color}}}</style></head><body><div class="box"><h1>{heading}</h1><p>{body_html}</p>{close}</div></body></html>"#
     )
 }
 

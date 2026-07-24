@@ -28,6 +28,18 @@ struct ToolAcc {
     closed: bool,
 }
 
+impl ToolAcc {
+    /// Ready for `content_block_start` (id+name known, not yet started/closed).
+    fn ready_to_start(&self) -> bool {
+        !self.start_emitted && !self.closed && !self.name.is_empty() && !self.id.is_empty()
+    }
+
+    fn mark_closed(&mut self) {
+        self.start_emitted = false;
+        self.closed = true;
+    }
+}
+
 /// Stateful encoder: IR chunks → Anthropic Messages SSE frames.
 #[derive(Debug)]
 pub struct AnthropicStreamEncoder {
@@ -117,204 +129,185 @@ impl AnthropicStreamEncoder {
     pub fn push(&mut self, chunk: &CanonicalChunk) -> Vec<String> {
         let mut out = Vec::new();
 
-        // Usage-only (no finish yet) — stash for message_start / message_delta.
-        // Must run *before* ensure_message_start so input_tokens are not zeroed.
-        if chunk.finish_reason.is_none()
-            && chunk.delta.is_none()
-            && chunk.block_kind.is_none()
-            && chunk.tool_use_id.is_none()
-            && chunk.tool_name.is_none()
-        {
-            if let Some(u) = &chunk.usage {
-                self.merge_pending_usage(u);
-                // Emit message_start with real input_tokens as soon as we know them.
-                if let Some(frame) = self.ensure_message_start(u.prompt_tokens) {
-                    out.push(frame);
-                }
-                // If we already saw finish_reason, emit message_delta now.
-                if self.finish_reason.is_some() && !self.message_delta_sent {
-                    self.close_open_blocks(&mut out);
-                    self.emit_message_delta(&mut out);
-                    self.emit_message_stop(&mut out);
-                }
-                return out;
-            }
+        // Usage-only must run *before* ensure_message_start so input_tokens
+        // are not zeroed when Anthropic seeds usage early.
+        if self.push_usage_only(chunk, &mut out) {
+            return out;
         }
 
         if let Some(frame) = self.ensure_message_start(0) {
             out.push(frame);
         }
 
-        // Explicit content_block_stop from Anthropic-native IR (all None except block_index).
-        if chunk.block_kind.is_none()
-            && chunk.delta.is_none()
-            && chunk.finish_reason.is_none()
-            && chunk.usage.is_none()
-            && chunk.tool_use_id.is_none()
-            && chunk.tool_name.is_none()
-        {
-            // Treat as content_block_stop for the given index when a block is open.
-            let idx = chunk.block_index;
-            if self.text_started && self.text_index == idx as i32 {
-                out.push(content_block_stop(idx));
-                self.text_started = false;
-                self.text_index = -1;
-            } else if self.thinking_started && self.thinking_index == idx as i32 {
-                self.emit_thinking_stop(idx, &mut out);
-            } else if let Some((oi, acc)) = self
-                .tools
-                .iter_mut()
-                .find(|(oi, _)| self.tool_block_indexes.get(oi) == Some(&idx))
-            {
-                let _ = oi;
-                if acc.start_emitted && !acc.closed {
-                    out.push(content_block_stop(idx));
-                    acc.start_emitted = false;
-                    acc.closed = true;
-                }
-            }
+        // Explicit content_block_stop (Anthropic-native IR marker).
+        if self.push_block_stop_marker(chunk, &mut out) {
             return out;
         }
 
-        // Thinking delta
-        if let Some(BlockDelta::ThinkingDelta { thinking }) = &chunk.delta {
-            if !thinking.is_empty() {
-                self.stop_text(&mut out);
-                self.ensure_thinking_start(&mut out);
-                let idx = self.thinking_index.max(0) as u32;
-                out.push(thinking_delta(idx, thinking));
-            }
-        }
+        self.push_content_deltas(chunk, &mut out);
+        self.push_block_starts(chunk, &mut out);
+        self.push_tool_args(chunk, &mut out);
+        self.push_finish(chunk, &mut out);
+        out
+    }
 
-        // Signature delta (Anthropic-native thinking close path)
-        if let Some(BlockDelta::SignatureDelta { signature }) = &chunk.delta {
-            if self.thinking_started {
-                let idx = self.thinking_index.max(0) as u32;
-                if !signature.is_empty() {
-                    out.push(signature_delta(idx, signature));
-                    self.thinking_signature_emitted = true;
-                }
-            }
+    /// Usage-only chunk: stash tokens and optionally complete a deferred finish.
+    /// Returns true when the chunk was fully handled.
+    fn push_usage_only(&mut self, chunk: &CanonicalChunk, out: &mut Vec<String>) -> bool {
+        if !is_marker_chunk(chunk) || chunk.usage.is_none() {
+            return false;
         }
-
-        // Text delta (with or without block_kind set)
-        if let Some(BlockDelta::TextDelta { text }) = &chunk.delta {
-            if !text.is_empty() {
-                self.stop_thinking(&mut out);
-                self.ensure_text_start(&mut out);
-                let idx = self.text_index.max(0) as u32;
-                out.push(text_delta(idx, text));
-            }
+        let Some(u) = &chunk.usage else {
+            return false;
+        };
+        self.merge_pending_usage(u);
+        if let Some(frame) = self.ensure_message_start(u.prompt_tokens) {
+            out.push(frame);
         }
+        // Finish may have arrived before usage; emit terminal frames now.
+        self.emit_finish_frames(out);
+        true
+    }
 
-        // Bare block start (Anthropic-native IR: kind set, no delta)
-        if chunk.delta.is_none() && chunk.finish_reason.is_none() {
-            if let Some(kind) = &chunk.block_kind {
-                match kind {
-                    BlockKind::Text => {
-                        // Only if not already open — OpenAI path uses kind+delta together.
-                        if !self.text_started
-                            && chunk.tool_use_id.is_none()
-                            && chunk.tool_name.is_none()
-                        {
-                            self.stop_thinking(&mut out);
-                            // Prefer upstream block_index when provided as pure start.
-                            if chunk.block_index > 0 || self.next_block_index == 0 {
-                                // assign via ensure
-                            }
-                            self.ensure_text_start(&mut out);
-                        }
-                    }
-                    BlockKind::Thinking => {
-                        if !self.thinking_started
-                            && chunk.tool_use_id.is_none()
-                            && chunk.tool_name.is_none()
-                        {
-                            self.stop_text(&mut out);
-                            self.ensure_thinking_start(&mut out);
-                        }
-                    }
-                    BlockKind::ToolUse => {
-                        self.handle_tool_start(chunk, &mut out);
-                    }
-                    _ => {}
-                }
-            } else if chunk.tool_use_id.is_some() || chunk.tool_name.is_some() {
-                self.handle_tool_start(chunk, &mut out);
-            }
-        } else if matches!(chunk.block_kind, Some(BlockKind::ToolUse))
-            && chunk.delta.is_none()
-            && (chunk.tool_use_id.is_some() || chunk.tool_name.is_some())
+    /// Anthropic-native `content_block_stop` marker (all payload fields empty).
+    /// Returns true when the chunk was fully handled.
+    fn push_block_stop_marker(&mut self, chunk: &CanonicalChunk, out: &mut Vec<String>) -> bool {
+        if !is_marker_chunk(chunk) || chunk.usage.is_some() {
+            return false;
+        }
+        let idx = chunk.block_index;
+        if self.text_started && self.text_index == idx as i32 {
+            out.push(content_block_stop(idx));
+            self.text_started = false;
+            self.text_index = -1;
+        } else if self.thinking_started && self.thinking_index == idx as i32 {
+            self.emit_thinking_stop(idx, out);
+        } else if let Some((_, acc)) = self
+            .tools
+            .iter_mut()
+            .find(|(oi, _)| self.tool_block_indexes.get(oi) == Some(&idx))
         {
-            self.handle_tool_start(chunk, &mut out);
+            if acc.start_emitted && !acc.closed {
+                out.push(content_block_stop(idx));
+                acc.mark_closed();
+            }
         }
+        true
+    }
 
-        // Tool argument delta
-        if let Some(BlockDelta::InputJsonDelta { partial_json }) = &chunk.delta {
-            let openai_idx = chunk.block_index;
-            let already_closed = self
+    fn push_content_deltas(&mut self, chunk: &CanonicalChunk, out: &mut Vec<String>) {
+        match &chunk.delta {
+            Some(BlockDelta::ThinkingDelta { thinking }) if !thinking.is_empty() => {
+                self.stop_text(out);
+                self.ensure_thinking_start(out);
+                out.push(thinking_delta(self.thinking_index.max(0) as u32, thinking));
+            }
+            Some(BlockDelta::SignatureDelta { signature })
+                if self.thinking_started && !signature.is_empty() =>
+            {
+                let idx = self.thinking_index.max(0) as u32;
+                out.push(signature_delta(idx, signature));
+                self.thinking_signature_emitted = true;
+            }
+            Some(BlockDelta::TextDelta { text }) if !text.is_empty() => {
+                self.stop_thinking(out);
+                self.ensure_text_start(out);
+                out.push(text_delta(self.text_index.max(0) as u32, text));
+            }
+            _ => {}
+        }
+    }
+
+    /// Bare block start (kind set, no delta) or tool id/name without kind.
+    fn push_block_starts(&mut self, chunk: &CanonicalChunk, out: &mut Vec<String>) {
+        if chunk.delta.is_some() {
+            return;
+        }
+        let toolish = chunk.tool_use_id.is_some() || chunk.tool_name.is_some();
+        match &chunk.block_kind {
+            Some(BlockKind::Text) if chunk.finish_reason.is_none() && !toolish => {
+                if !self.text_started {
+                    self.stop_thinking(out);
+                    self.ensure_text_start(out);
+                }
+            }
+            Some(BlockKind::Thinking) if chunk.finish_reason.is_none() && !toolish => {
+                if !self.thinking_started {
+                    self.stop_text(out);
+                    self.ensure_thinking_start(out);
+                }
+            }
+            // Tool start: normal bare start, or same-chunk finish with tool fields.
+            Some(BlockKind::ToolUse) if chunk.finish_reason.is_none() || toolish => {
+                self.handle_tool_start(chunk, out);
+            }
+            None if chunk.finish_reason.is_none() && toolish => {
+                self.handle_tool_start(chunk, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn push_tool_args(&mut self, chunk: &CanonicalChunk, out: &mut Vec<String>) {
+        let Some(BlockDelta::InputJsonDelta { partial_json }) = &chunk.delta else {
+            return;
+        };
+        let openai_idx = chunk.block_index;
+        if self.tools.get(&openai_idx).is_some_and(|a| a.closed) {
+            return;
+        }
+        {
+            let acc = self.tools.entry(openai_idx).or_default();
+            if !partial_json.is_empty() {
+                acc.arguments.push_str(partial_json);
+            }
+        }
+        if self.tools.get(&openai_idx).is_some_and(ToolAcc::ready_to_start) {
+            self.stop_text(out);
+            self.stop_thinking(out);
+            self.emit_tool_start(openai_idx, out);
+        }
+        if !partial_json.is_empty()
+            && self
                 .tools
                 .get(&openai_idx)
-                .map(|a| a.closed)
-                .unwrap_or(false);
-            if !already_closed {
-                {
-                    let acc = self.tools.entry(openai_idx).or_default();
-                    if !partial_json.is_empty() {
-                        acc.arguments.push_str(partial_json);
-                    }
-                }
-                // Emit start if we can; stream args live once started.
-                let can_start = self
-                    .tools
-                    .get(&openai_idx)
-                    .map(|a| !a.start_emitted && !a.name.is_empty() && !a.id.is_empty())
-                    .unwrap_or(false);
-                if can_start {
-                    self.stop_text(&mut out);
-                    self.stop_thinking(&mut out);
-                    self.emit_tool_start(openai_idx, &mut out);
-                }
-                let started = self
-                    .tools
-                    .get(&openai_idx)
-                    .map(|a| a.start_emitted)
-                    .unwrap_or(false);
-                if started && !partial_json.is_empty() {
-                    let block_idx = self.tool_content_index(openai_idx);
-                    out.push(input_json_delta(block_idx, partial_json));
-                    if let Some(acc) = self.tools.get_mut(&openai_idx) {
-                        acc.args_live_streamed = true;
-                    }
-                }
+                .is_some_and(|a| a.start_emitted)
+        {
+            let block_idx = self.tool_content_index(openai_idx);
+            out.push(input_json_delta(block_idx, partial_json));
+            if let Some(acc) = self.tools.get_mut(&openai_idx) {
+                acc.args_live_streamed = true;
             }
         }
+    }
 
-        // Finish reason
-        if let Some(fr) = &chunk.finish_reason {
-            // CLIProxyAPI: if we saw real tool_use blocks, force tool_calls;
-            // if upstream said tool_calls but never emitted tools → stop.
-            if self.saw_tool_call {
-                self.finish_reason = Some(FinishReason::ToolCalls);
-            } else if matches!(fr, FinishReason::ToolCalls) {
-                self.finish_reason = Some(FinishReason::Stop);
-            } else {
-                self.finish_reason = Some(fr.clone());
-            }
-            if let Some(u) = &chunk.usage {
-                self.merge_pending_usage(u);
-            }
-            self.close_open_blocks(&mut out);
-            // Emit message_delta when we have usage or immediately (CLIProxyAPI
-            // waits for usage when include_usage is on; we emit now and upgrade
-            // is not supported — emit once).
-            if !self.message_delta_sent {
-                self.emit_message_delta(&mut out);
-                self.emit_message_stop(&mut out);
-            }
+    fn push_finish(&mut self, chunk: &CanonicalChunk, out: &mut Vec<String>) {
+        let Some(fr) = &chunk.finish_reason else {
+            return;
+        };
+        // CLIProxyAPI: real tool_use → force tool_calls; bare tool_calls → stop.
+        self.finish_reason = Some(if self.saw_tool_call {
+            FinishReason::ToolCalls
+        } else if matches!(fr, FinishReason::ToolCalls) {
+            FinishReason::Stop
+        } else {
+            fr.clone()
+        });
+        if let Some(u) = &chunk.usage {
+            self.merge_pending_usage(u);
         }
+        self.emit_finish_frames(out);
+    }
 
-        out
+    /// Close open blocks and emit `message_delta` + `message_stop` once.
+    /// No-op when finish has not been recorded yet, or terminals already sent.
+    fn emit_finish_frames(&mut self, out: &mut Vec<String>) {
+        if self.finish_reason.is_none() || self.message_delta_sent {
+            return;
+        }
+        self.close_open_blocks(out);
+        self.emit_message_delta(out);
+        self.emit_message_stop(out);
     }
 
     /// Flush remaining terminal events (open blocks, message_delta, message_stop).
@@ -323,77 +316,68 @@ impl AnthropicStreamEncoder {
         if let Some(frame) = self.ensure_message_start(0) {
             out.push(frame);
         }
-        self.close_open_blocks(&mut out);
         if self.finish_reason.is_none() {
             // Stream ended without finish_reason — treat as end_turn.
             self.finish_reason = Some(FinishReason::Stop);
         }
-        if !self.message_delta_sent {
-            self.emit_message_delta(&mut out);
-        }
+        self.emit_finish_frames(&mut out);
+        // message_stop is gated by message_delta_sent inside emit_finish_frames;
+        // if delta was already sent earlier, still ensure stop.
         self.emit_message_stop(&mut out);
         out
     }
 
     fn merge_pending_usage(&mut self, u: &Usage) {
-        match &mut self.pending_usage {
-            Some(prev) => {
-                if u.prompt_tokens > 0 {
-                    prev.prompt_tokens = u.prompt_tokens;
-                }
-                if u.completion_tokens > 0 {
-                    prev.completion_tokens = u.completion_tokens;
-                }
-                if u.cache_read_tokens > 0 {
-                    prev.cache_read_tokens = u.cache_read_tokens;
-                }
-                if u.cache_write_tokens > 0 {
-                    prev.cache_write_tokens = u.cache_write_tokens;
-                }
-                if u.reasoning_tokens > 0 {
-                    prev.reasoning_tokens = u.reasoning_tokens;
-                }
-                prev.total_tokens = prev.prompt_tokens + prev.completion_tokens;
+        let Some(prev) = self.pending_usage.as_mut() else {
+            self.pending_usage = Some(u.clone());
+            return;
+        };
+        // Only overwrite with positive counts so late zeroed frames cannot
+        // clobber early Anthropic message_start input_tokens.
+        for (dst, src) in [
+            (&mut prev.prompt_tokens, u.prompt_tokens),
+            (&mut prev.completion_tokens, u.completion_tokens),
+            (&mut prev.cache_read_tokens, u.cache_read_tokens),
+            (&mut prev.cache_write_tokens, u.cache_write_tokens),
+            (&mut prev.reasoning_tokens, u.reasoning_tokens),
+        ] {
+            if src > 0 {
+                *dst = src;
             }
-            None => self.pending_usage = Some(u.clone()),
         }
+        prev.total_tokens = prev.prompt_tokens + prev.completion_tokens;
     }
 
     fn handle_tool_start(&mut self, chunk: &CanonicalChunk, out: &mut Vec<String>) {
         let openai_idx = chunk.block_index;
-        let acc = self.tools.entry(openai_idx).or_default();
-        if acc.closed {
-            return;
-        }
-        if let Some(id) = &chunk.tool_use_id {
-            if !id.is_empty() {
-                acc.id = id.clone();
+        {
+            let acc = self.tools.entry(openai_idx).or_default();
+            if acc.closed {
+                return;
+            }
+            if let Some(id) = chunk.tool_use_id.as_deref().filter(|s| !s.is_empty()) {
+                acc.id = id.to_string();
+            }
+            if let Some(name) = chunk.tool_name.as_deref().filter(|s| !s.is_empty()) {
+                acc.name = name.to_string();
+            }
+            if !acc.ready_to_start() {
+                return;
             }
         }
-        if let Some(name) = &chunk.tool_name {
-            if !name.is_empty() {
-                acc.name = name.clone();
-            }
-        }
-        if !acc.start_emitted && !acc.name.is_empty() && !acc.id.is_empty() {
-            self.stop_text(out);
-            self.stop_thinking(out);
-            self.emit_tool_start(openai_idx, out);
-        }
+        self.stop_text(out);
+        self.stop_thinking(out);
+        self.emit_tool_start(openai_idx, out);
     }
 
     fn emit_tool_start(&mut self, openai_idx: u32, out: &mut Vec<String>) {
-        let (id, name, already) = {
+        let (id, name) = {
             let acc = self.tools.entry(openai_idx).or_default();
-            (
-                acc.id.clone(),
-                acc.name.clone(),
-                acc.closed || acc.start_emitted || acc.name.is_empty() || acc.id.is_empty(),
-            )
+            if !acc.ready_to_start() {
+                return;
+            }
+            (acc.id.clone(), acc.name.clone())
         };
-        if already {
-            return;
-        }
         let block_idx = self.tool_content_index(openai_idx);
         if let Some(acc) = self.tools.get_mut(&openai_idx) {
             acc.start_emitted = true;
@@ -403,24 +387,27 @@ impl AnthropicStreamEncoder {
     }
 
     fn tool_content_index(&mut self, openai_idx: u32) -> u32 {
-        if let Some(&idx) = self.tool_block_indexes.get(&openai_idx) {
-            return idx;
+        *self.tool_block_indexes.entry(openai_idx).or_insert_with(|| {
+            let idx = self.next_block_index;
+            self.next_block_index += 1;
+            idx
+        })
+    }
+
+    /// Assign the next content-block index if `slot` is still unset (`-1`).
+    fn take_block_index(slot: &mut i32, next: &mut u32) -> u32 {
+        if *slot < 0 {
+            *slot = *next as i32;
+            *next += 1;
         }
-        let idx = self.next_block_index;
-        self.next_block_index += 1;
-        self.tool_block_indexes.insert(openai_idx, idx);
-        idx
+        *slot as u32
     }
 
     fn ensure_text_start(&mut self, out: &mut Vec<String>) {
         if self.text_started {
             return;
         }
-        if self.text_index < 0 {
-            self.text_index = self.next_block_index as i32;
-            self.next_block_index += 1;
-        }
-        let idx = self.text_index as u32;
+        let idx = Self::take_block_index(&mut self.text_index, &mut self.next_block_index);
         out.push(text_block_start(idx));
         self.text_started = true;
     }
@@ -429,11 +416,7 @@ impl AnthropicStreamEncoder {
         if self.thinking_started {
             return;
         }
-        if self.thinking_index < 0 {
-            self.thinking_index = self.next_block_index as i32;
-            self.next_block_index += 1;
-        }
-        let idx = self.thinking_index as u32;
+        let idx = Self::take_block_index(&mut self.thinking_index, &mut self.next_block_index);
         out.push(thinking_block_start(idx));
         self.thinking_started = true;
         // New thinking block — wait for a real signature or synthesize on stop.
@@ -465,72 +448,64 @@ impl AnthropicStreamEncoder {
     }
 
     fn stop_thinking(&mut self, out: &mut Vec<String>) {
-        if !self.thinking_started {
-            return;
+        if self.thinking_started {
+            self.emit_thinking_stop(self.thinking_index as u32, out);
         }
-        let idx = self.thinking_index as u32;
-        self.emit_thinking_stop(idx, out);
     }
 
     fn close_open_blocks(&mut self, out: &mut Vec<String>) {
         self.stop_thinking(out);
         self.stop_text(out);
-
         if self.content_blocks_stopped {
             return;
         }
-
         // Belated tool starts + stop all tools (CLIProxyAPI finish_reason path).
-        // Skip tools already closed via explicit content_block_stop (Anthropic→IR→Anthropic).
         let indexes: Vec<u32> = self.tools.keys().copied().collect();
         for openai_idx in indexes {
-            if self
-                .tools
-                .get(&openai_idx)
-                .map(|a| a.closed)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-
-            let needs_start = self
-                .tools
-                .get(&openai_idx)
-                .map(|a| !a.start_emitted && !a.name.is_empty())
-                .unwrap_or(false);
-            if needs_start {
-                // Synthetic id if missing (CLIProxyAPI SanitizeClaudeToolID).
-                {
-                    let acc = self.tools.entry(openai_idx).or_default();
-                    if acc.id.is_empty() {
-                        acc.id = format!("toolu_conduit_{openai_idx}");
-                    }
-                }
-                self.emit_tool_start(openai_idx, out);
-            }
-
-            let Some(acc) = self.tools.get_mut(&openai_idx) else {
-                continue;
-            };
-            if !acc.start_emitted {
-                continue;
-            }
-            let block_idx = self
-                .tool_block_indexes
-                .get(&openai_idx)
-                .copied()
-                .unwrap_or(0);
-            // Flush buffered args only when we never streamed them live
-            // (start was delayed until close).
-            if !acc.args_live_streamed && !acc.arguments.is_empty() {
-                let args = std::mem::take(&mut acc.arguments);
-                out.push(input_json_delta(block_idx, &args));
-            }
-            out.push(content_block_stop(block_idx));
-            acc.start_emitted = false;
-            acc.closed = true;
+            self.close_tool(openai_idx, out);
         }
         self.content_blocks_stopped = true;
+    }
+
+    /// Finish one tool: optional belated start (synthetic id), flush buffered
+    /// args, then `content_block_stop`. Skips tools already closed.
+    fn close_tool(&mut self, openai_idx: u32, out: &mut Vec<String>) {
+        if self.tools.get(&openai_idx).is_some_and(|a| a.closed) {
+            return;
+        }
+        // Belated start when name is known but start never emitted.
+        if self
+            .tools
+            .get(&openai_idx)
+            .is_some_and(|a| !a.start_emitted && !a.name.is_empty())
+        {
+            // Synthetic id if missing (CLIProxyAPI SanitizeClaudeToolID).
+            if let Some(acc) = self.tools.get_mut(&openai_idx) {
+                if acc.id.is_empty() {
+                    acc.id = format!("toolu_conduit_{openai_idx}");
+                }
+            }
+            self.emit_tool_start(openai_idx, out);
+        }
+
+        let Some(acc) = self.tools.get_mut(&openai_idx) else {
+            return;
+        };
+        if !acc.start_emitted {
+            return;
+        }
+        let block_idx = self.tool_block_indexes.get(&openai_idx).copied().unwrap_or(0);
+        // Flush buffered args only when we never streamed them live.
+        let args = if !acc.args_live_streamed && !acc.arguments.is_empty() {
+            Some(std::mem::take(&mut acc.arguments))
+        } else {
+            None
+        };
+        acc.mark_closed();
+        if let Some(args) = args {
+            out.push(input_json_delta(block_idx, &args));
+        }
+        out.push(content_block_stop(block_idx));
     }
 
     fn emit_message_delta(&mut self, out: &mut Vec<String>) {
@@ -539,10 +514,7 @@ impl AnthropicStreamEncoder {
         }
         let fr = self.finish_reason.clone().unwrap_or(FinishReason::Stop);
         let stop = finish_reason_to_anthropic(&fr);
-        let usage = self
-            .pending_usage
-            .clone()
-            .unwrap_or_default();
+        let usage = self.pending_usage.clone().unwrap_or_default();
         // Include input_tokens (non-standard vs pure Anthropic delta, which is
         // often output-only) so clients that miss message_start still get context.
         let data = json!({
@@ -550,7 +522,7 @@ impl AnthropicStreamEncoder {
             "delta": {"stop_reason": stop, "stop_sequence": null},
             "usage": anthropic_usage_json(&usage),
         });
-        out.push(format!("event: message_delta\ndata: {data}\n\n"));
+        out.push(sse_event("message_delta", &data));
         self.message_delta_sent = true;
     }
 
@@ -564,6 +536,20 @@ impl AnthropicStreamEncoder {
 }
 
 // ── Frame builders ──────────────────────────────────────────────────────────
+
+/// Chunk with no content payload (usage-only, block-stop marker, or empty).
+fn is_marker_chunk(chunk: &CanonicalChunk) -> bool {
+    chunk.finish_reason.is_none()
+        && chunk.delta.is_none()
+        && chunk.block_kind.is_none()
+        && chunk.tool_use_id.is_none()
+        && chunk.tool_name.is_none()
+}
+
+/// `event: {name}\ndata: {json}\n\n`
+pub(crate) fn sse_event(event: &str, data: &serde_json::Value) -> String {
+    format!("event: {event}\ndata: {data}\n\n")
+}
 
 /// Build Anthropic `usage` object (input/output + cache fields).
 pub fn anthropic_usage_json(u: &Usage) -> serde_json::Value {
@@ -603,7 +589,7 @@ pub fn encode_message_start_frame(
             "usage": anthropic_usage_json(&usage),
         }
     });
-    format!("event: message_start\ndata: {data}\n\n")
+    sse_event("message_start", &data)
 }
 
 /// Convenience: `message_start` with prompt tokens only (no cache).
@@ -615,86 +601,78 @@ pub fn encode_message_stop_frame() -> &'static str {
     "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 }
 
-fn text_block_start(index: u32) -> String {
+fn content_block_start(index: u32, content_block: serde_json::Value) -> String {
     let data = json!({
         "type": "content_block_start",
         "index": index,
-        "content_block": {"type": "text", "text": ""},
+        "content_block": content_block,
     });
-    format!("event: content_block_start\ndata: {data}\n\n")
+    sse_event("content_block_start", &data)
 }
 
-fn thinking_block_start(index: u32) -> String {
+fn content_block_delta(index: u32, delta: serde_json::Value) -> String {
     let data = json!({
-        "type": "content_block_start",
+        "type": "content_block_delta",
         "index": index,
-        "content_block": {"type": "thinking", "thinking": ""},
+        "delta": delta,
     });
-    format!("event: content_block_start\ndata: {data}\n\n")
+    sse_event("content_block_delta", &data)
 }
 
-fn tool_use_start(index: u32, id: &str, name: &str) -> String {
-    let data = json!({
-        "type": "content_block_start",
-        "index": index,
-        "content_block": {
+pub(crate) fn text_block_start(index: u32) -> String {
+    content_block_start(index, json!({"type": "text", "text": ""}))
+}
+
+pub(crate) fn thinking_block_start(index: u32) -> String {
+    content_block_start(index, json!({"type": "thinking", "thinking": ""}))
+}
+
+pub(crate) fn tool_use_start(index: u32, id: &str, name: &str) -> String {
+    content_block_start(
+        index,
+        json!({
             "type": "tool_use",
             "id": id,
             "name": name,
             "input": {},
-        },
-    });
-    format!("event: content_block_start\ndata: {data}\n\n")
+        }),
+    )
 }
 
-fn text_delta(index: u32, text: &str) -> String {
-    let data = json!({
-        "type": "content_block_delta",
-        "index": index,
-        "delta": {"type": "text_delta", "text": text},
-    });
-    format!("event: content_block_delta\ndata: {data}\n\n")
+pub(crate) fn text_delta(index: u32, text: &str) -> String {
+    content_block_delta(index, json!({"type": "text_delta", "text": text}))
 }
 
-fn thinking_delta(index: u32, thinking: &str) -> String {
-    let data = json!({
-        "type": "content_block_delta",
-        "index": index,
-        "delta": {"type": "thinking_delta", "thinking": thinking},
-    });
-    format!("event: content_block_delta\ndata: {data}\n\n")
+pub(crate) fn thinking_delta(index: u32, thinking: &str) -> String {
+    content_block_delta(index, json!({"type": "thinking_delta", "thinking": thinking}))
 }
 
-fn signature_delta(index: u32, signature: &str) -> String {
-    let data = json!({
-        "type": "content_block_delta",
-        "index": index,
-        "delta": {"type": "signature_delta", "signature": signature},
-    });
-    format!("event: content_block_delta\ndata: {data}\n\n")
+pub(crate) fn signature_delta(index: u32, signature: &str) -> String {
+    content_block_delta(
+        index,
+        json!({"type": "signature_delta", "signature": signature}),
+    )
 }
 
-fn input_json_delta(index: u32, partial_json: &str) -> String {
-    let data = json!({
-        "type": "content_block_delta",
-        "index": index,
-        "delta": {"type": "input_json_delta", "partial_json": partial_json},
-    });
-    format!("event: content_block_delta\ndata: {data}\n\n")
+pub(crate) fn input_json_delta(index: u32, partial_json: &str) -> String {
+    content_block_delta(
+        index,
+        json!({"type": "input_json_delta", "partial_json": partial_json}),
+    )
 }
 
-fn content_block_stop(index: u32) -> String {
-    let data = json!({"type": "content_block_stop", "index": index});
-    format!("event: content_block_stop\ndata: {data}\n\n")
+pub(crate) fn content_block_stop(index: u32) -> String {
+    sse_event(
+        "content_block_stop",
+        &json!({"type": "content_block_stop", "index": index}),
+    )
 }
 
 pub fn finish_reason_to_anthropic(fr: &FinishReason) -> &'static str {
     match fr {
-        FinishReason::Stop => "end_turn",
         FinishReason::ToolCalls => "tool_use",
         FinishReason::Length => "max_tokens",
-        FinishReason::ContentFilter => "end_turn",
-        FinishReason::Other(_) => "end_turn",
+        // Stop, ContentFilter, Other, and any future variants → end_turn.
         _ => "end_turn",
     }
 }

@@ -7,6 +7,8 @@ Conduit exposes OpenAI-compatible (Chat Completions and Responses) and Anthropic
 > [!WARNING]
 > Conduit is pre-release software under active development. Configuration and storage formats may change without migration support. There are no official binary releases yet; build from source for development and evaluation.
 
+![conduitctl Overview dashboard showing health, token usage, spend, model breakdown, and provider health](docs/assets/conduitctl-overview.jpg)
+
 ## Why Conduit?
 
 - **Local-first operation**: configuration, secrets, and usage records remain on the host running Conduit.
@@ -58,7 +60,7 @@ flowchart LR
 
 Requests pass through a layered pipeline: transport, ingress filters, routing, codec translation, upstream transport, and egress accounting (usage/cost ledger). The routing decision is pure and deterministic; configuration and usage records use SQLite.
 
-For crate boundaries, storage details, security trade-offs, and codec contracts, read [ARCHITECTURE.md](ARCHITECTURE.md).
+For crate boundaries, storage details, security trade-offs, and codec contracts, read [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Supported APIs and Providers
 
@@ -296,7 +298,7 @@ By default, Conduit stores its state under `~/.conduit`:
 | Usage records | SQLite |
 | Provider secrets | AES-256-GCM files under `{data_dir}/secrets/` (Argon2id KEK from master password) |
 
-Set `CONDUIT_MASTER_PASSWORD` (or `--master-password`) before storing production API keys. An empty password is allowed for local development only and is warned at startup. Treat the data directory as sensitive and read the full [security model](ARCHITECTURE.md#security-model).
+Set `CONDUIT_MASTER_PASSWORD` (or `--master-password`) before storing production API keys. An empty password is allowed for local development only and is warned at startup. Treat the data directory as sensitive and read the full [security model](docs/ARCHITECTURE.md#security-model).
 
 ## Development
 

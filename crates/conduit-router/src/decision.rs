@@ -232,19 +232,13 @@ fn select_from_pool<'a>(
     if pool.is_empty() {
         unreachable!("caller guarantees non-empty pool");
     }
-    match strategy {
-        RoutingStrategy::Fixed => pool[0],
-        RoutingStrategy::Fallback => {
-            let order = sticky_target_order_refs(pool, preferred_provider_id);
-            let idx = (attempt_no as usize).min(order.len() - 1);
-            order[idx]
-        }
-        RoutingStrategy::Weighted => {
-            let order = weighted_target_order_refs(pool, preferred_provider_id, seed);
-            let idx = (attempt_no as usize).min(order.len() - 1);
-            order[idx]
-        }
-    }
+    let order = match strategy {
+        RoutingStrategy::Fixed => return pool[0],
+        RoutingStrategy::Fallback => order_sticky(pool, preferred_provider_id),
+        RoutingStrategy::Weighted => order_weighted(pool, preferred_provider_id, seed),
+    };
+    let idx = (attempt_no as usize).min(order.len() - 1);
+    order[idx]
 }
 
 /// Non-cooling targets first; if `skip` is empty/None, all targets.
@@ -255,73 +249,81 @@ fn filter_targets_by_cooldown<'a>(
     let Some(skip) = skip.filter(|s| !s.is_empty()) else {
         return targets.iter().collect();
     };
-    let available: Vec<_> = targets
+    targets
         .iter()
         .filter(|t| !skip.contains(&t.provider_id))
-        .collect();
-    available
+        .collect()
 }
 
-fn sticky_target_order_refs<'a>(
+/// Move `targets[first_idx]` to the front; preserve relative order of the rest.
+fn reorder_first_at<'a>(targets: &[&'a RouteTarget], first_idx: usize) -> Vec<&'a RouteTarget> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let first_idx = first_idx.min(targets.len() - 1);
+    let mut out = Vec::with_capacity(targets.len());
+    out.push(targets[first_idx]);
+    out.extend(
+        targets
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != first_idx)
+            .map(|(_, t)| *t),
+    );
+    out
+}
+
+/// Preferred provider first (if still listed), else table order.
+fn order_sticky<'a>(
     targets: &[&'a RouteTarget],
     preferred_provider_id: Option<&str>,
 ) -> Vec<&'a RouteTarget> {
     if let Some(pref) = preferred_provider_id.filter(|s| !s.is_empty()) {
-        if targets.iter().any(|t| t.provider_id == pref) {
-            let mut out = Vec::with_capacity(targets.len());
-            if let Some(t) = targets.iter().find(|t| t.provider_id == pref) {
-                out.push(*t);
-            }
-            for t in targets {
-                if t.provider_id != pref {
-                    out.push(*t);
-                }
-            }
-            return out;
+        if let Some(pin_idx) = targets.iter().position(|t| t.provider_id == pref) {
+            return reorder_first_at(targets, pin_idx);
         }
     }
     targets.to_vec()
 }
 
-fn weighted_target_order_refs<'a>(
+/// Sticky pin wins when present; otherwise weight-pick the first attempt target.
+fn order_weighted<'a>(
     targets: &[&'a RouteTarget],
     preferred_provider_id: Option<&str>,
     seed: u64,
 ) -> Vec<&'a RouteTarget> {
-    if preferred_provider_id
-        .filter(|s| !s.is_empty())
-        .is_some_and(|p| targets.iter().any(|t| t.provider_id == p))
-    {
-        return sticky_target_order_refs(targets, preferred_provider_id);
-    }
-    // Convert to owned slice of RouteTarget for pick_weighted_index compatibility
-    // by building index over references with weight.
-    let first_idx = pick_weighted_index_refs(targets, seed);
-    let first = targets[first_idx];
-    let mut out = Vec::with_capacity(targets.len());
-    out.push(first);
-    for (i, t) in targets.iter().enumerate() {
-        if i != first_idx {
-            out.push(*t);
+    if let Some(pref) = preferred_provider_id.filter(|s| !s.is_empty()) {
+        if let Some(pin_idx) = targets.iter().position(|t| t.provider_id == pref) {
+            return reorder_first_at(targets, pin_idx);
         }
     }
-    out
+    let first_idx =
+        pick_weighted_among(targets.iter().map(|t| t.weight), targets.len(), seed);
+    reorder_first_at(targets, first_idx)
 }
 
-fn pick_weighted_index_refs(targets: &[&RouteTarget], seed: u64) -> usize {
-    let total: u64 = targets.iter().map(|t| t.weight as u64).sum();
-    if total == 0 {
+/// Weighted index from a weight sequence. Zero-weight entries are skipped; if
+/// all weights are zero, falls back to `seed % len`.
+fn pick_weighted_among(
+    weights: impl Iterator<Item = u32> + Clone,
+    len: usize,
+    seed: u64,
+) -> usize {
+    if len == 0 {
         return 0;
     }
+    let total: u64 = weights.clone().map(u64::from).sum();
+    if total == 0 {
+        return (seed as usize) % len;
+    }
     let mut r = seed % total;
-    for (i, t) in targets.iter().enumerate() {
-        let w = t.weight as u64;
+    for (i, w) in weights.map(u64::from).enumerate() {
         if r < w {
             return i;
         }
         r -= w;
     }
-    0
+    len - 1
 }
 
 /// Preferred provider first (if still listed), then remaining targets in table order.
@@ -331,21 +333,8 @@ pub fn sticky_target_order<'a>(
     targets: &'a [RouteTarget],
     preferred_provider_id: Option<&str>,
 ) -> Vec<&'a RouteTarget> {
-    if let Some(pref) = preferred_provider_id.filter(|s| !s.is_empty()) {
-        if targets.iter().any(|t| t.provider_id == pref) {
-            let mut out = Vec::with_capacity(targets.len());
-            if let Some(t) = targets.iter().find(|t| t.provider_id == pref) {
-                out.push(t);
-            }
-            for t in targets {
-                if t.provider_id != pref {
-                    out.push(t);
-                }
-            }
-            return out;
-        }
-    }
-    targets.iter().collect()
+    let refs: Vec<&RouteTarget> = targets.iter().collect();
+    order_sticky(&refs, preferred_provider_id)
 }
 
 /// Build attempt order for weighted LB: sticky pin wins; else weight-pick first.
@@ -354,45 +343,14 @@ pub fn weighted_target_order<'a>(
     preferred_provider_id: Option<&str>,
     seed: u64,
 ) -> Vec<&'a RouteTarget> {
-    if preferred_provider_id
-        .filter(|s| !s.is_empty())
-        .is_some_and(|p| targets.iter().any(|t| t.provider_id == p))
-    {
-        return sticky_target_order(targets, preferred_provider_id);
-    }
-
-    let first_idx = pick_weighted_index(targets, seed);
-    let first = &targets[first_idx];
-    let mut out = Vec::with_capacity(targets.len());
-    out.push(first);
-    for (i, t) in targets.iter().enumerate() {
-        if i != first_idx {
-            out.push(t);
-        }
-    }
-    out
+    let refs: Vec<&RouteTarget> = targets.iter().collect();
+    order_weighted(&refs, preferred_provider_id, seed)
 }
 
 /// Weighted index among targets. Zero-weight targets are skipped; if all zero,
 /// falls back to `seed % len`.
 pub fn pick_weighted_index(targets: &[RouteTarget], seed: u64) -> usize {
-    if targets.is_empty() {
-        return 0;
-    }
-    let weights: Vec<u32> = targets.iter().map(|t| t.weight).collect();
-    let total: u64 = weights.iter().map(|&w| u64::from(w)).sum();
-    if total == 0 {
-        return (seed as usize) % targets.len();
-    }
-    let mut r = seed % total;
-    for (i, &w) in weights.iter().enumerate() {
-        let w = u64::from(w);
-        if r < w {
-            return i;
-        }
-        r -= w;
-    }
-    targets.len() - 1
+    pick_weighted_among(targets.iter().map(|t| t.weight), targets.len(), seed)
 }
 
 // ---------------------------------------------------------------------------
@@ -605,6 +563,23 @@ mod tests {
                 "seed {seed} should pick weight-100 target"
             );
         }
+    }
+
+    #[test]
+    fn pick_weighted_all_zero_weights_uses_seed_mod_len() {
+        let targets = vec![target_w("a", "m", 0), target_w("b", "m", 0), target_w("c", "m", 0)];
+        assert_eq!(pick_weighted_index(&targets, 0), 0);
+        assert_eq!(pick_weighted_index(&targets, 1), 1);
+        assert_eq!(pick_weighted_index(&targets, 2), 2);
+        assert_eq!(pick_weighted_index(&targets, 5), 2); // 5 % 3
+        // Production path (cooldown-filtered refs → order_weighted) must match.
+        let table = RoutingTable::new([weighted_route("lb", targets)]);
+        assert_eq!(
+            route_with_seed("lb", &table, 0, None, 1)
+                .unwrap()
+                .provider_id,
+            "b"
+        );
     }
 
     #[test]

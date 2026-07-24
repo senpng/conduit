@@ -79,82 +79,118 @@ async fn build_client(proxy_url: Option<&str>) -> Result<reqwest::Client, OAuthE
         .map_err(|e| OAuthError::Network(e.to_string()))
 }
 
-async fn fetch_claude(
-    resolved: &ResolvedCredential,
-    proxy_url: Option<&str>,
-) -> Result<OAuthQuotaProbe, OAuthError> {
-    let _ = resolved.auth_mode; // token is authoritative
-    let client = build_client(proxy_url).await?;
-    let token = resolved.access_token.expose_secret();
-    let resp = client
-        .get(CLAUDE_USAGE_URL)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("anthropic-beta", CLAUDE_OAUTH_BETA)
-        .header("anthropic-version", CLAUDE_ANTHROPIC_VERSION)
-        .header("User-Agent", "claude-cli/2.1.201 (external, cli)")
-        .header("x-app", "cli")
-        .send()
-        .await
-        .map_err(|e| OAuthError::Network(e.to_string()))?;
+fn body_preview(s: &str) -> String {
+    s.chars().take(200).collect()
+}
+
+/// Map HTTP status + body preview to auth refresh or provider error.
+///
+/// `ok` decides success: Claude/Codex use any 2xx; Grok historically requires exact 200.
+fn map_probe_http_status(
+    label: &str,
+    status: u16,
+    preview: String,
+    ok: impl FnOnce(u16) -> bool,
+) -> Result<(), OAuthError> {
+    if status == 401 || status == 403 {
+        return Err(OAuthError::TokenRefresh {
+            status,
+            body: preview,
+        });
+    }
+    if !ok(status) {
+        return Err(OAuthError::Provider(format!(
+            "{label} HTTP {status}: {preview}"
+        )));
+    }
+    Ok(())
+}
+
+fn http_ok_2xx(status: u16) -> bool {
+    (200..300).contains(&status)
+}
+
+fn http_ok_200(status: u16) -> bool {
+    status == 200
+}
+
+async fn response_text(resp: reqwest::Response) -> Result<(u16, String), OAuthError> {
     let status = resp.status().as_u16();
     let body = resp
         .text()
         .await
         .map_err(|e| OAuthError::Network(e.to_string()))?;
-    if status == 401 || status == 403 {
-        return Err(OAuthError::TokenRefresh {
-            status,
-            body: body.chars().take(200).collect(),
-        });
-    }
-    if !(200..300).contains(&status) {
-        return Err(OAuthError::Provider(format!(
-            "claude usage HTTP {status}: {}",
-            body.chars().take(200).collect::<String>()
-        )));
-    }
-    parse_claude_usage(&body)
+    Ok((status, body))
+}
+
+/// Shared JSON usage probe: build request → send → status map → parse.
+async fn fetch_json_usage(
+    proxy_url: Option<&str>,
+    label: &str,
+    build: impl FnOnce(&reqwest::Client) -> reqwest::RequestBuilder,
+    parse: fn(&str) -> Result<OAuthQuotaProbe, OAuthError>,
+) -> Result<OAuthQuotaProbe, OAuthError> {
+    let client = build_client(proxy_url).await?;
+    let resp = build(&client)
+        .send()
+        .await
+        .map_err(|e| OAuthError::Network(e.to_string()))?;
+    let (status, body) = response_text(resp).await?;
+    map_probe_http_status(label, status, body_preview(&body), http_ok_2xx)?;
+    parse(&body)
+}
+
+async fn fetch_claude(
+    resolved: &ResolvedCredential,
+    proxy_url: Option<&str>,
+) -> Result<OAuthQuotaProbe, OAuthError> {
+    let _ = resolved.auth_mode; // token is authoritative
+    let token = resolved.access_token.expose_secret().to_string();
+    fetch_json_usage(
+        proxy_url,
+        "claude usage",
+        |client| {
+            client
+                .get(CLAUDE_USAGE_URL)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("anthropic-beta", CLAUDE_OAUTH_BETA)
+                .header("anthropic-version", CLAUDE_ANTHROPIC_VERSION)
+                .header("User-Agent", "claude-cli/2.1.201 (external, cli)")
+                .header("x-app", "cli")
+        },
+        parse_claude_usage,
+    )
+    .await
 }
 
 async fn fetch_codex(
     resolved: &ResolvedCredential,
     proxy_url: Option<&str>,
 ) -> Result<OAuthQuotaProbe, OAuthError> {
-    let client = build_client(proxy_url).await?;
-    let token = resolved.access_token.expose_secret();
-    let mut req = client
-        .get(CODEX_USAGE_URL)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("User-Agent", "codex-tui/0.135.0")
-        .header("Originator", "codex-tui");
-    // Inject Chatgpt-Account-Id when present on the credential extras.
-    for (k, v) in &resolved.extra_headers {
-        if k.eq_ignore_ascii_case("Chatgpt-Account-Id") {
-            req = req.header(k.as_str(), v.as_str());
-        }
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| OAuthError::Network(e.to_string()))?;
-    let status = resp.status().as_u16();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| OAuthError::Network(e.to_string()))?;
-    if status == 401 || status == 403 {
-        return Err(OAuthError::TokenRefresh {
-            status,
-            body: body.chars().take(200).collect(),
-        });
-    }
-    if !(200..300).contains(&status) {
-        return Err(OAuthError::Provider(format!(
-            "codex usage HTTP {status}: {}",
-            body.chars().take(200).collect::<String>()
-        )));
-    }
-    parse_codex_usage(&body)
+    let token = resolved.access_token.expose_secret().to_string();
+    let account_headers: Vec<(String, String)> = resolved
+        .extra_headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("Chatgpt-Account-Id"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    fetch_json_usage(
+        proxy_url,
+        "codex usage",
+        |client| {
+            let mut req = client
+                .get(CODEX_USAGE_URL)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("User-Agent", "codex-tui/0.135.0")
+                .header("Originator", "codex-tui");
+            for (k, v) in &account_headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            req
+        },
+        parse_codex_usage,
+    )
+    .await
 }
 
 /// Grok monthly credits via grok.com gRPC-web (CodexBar `GrokWebBillingFetcher` parity).
@@ -190,21 +226,13 @@ async fn fetch_grok(
         .bytes()
         .await
         .map_err(|e| OAuthError::Network(e.to_string()))?;
-
-    if status == 401 || status == 403 {
-        let preview = String::from_utf8_lossy(&bytes);
-        return Err(OAuthError::TokenRefresh {
-            status,
-            body: preview.chars().take(200).collect(),
-        });
-    }
-    if status != 200 {
-        let preview = String::from_utf8_lossy(&bytes);
-        return Err(OAuthError::Provider(format!(
-            "grok billing HTTP {status}: {}",
-            preview.chars().take(200).collect::<String>()
-        )));
-    }
+    // Exact 200 only (not the broader 2xx band used by JSON probes).
+    map_probe_http_status(
+        "grok billing",
+        status,
+        body_preview(&String::from_utf8_lossy(&bytes)),
+        http_ok_200,
+    )?;
 
     // Surface gRPC status from headers or trailers before parsing.
     if let Some(err) = grpc_status_error_from_headers(&headers) {
@@ -217,36 +245,33 @@ async fn fetch_grok(
     parse_grok_billing_protobuf(&bytes)
 }
 
+fn grpc_status_error(status: i32, message: &str) -> Option<OAuthError> {
+    (status != 0).then(|| classify_grok_rpc_status(status, message))
+}
+
 fn grpc_status_error_from_headers(headers: &reqwest::header::HeaderMap) -> Option<OAuthError> {
     let status = headers
         .get("grpc-status")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<i32>().ok())?;
-    if status == 0 {
-        return None;
-    }
     let message = headers
         .get("grpc-message")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    Some(classify_grok_rpc_status(status, &message))
+        .unwrap_or("");
+    grpc_status_error(status, message)
 }
 
 fn grpc_status_error_from_trailers(data: &[u8]) -> Option<OAuthError> {
     let fields = grpc_web_trailer_fields(data);
     let status = fields.get("grpc-status")?.parse::<i32>().ok()?;
-    if status == 0 {
-        return None;
-    }
-    let message = fields.get("grpc-message").cloned().unwrap_or_default();
-    Some(classify_grok_rpc_status(status, &message))
+    let message = fields.get("grpc-message").map(String::as_str).unwrap_or("");
+    grpc_status_error(status, message)
 }
 
 fn classify_grok_rpc_status(status: i32, message: &str) -> OAuthError {
     let lower = message.to_ascii_lowercase();
     // gRPC UNAUTHENTICATED = 16; PERMISSION_DENIED = 7 with bad-credentials text.
-    if status == 16
+    let auth_denied = status == 16
         || (status == 7
             && (lower.contains("bad-credentials")
                 || lower.contains("unauthenticated")
@@ -254,17 +279,15 @@ fn classify_grok_rpc_status(status: i32, message: &str) -> OAuthError {
                 || (lower.contains("access token")
                     && (lower.contains("invalid")
                         || lower.contains("expired")
-                        || lower.contains("could not be validated")))))
-    {
+                        || lower.contains("could not be validated")))));
+    if auth_denied {
         return OAuthError::TokenRefresh {
             status: 401,
             body: format!("grok billing grpc-status={status}: {message}"),
         };
     }
     // FAILED_PRECONDITION = 9 "no personal team"
-    if status == 9
-        && (lower.contains("no personal team") || lower.trim() == "no personal team.")
-    {
+    if status == 9 && lower.contains("no personal team") {
         return OAuthError::Provider(
             "grok team usage is unavailable from the current billing surface".into(),
         );
@@ -284,9 +307,7 @@ pub fn parse_claude_usage(body: &str) -> Result<OAuthQuotaProbe, OAuthError> {
 
     // When five_hour is empty, weekly becomes the primary signal (CodexBar parity).
     if session.is_none() {
-        if let Some(w) = weekly.clone() {
-            session = Some(w);
-        }
+        session = weekly.clone();
     }
 
     // Model-scoped weekly (opus/sonnet) — only if main weekly missing.
@@ -297,35 +318,7 @@ pub fn parse_claude_usage(body: &str) -> Result<OAuthQuotaProbe, OAuthError> {
 
     if session.is_none() && weekly.is_none() {
         // Richer body may only have `limits` array.
-        let mut lim_session = None;
-        let mut lim_weekly = None;
-        if let Some(arr) = v.get("limits").and_then(|x| x.as_array()) {
-            for lim in arr {
-                let kind = lim.get("kind").and_then(|x| x.as_str()).unwrap_or("");
-                let pct = lim
-                    .get("percent")
-                    .and_then(|x| x.as_f64())
-                    .or_else(|| lim.get("percent").and_then(|x| x.as_i64()).map(|i| i as f64));
-                let Some(used) = pct else { continue };
-                let resets = lim
-                    .get("resets_at")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string());
-                let win = Some(QuotaWindow {
-                    used_pct: normalize_used_pct(used),
-                    remaining_pct: used_to_remaining(used),
-                    resets_at: resets,
-                });
-                match kind {
-                    "session" if lim_session.is_none() => lim_session = win,
-                    "weekly_all" | "weekly" if lim_weekly.is_none() => lim_weekly = win,
-                    "weekly_scoped" if lim_weekly.is_none() => lim_weekly = win,
-                    _ => {}
-                }
-            }
-        }
-        session = lim_session;
-        weekly = lim_weekly;
+        fill_claude_windows_from_limits(&v, &mut session, &mut weekly);
         if session.is_none() && weekly.is_none() {
             return Err(OAuthError::Provider(
                 "claude usage: no five_hour/seven_day windows".into(),
@@ -342,29 +335,69 @@ pub fn parse_claude_usage(body: &str) -> Result<OAuthQuotaProbe, OAuthError> {
     })
 }
 
+/// Fill session/weekly from Claude `limits[]` when five_hour/seven_day are absent.
+fn fill_claude_windows_from_limits(
+    v: &Value,
+    session: &mut Option<QuotaWindow>,
+    weekly: &mut Option<QuotaWindow>,
+) {
+    let Some(arr) = v.get("limits").and_then(|x| x.as_array()) else {
+        return;
+    };
+    for lim in arr {
+        let kind = lim.get("kind").and_then(|x| x.as_str()).unwrap_or("");
+        let Some(used) = json_f64(lim.get("percent")) else {
+            continue;
+        };
+        let win = Some(quota_window(used, json_reset_at(lim)));
+        match kind {
+            "session" if session.is_none() => *session = win,
+            "weekly_all" | "weekly" | "weekly_scoped" if weekly.is_none() => *weekly = win,
+            _ => {}
+        }
+    }
+}
+
+/// Build a quota window from a used-capacity value (fraction or percent).
+fn quota_window(used: f64, resets_at: Option<String>) -> QuotaWindow {
+    QuotaWindow {
+        used_pct: normalize_used_pct(used),
+        remaining_pct: used_to_remaining(used),
+        resets_at,
+    }
+}
+
+/// JSON number as f64 (accepts int or float).
+fn json_f64(node: Option<&Value>) -> Option<f64> {
+    let node = node?;
+    node.as_f64()
+        .or_else(|| node.as_i64().map(|i| i as f64))
+        .or_else(|| node.as_u64().map(|u| u as f64))
+}
+
+/// First matching string/number reset field among common key names.
+fn json_reset_at(node: &Value) -> Option<String> {
+    const KEYS: &[&str] = &["resets_at", "reset_at", "reset_after"];
+    for key in KEYS {
+        if let Some(v) = node.get(*key) {
+            if let Some(s) = v.as_str() {
+                return Some(s.to_string());
+            }
+            if let Some(n) = v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)) {
+                return Some(n.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn window_from_utilization(node: Option<&Value>) -> Option<QuotaWindow> {
     let node = node?;
     if node.is_null() {
         return None;
     }
-    let used = node
-        .get("utilization")
-        .and_then(|x| x.as_f64())
-        .or_else(|| {
-            node.get("utilization")
-                .and_then(|x| x.as_i64())
-                .map(|i| i as f64)
-        })
-        .unwrap_or(0.0);
-    let resets_at = node
-        .get("resets_at")
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string());
-    Some(QuotaWindow {
-        used_pct: normalize_used_pct(used),
-        remaining_pct: used_to_remaining(used),
-        resets_at,
-    })
+    let used = json_f64(node.get("utilization")).unwrap_or(0.0);
+    Some(quota_window(used, json_reset_at(node)))
 }
 
 /// Parse Codex `wham/usage` JSON into session/weekly windows.
@@ -394,49 +427,7 @@ pub fn parse_codex_usage(body: &str) -> Result<OAuthQuotaProbe, OAuthError> {
         .or_else(|| rl.get("secondary"))
         .or_else(|| v.get("secondary_window"));
 
-    let nodes: Vec<&Value> = [primary, secondary].into_iter().flatten().collect();
-    let any_duration = nodes.iter().any(|n| codex_window_secs(n).is_some());
-
-    let mut session = None;
-    let mut weekly = None;
-
-    if any_duration {
-        // Prefer duration-based classification.
-        // ~5h = 18000 (legacy), ~7d = 604800 — allow slack.
-        for node in &nodes {
-            let win = window_from_codex_node(Some(node));
-            match codex_window_secs(node) {
-                Some(secs) if (3_600..43_200).contains(&secs) => session = win,
-                Some(secs) if secs >= 86_400 => weekly = win,
-                // Unknown band or missing on this node: default to weekly.
-                _ => {
-                    if weekly.is_none() {
-                        weekly = win;
-                    } else if session.is_none() {
-                        session = win;
-                    }
-                }
-            }
-        }
-    } else {
-        // No durations at all.
-        match (
-            window_from_codex_node(primary),
-            window_from_codex_node(secondary),
-        ) {
-            // Legacy dual-window shape without durations: primary≈session, secondary≈weekly.
-            (Some(p), Some(s)) => {
-                session = Some(p);
-                weekly = Some(s);
-            }
-            // Single window → weekly only (current Codex product).
-            (Some(only), None) | (None, Some(only)) => {
-                weekly = Some(only);
-            }
-            (None, None) => {}
-        }
-    }
-
+    let (session, weekly) = classify_codex_windows(primary, secondary);
     if session.is_none() && weekly.is_none() {
         return Err(OAuthError::Provider(
             "codex usage: no rate_limit windows".into(),
@@ -451,6 +442,41 @@ pub fn parse_codex_usage(body: &str) -> Result<OAuthQuotaProbe, OAuthError> {
     })
 }
 
+/// Map primary/secondary Codex windows → (session, weekly).
+///
+/// Duration bands: ~5h (3600..43200) → session; ≥1d → weekly. Without durations,
+/// dual windows keep legacy primary=session/secondary=weekly; a single window is weekly.
+fn classify_codex_windows(
+    primary: Option<&Value>,
+    secondary: Option<&Value>,
+) -> (Option<QuotaWindow>, Option<QuotaWindow>) {
+    let nodes: Vec<&Value> = [primary, secondary].into_iter().flatten().collect();
+    if nodes.iter().any(|n| codex_window_secs(n).is_some()) {
+        let mut session = None;
+        let mut weekly = None;
+        for node in &nodes {
+            let win = window_from_codex_node(Some(node));
+            match codex_window_secs(node) {
+                Some(secs) if (3_600..43_200).contains(&secs) => session = win,
+                Some(secs) if secs >= 86_400 => weekly = win,
+                // Unknown band: prefer weekly, then session.
+                _ if weekly.is_none() => weekly = win,
+                _ if session.is_none() => session = win,
+                _ => {}
+            }
+        }
+        return (session, weekly);
+    }
+    match (
+        window_from_codex_node(primary),
+        window_from_codex_node(secondary),
+    ) {
+        (Some(p), Some(s)) => (Some(p), Some(s)),
+        (Some(only), None) | (None, Some(only)) => (None, Some(only)),
+        (None, None) => (None, None),
+    }
+}
+
 fn codex_window_secs(node: &Value) -> Option<u64> {
     node.get("limit_window_seconds")
         .or_else(|| node.get("limit_window_secs"))
@@ -462,34 +488,11 @@ fn window_from_codex_node(node: Option<&Value>) -> Option<QuotaWindow> {
     if node.is_null() {
         return None;
     }
-    let used = node
-        .get("used_percent")
-        .or_else(|| node.get("used_pct"))
-        .or_else(|| node.get("utilization"))
-        .and_then(|x| x.as_f64())
-        .or_else(|| {
-            node.get("used_percent")
-                .and_then(|x| x.as_i64())
-                .map(|i| i as f64)
-        })?;
-    let resets_at = node
-        .get("reset_at")
-        .or_else(|| node.get("resets_at"))
-        .or_else(|| node.get("reset_after"))
-        .and_then(|x| {
-            if let Some(s) = x.as_str() {
-                Some(s.to_string())
-            } else if let Some(n) = x.as_i64().or_else(|| x.as_u64().map(|u| u as i64)) {
-                Some(n.to_string())
-            } else {
-                None
-            }
-        });
-    Some(QuotaWindow {
-        used_pct: normalize_used_pct(used),
-        remaining_pct: used_to_remaining(used),
-        resets_at,
-    })
+    // Prefer used_percent / used_pct; fall back to utilization.
+    let used = json_f64(node.get("used_percent"))
+        .or_else(|| json_f64(node.get("used_pct")))
+        .or_else(|| json_f64(node.get("utilization")))?;
+    Some(quota_window(used, json_reset_at(node)))
 }
 
 /// Parse Grok gRPC-web protobuf billing response into a monthly credits window.
@@ -519,67 +522,15 @@ pub fn parse_grok_billing_protobuf(data: &[u8]) -> Result<OAuthQuotaProbe, OAuth
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // Prefer shallowest fixed32 path ending in field 1 with value in 0..=100.
-    let mut candidates: Vec<(usize, usize, f32)> = scan
-        .fixed32
-        .iter()
-        .filter(|f| {
-            f.path.last() == Some(&1)
-                && f.value.is_finite()
-                && (0.0..=100.0).contains(&f.value)
-        })
-        .map(|f| (f.path.len(), f.order, f.value))
-        .collect();
-    candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    let parsed_used = candidates.first().map(|c| c.2 as f64);
-
-    let reset_candidates: Vec<(Vec<u64>, u64)> = scan
-        .varints
-        .iter()
-        .filter(|f| (1_700_000_000..=2_100_000_000).contains(&f.value))
-        .map(|f| (f.path.clone(), f.value))
-        .collect();
-    // Prefer future resets; prefer path [1,5,1] (CodexBar).
-    let future: Vec<_> = reset_candidates
-        .iter()
-        .filter(|(_, ts)| *ts > now)
-        .cloned()
-        .collect();
-    let preferred = future
-        .iter()
-        .find(|(path, _)| path.as_slice() == [1, 5, 1])
-        .or_else(|| future.iter().min_by_key(|(_, ts)| *ts))
-        .or_else(|| {
-            reset_candidates
-                .iter()
-                .find(|(path, _)| path.as_slice() == [1, 5, 1])
-        })
-        .or_else(|| reset_candidates.iter().min_by_key(|(_, ts)| *ts));
-    let resets_at = preferred.map(|(_, ts)| ts.to_string());
-
-    let has_usage_period = scan.varints.iter().any(|f| {
-        f.path.starts_with(&[1, 6])
-            || (f.path.as_slice() == [1, 8, 1] && (f.value == 1 || f.value == 2))
-    });
-    let no_usage_yet =
-        parsed_used.is_none() && scan.fixed32.is_empty() && resets_at.is_some() && has_usage_period;
-
-    let used = match parsed_used {
+    let resets_at = grok_reset_from_scan(&scan, now);
+    let used = match grok_used_pct_from_scan(&scan) {
         Some(u) => u,
-        None if no_usage_yet => 0.0,
+        None if grok_empty_usage_ok(&scan, resets_at.is_some()) => 0.0,
         None => {
             return Err(OAuthError::Provider(
                 "grok billing: could not parse credit usage percent".into(),
             ));
         }
-    };
-
-    let used_pct = normalize_used_pct(used);
-    let remaining_pct = used_to_remaining(used);
-    let monthly = QuotaWindow {
-        remaining_pct,
-        used_pct,
-        resets_at,
     };
 
     let hex_preview: String = data
@@ -594,75 +545,132 @@ pub fn parse_grok_billing_protobuf(data: &[u8]) -> Result<OAuthQuotaProbe, OAuth
         // Grok has no 5h session window from this endpoint.
         session: None,
         // Store monthly credits in the longer-window slot.
-        weekly: Some(monthly),
+        weekly: Some(quota_window(used, resets_at)),
         source: "oauth_billing_api",
         raw_excerpt: format!("grpc-web {} bytes; head={hex_preview}", data.len()),
     })
 }
 
+/// Empty usage period with only a reset timestamp → treat used as 0%.
+fn grok_empty_usage_ok(scan: &ProtobufScan, has_reset: bool) -> bool {
+    if !has_reset || !scan.fixed32.is_empty() {
+        return false;
+    }
+    scan.varints.iter().any(|f| {
+        f.path.starts_with(&[1, 6])
+            || (f.path.as_slice() == [1, 8, 1] && (f.value == 1 || f.value == 2))
+    })
+}
+
+/// Shallowest fixed32 path ending in field 1 with value in 0..=100.
+fn grok_used_pct_from_scan(scan: &ProtobufScan) -> Option<f64> {
+    let mut candidates: Vec<(usize, usize, f32)> = scan
+        .fixed32
+        .iter()
+        .filter(|f| {
+            f.path.last() == Some(&1) && f.value.is_finite() && (0.0..=100.0).contains(&f.value)
+        })
+        .map(|f| (f.path.len(), f.order, f.value))
+        .collect();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    candidates.first().map(|c| c.2 as f64)
+}
+
+/// Prefer future reset at path [1,5,1] (CodexBar), else earliest future, else any.
+fn grok_reset_from_scan(scan: &ProtobufScan, now: u64) -> Option<String> {
+    let resets: Vec<(Vec<u64>, u64)> = scan
+        .varints
+        .iter()
+        .filter(|f| (1_700_000_000..=2_100_000_000).contains(&f.value))
+        .map(|f| (f.path.clone(), f.value))
+        .collect();
+    let prefer = |items: &[(Vec<u64>, u64)]| {
+        items
+            .iter()
+            .find(|(path, _)| path.as_slice() == [1, 5, 1])
+            .or_else(|| items.iter().min_by_key(|(_, ts)| *ts))
+            .map(|(_, ts)| ts.to_string())
+    };
+    let future: Vec<_> = resets
+        .iter()
+        .filter(|(_, ts)| *ts > now)
+        .cloned()
+        .collect();
+    prefer(&future).or_else(|| prefer(&resets))
+}
+
 // ── gRPC-web / protobuf helpers (CodexBar GrokWebBillingFetcher) ────────────
+
+/// Parse one gRPC-web frame header: `(flags, payload_range, next_index)`.
+fn grpc_web_frame_at(data: &[u8], index: usize) -> Option<(u8, std::ops::Range<usize>, usize)> {
+    if index + 5 > data.len() {
+        return None;
+    }
+    let flags = data[index];
+    let length = u32::from_be_bytes([
+        data[index + 1],
+        data[index + 2],
+        data[index + 3],
+        data[index + 4],
+    ]) as usize;
+    let start = index + 5;
+    let end = start.checked_add(length)?;
+    if end > data.len() {
+        return None;
+    }
+    Some((flags, start..end, end))
+}
+
+/// Walk gRPC-web frames. On a truncated/invalid header:
+/// - `strict`: abort and return `false` (data-frame path — bad stream)
+/// - non-strict: stop early and return `true` (trailers are best-effort)
+fn for_each_grpc_web_frame(
+    data: &[u8],
+    strict: bool,
+    mut visit: impl FnMut(u8, &[u8]),
+) -> bool {
+    let mut index = 0usize;
+    while index < data.len() {
+        let Some((flags, range, next)) = grpc_web_frame_at(data, index) else {
+            return !strict;
+        };
+        visit(flags, &data[range]);
+        index = next;
+    }
+    true
+}
 
 fn grpc_web_data_frames(data: &[u8]) -> Vec<Vec<u8>> {
     let mut frames = Vec::new();
-    let mut index = 0usize;
-    while index < data.len() {
-        if index + 5 > data.len() {
-            return Vec::new();
-        }
-        let flags = data[index];
-        let length = u32::from_be_bytes([
-            data[index + 1],
-            data[index + 2],
-            data[index + 3],
-            data[index + 4],
-        ]) as usize;
-        let start = index + 5;
-        let end = start.saturating_add(length);
-        if end > data.len() {
-            return Vec::new();
-        }
+    let ok = for_each_grpc_web_frame(data, true, |flags, payload| {
         // Trailer frames have high bit set (0x80).
         if flags & 0x80 == 0 {
-            frames.push(data[start..end].to_vec());
+            frames.push(payload.to_vec());
         }
-        index = end;
+    });
+    if ok {
+        frames
+    } else {
+        Vec::new()
     }
-    frames
 }
 
 fn grpc_web_trailer_fields(data: &[u8]) -> std::collections::HashMap<String, String> {
     let mut fields = std::collections::HashMap::new();
-    let mut index = 0usize;
-    while index + 5 <= data.len() {
-        let flags = data[index];
-        let length = u32::from_be_bytes([
-            data[index + 1],
-            data[index + 2],
-            data[index + 3],
-            data[index + 4],
-        ]) as usize;
-        let start = index + 5;
-        let end = start.saturating_add(length);
-        if end > data.len() {
-            break;
+    let _ = for_each_grpc_web_frame(data, false, |flags, payload| {
+        // Trailer frames have high bit set (0x80).
+        if flags & 0x80 == 0 {
+            return;
         }
-        if flags & 0x80 != 0 {
-            if let Ok(text) = std::str::from_utf8(&data[start..end]) {
-                for line in text.lines() {
-                    if line.is_empty() {
-                        continue;
-                    }
-                    if let Some((k, v)) = line.split_once(':') {
-                        fields.insert(
-                            k.trim().to_ascii_lowercase(),
-                            v.trim().to_string(),
-                        );
-                    }
-                }
+        let Ok(text) = std::str::from_utf8(payload) else {
+            return;
+        };
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            if let Some((k, v)) = line.split_once(':') {
+                fields.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
             }
         }
-        index = end;
-    }
+    });
     fields
 }
 
@@ -703,14 +711,18 @@ fn scan_protobuf(data: &[u8], depth: u8, path: &[u64]) -> ProtobufScan {
     let mut scan = ProtobufScan::default();
     let mut index = 0usize;
     let mut order = 0usize;
+    // On parse failure, skip one byte and resync (CodexBar-style best-effort scan).
+    let resync = |index: &mut usize, field_start: usize| {
+        *index = field_start + 1;
+    };
     while index < data.len() {
         let field_start = index;
         let Some(key) = read_varint(data, &mut index) else {
-            index = field_start + 1;
+            resync(&mut index, field_start);
             continue;
         };
         if key == 0 {
-            index = field_start + 1;
+            resync(&mut index, field_start);
             continue;
         }
         let field_number = key >> 3;
@@ -719,17 +731,15 @@ fn scan_protobuf(data: &[u8], depth: u8, path: &[u64]) -> ProtobufScan {
         field_path.push(field_number);
 
         match wire_type {
-            0 => {
-                if let Some(value) = read_varint(data, &mut index) {
-                    scan.varints.push(VarintField {
-                        path: field_path,
-                        value,
-                    });
-                } else {
-                    index = field_start + 1;
-                }
-            }
+            0 => match read_varint(data, &mut index) {
+                Some(value) => scan.varints.push(VarintField {
+                    path: field_path,
+                    value,
+                }),
+                None => resync(&mut index, field_start),
+            },
             1 => {
+                // fixed64 — skip (not used for billing %)
                 if index + 8 > data.len() {
                     break;
                 }
@@ -737,19 +747,17 @@ fn scan_protobuf(data: &[u8], depth: u8, path: &[u64]) -> ProtobufScan {
             }
             2 => {
                 let Some(length) = read_varint(data, &mut index) else {
-                    index = field_start + 1;
+                    resync(&mut index, field_start);
                     continue;
                 };
                 let length = length as usize;
                 if length > data.len().saturating_sub(index) {
-                    index = field_start + 1;
+                    resync(&mut index, field_start);
                     continue;
                 }
-                let start = index;
                 let end = index + length;
                 if depth < 4 {
-                    let nested = scan_protobuf(&data[start..end], depth + 1, &field_path);
-                    scan.merge(nested);
+                    scan.merge(scan_protobuf(&data[index..end], depth + 1, &field_path));
                 }
                 index = end;
             }
@@ -757,12 +765,7 @@ fn scan_protobuf(data: &[u8], depth: u8, path: &[u64]) -> ProtobufScan {
                 if index + 4 > data.len() {
                     break;
                 }
-                let bits = u32::from_le_bytes([
-                    data[index],
-                    data[index + 1],
-                    data[index + 2],
-                    data[index + 3],
-                ]);
+                let bits = u32::from_le_bytes(data[index..index + 4].try_into().unwrap());
                 scan.fixed32.push(Fixed32Field {
                     path: field_path,
                     value: f32::from_bits(bits),
@@ -771,9 +774,7 @@ fn scan_protobuf(data: &[u8], depth: u8, path: &[u64]) -> ProtobufScan {
                 order += 1;
                 index += 4;
             }
-            _ => {
-                index = field_start + 1;
-            }
+            _ => resync(&mut index, field_start),
         }
     }
     scan
