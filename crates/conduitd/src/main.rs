@@ -1,4 +1,4 @@
-//! conduitd — the Conduit v2 daemon process.
+//! conduitd — the Conduit daemon process.
 //!
 //! Starts the OpenAI-compatible gateway on the configured port,
 //! console API, and background services (quota cleanup).
@@ -9,7 +9,7 @@ use conduitd::{config, server};
 use tracing::info;
 
 #[derive(Debug, Parser)]
-#[command(name = "conduitd", about = "Conduit v2 LLM gateway daemon")]
+#[command(name = "conduitd", about = "Conduit LLM gateway daemon")]
 pub struct Args {
     /// Path to conduit.toml config file. When unset, conduitd looks for
     /// `conduit.toml` in the working directory, then `~/.conduit/conduit.toml`.

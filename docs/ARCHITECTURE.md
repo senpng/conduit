@@ -1,4 +1,4 @@
-# Conduit v2 Architecture
+# Conduit Architecture
 
 Conduit is a **local-first, single-binary LLM gateway**. It proxies requests to upstream LLM providers (OpenAI, Anthropic, and more) while tracking usage and cost for the operator console.
 

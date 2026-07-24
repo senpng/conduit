@@ -1,4 +1,4 @@
-//! conduitctl — Conduit v2 command-line interface.
+//! conduitctl — Conduit command-line interface.
 //!
 //! Provides human, machine, and interactive TUI interfaces for the conduitd daemon.
 
@@ -12,7 +12,7 @@ mod cmd;
 use conduitctl::tui;
 
 #[derive(Debug, Parser)]
-#[command(name = "conduitctl", about = "Conduit v2 gateway CLI")]
+#[command(name = "conduitctl", about = "Conduit gateway CLI")]
 pub struct Args {
     /// Daemon console address (host:port)
     #[arg(
